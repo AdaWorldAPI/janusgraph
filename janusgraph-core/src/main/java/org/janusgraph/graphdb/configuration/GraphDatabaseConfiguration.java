@@ -451,6 +451,21 @@ public class GraphDatabaseConfiguration {
             "as described in the config option 'schema.default'. If 'schema.constraints' is set to 'false' which is the default, then no schema constraints are applied.",
             ConfigOption.Type.GLOBAL_OFFLINE, false);
 
+    public static final ConfigNamespace SCHEMA_REINDEX = new ConfigNamespace(SCHEMA_NS, "reindex",
+        "Configuration options for schema reindex operations.");
+
+    public static final ConfigOption<Boolean> MIXED_INDEX_REINDEX_BATCH_ENABLED = new ConfigOption<>(SCHEMA_REINDEX,
+        "mixed-index-batch-enabled",
+        "Whether mixed-index reindex jobs should batch document restore calls independently from the storage page size.",
+        ConfigOption.Type.MASKABLE, true);
+
+    public static final ConfigOption<Integer> MIXED_INDEX_REINDEX_BATCH_SIZE = new ConfigOption<>(SCHEMA_REINDEX,
+        "mixed-index-batch-size",
+        "Number of graph elements a mixed-index reindex worker should process before flushing restored documents " +
+            "to the index backend. Larger values can improve Elasticsearch bulk restore throughput at the cost " +
+            "of additional worker memory.",
+        ConfigOption.Type.MASKABLE, Integer.class, 1000, size -> size > 0);
+
     public static final ConfigNamespace SCHEMA_INIT = new ConfigNamespace(SCHEMA_NS,"init",
         "Configuration options for schema initialization on startup.");
 
@@ -664,6 +679,13 @@ public class GraphDatabaseConfiguration {
     public static final ConfigOption<Boolean> STORAGE_BATCH = new ConfigOption<>(STORAGE_NS,"batch-loading",
             "Whether to enable batch loading into the storage backend",
             ConfigOption.Type.LOCAL, false);
+
+    public static final ConfigOption<Boolean> DROP_WHOLE_ROW_ON_VERTEX_REMOVAL = new ConfigOption<>(STORAGE_NS,"drop-whole-row-on-vertex-removal",
+            "When a vertex is removed, delete its entire storage row in a single operation (e.g. a Cassandra " +
+            "partition-level delete producing one tombstone) instead of deleting each edge/property column " +
+            "individually. This greatly reduces tombstone pressure when removing super-nodes. Only takes effect " +
+            "on storage backends that support optimized whole-row deletion; ignored otherwise.",
+            ConfigOption.Type.MASKABLE, true);
 
     /**
      * Enables transactions on storage backends that support them
@@ -1466,6 +1488,7 @@ public class GraphDatabaseConfiguration {
     private boolean allowVertexIdSetting;
     private boolean allowCustomVertexIdType;
     private boolean logTransactions;
+    private boolean dropWholeRowOnVertexRemoval;
     private String metricsPrefix;
     private String unknownIndexKeyName;
     private MultiQueryHasStepStrategyMode hasStepStrategyMode;
@@ -1625,6 +1648,10 @@ public class GraphDatabaseConfiguration {
 
     public boolean hasLogTransactions() {
         return logTransactions;
+    }
+
+    public boolean getDropWholeRowOnVertexRemoval() {
+        return dropWholeRowOnVertexRemoval;
     }
 
     public TimestampProvider getTimestampProvider() {
@@ -1794,6 +1821,7 @@ public class GraphDatabaseConfiguration {
         }
 
         logTransactions = configuration.get(SYSTEM_LOG_TRANSACTIONS);
+        dropWholeRowOnVertexRemoval = configuration.get(DROP_WHOLE_ROW_ON_VERTEX_REMOVAL);
 
         unknownIndexKeyName = configuration.get(IGNORE_UNKNOWN_INDEX_FIELD) ? UNKNOWN_FIELD_NAME : null;
 
