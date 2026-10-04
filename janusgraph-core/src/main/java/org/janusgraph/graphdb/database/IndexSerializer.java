@@ -19,6 +19,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.tinkerpop.gremlin.process.traversal.Order;
+import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphVertex;
@@ -311,8 +312,18 @@ public class IndexSerializer {
     }
 
     public boolean reindexElement(JanusGraphElement element, MixedIndexType index, Map<String,Map<String,List<IndexEntry>>> documentsPerStore) {
-        if (!indexAppliesTo(index, element))
+        final List<IndexEntry> entries = getCompleteDocument(element, index);
+        if (entries.isEmpty())
             return false;
+        getDocuments(documentsPerStore, index).put(element2String(element), entries);
+        return true;
+    }
+
+    //The complete indexed content of the element in this index, as a restore writes the document: every value of
+    //every enabled field key. Empty when the index does not apply to the element or nothing it indexes is set
+    public List<IndexEntry> getCompleteDocument(JanusGraphElement element, MixedIndexType index) {
+        if (!indexAppliesTo(index, element))
+            return Collections.emptyList();
         final List<IndexEntry> entries = new ArrayList<>();
         for (final ParameterIndexField field: index.getFieldKeys()) {
             final PropertyKey key = field.getFieldKey();
@@ -321,10 +332,7 @@ public class IndexSerializer {
                 element.values(key.name()).forEachRemaining(value->entries.add(new IndexEntry(key2Field(field), value)));
             }
         }
-        if (entries.isEmpty())
-            return false;
-        getDocuments(documentsPerStore, index).put(element2String(element), entries);
-        return true;
+        return entries;
     }
 
     private Map<String,List<IndexEntry>> getDocuments(Map<String,Map<String,List<IndexEntry>>> documentsPerStore, MixedIndexType index) {
@@ -332,7 +340,9 @@ public class IndexSerializer {
     }
 
     public void removeElement(Object elementId, MixedIndexType index, Map<String,Map<String,List<IndexEntry>>> documentsPerStore) {
-        Preconditions.checkArgument((index.getElement()==ElementCategory.VERTEX && elementId instanceof Long) ||
+        //A String id is valid for a vertex when the graph allows custom vertex id types, and element2String below
+        //encodes it, so accept the same ids that method does
+        Preconditions.checkArgument((index.getElement()==ElementCategory.VERTEX && (elementId instanceof Long || elementId instanceof String)) ||
             (index.getElement().isRelation() && elementId instanceof RelationIdentifier),"Invalid element id [%s] provided for index: %s",elementId,index);
         getDocuments(documentsPerStore,index).put(element2String(elementId),new ArrayList<>());
     }
@@ -366,7 +376,9 @@ public class IndexSerializer {
         if (index.isCompositeIndex()) {
             Map<String, SliceQuery> inlineQueries = IndexRecordUtil.getInlinePropertiesQueries((CompositeIndexType) index, standardJanusGraphTx);
             final MultiKeySliceQuery sq = query.getCompositeQuery();
-            final List<EntryList> rs = sq.execute(tx);
+            //The transaction's multi-query setting, which query.batch.enabled gives it unless it sets its own, decides for
+            //composite index rows too whether reads are batched
+            final List<EntryList> rs = sq.execute(tx, standardJanusGraphTx.getConfiguration().useMultiQuery());
             final List<Object> results = new ArrayList<>(rs.get(0).size());
             for (final EntryList r : rs) {
                 for (final java.util.Iterator<Entry> iterator = r.reuseIterator(); iterator.hasNext(); ) {
@@ -404,7 +416,8 @@ public class IndexSerializer {
             ksqs.add(new KeySliceQuery(IndexRecordUtil.getIndexKey(index, value, serializer, hashKeys, hashLength),
                 BufferUtil.zeroBuffer(1), BufferUtil.oneBuffer(1)));
         }
-        return new MultiKeySliceQuery(ksqs);
+        //Each key of a unique index holds at most one entry: its one column doesn't name the element
+        return new MultiKeySliceQuery(ksqs, index.getCardinality() == Cardinality.SINGLE);
     }
 
     public IndexQuery getQuery(final MixedIndexType index, final Condition condition, final OrderList orders) {

@@ -26,6 +26,14 @@ public interface ElasticSearchClient extends Closeable {
 
     ElasticMajorVersion getMajorVersion();
 
+    /**
+     * Returns whether requests use mapping types: those of Elasticsearch 6, and of Elasticsearch 7 with
+     * {@code use-mapping-for-es7}. The default only knows the major version, so it only covers Elasticsearch 6.
+     */
+    default boolean usesMappingTypes() {
+        return getMajorVersion().getValue() < 7;
+    }
+
     void clusterHealthRequest(String timeout) throws IOException;
 
     boolean indexExists(String indexName) throws IOException;
@@ -52,7 +60,14 @@ public interface ElasticSearchClient extends Closeable {
 
     void deleteIndex(String indexName) throws IOException;
 
-    void clearStore(String indexName, String storeName) throws IOException;
+    /**
+     * Deletes the Elasticsearch index which backs a store, if it exists.
+     *
+     * @param indexStoreName the Elasticsearch index name of the store, already derived by the caller from the
+     *                       JanusGraph store name, so that the mapping between the two exists in exactly one place.
+     *                       It is used verbatim; in particular it is not lowercased here.
+     */
+    void clearStore(String indexStoreName) throws IOException;
 
     void bulkRequest(List<ElasticSearchMutation> requests, String ingestPipeline) throws IOException;
 
@@ -70,6 +85,11 @@ public interface ElasticSearchClient extends Closeable {
 
     ElasticSearchResponse search(String scrollId) throws IOException;
 
+    /**
+     * Releases a scroll context which is no longer read. It is a courtesy to the cluster rather than part of the
+     * search: the context expires after the scroll keep-alive on its own, so an implementation may return before
+     * the cluster has released it, and the caller doesn't fail its search over a release which failed.
+     */
     void deleteScroll(String scrollId) throws IOException;
 
     void addAlias(String alias, String index) throws IOException;

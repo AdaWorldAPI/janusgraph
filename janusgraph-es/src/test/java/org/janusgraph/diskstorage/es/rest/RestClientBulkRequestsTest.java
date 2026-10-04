@@ -15,11 +15,13 @@
 package org.janusgraph.diskstorage.es.rest;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableMap;
 import org.apache.http.HttpEntity;
 import org.apache.http.StatusLine;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.Response;
 import org.elasticsearch.client.RestClient;
+import org.janusgraph.diskstorage.es.ElasticMajorVersion;
 import org.janusgraph.diskstorage.es.ElasticSearchMutation;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -35,6 +37,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.IntStream;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -66,6 +69,38 @@ public class RestClientBulkRequestsTest {
         //There's an initial query to get the ES version we need to accommodate, and then reset for the actual test
         Mockito.reset(restClientMock);
         return clientUnderTest;
+    }
+
+    //The action line of an update carries retry_on_conflict above 0, which is Elasticsearch's own default
+    @Test
+    public void testRetryOnConflictIsSentWithEveryUpdateAboveZero() throws IOException {
+        final ElasticSearchMutation update = ElasticSearchMutation.createUpdateRequest("some_index", "some_type",
+            "some_doc_id", ImmutableMap.builder().put("doc", ImmutableMap.of("name", "value")), null);
+        final ElasticSearchMutation index = ElasticSearchMutation.createIndexRequest("some_index", "some_type",
+            "some_doc_id", ImmutableMap.of("name", "value"));
+        try (RestElasticSearchClient restClientUnderTest = createClient(100_000_000)) {
+            restClientUnderTest.setRetryOnConflict(3);
+            Assertions.assertEquals(3, action(restClientUnderTest.new RequestBytes(update), "update").get("retry_on_conflict"));
+            Assertions.assertFalse(action(restClientUnderTest.new RequestBytes(index), "index").containsKey("retry_on_conflict"));
+
+            restClientUnderTest.setRetryOnConflict(0);
+            Assertions.assertFalse(action(restClientUnderTest.new RequestBytes(update), "update").containsKey("retry_on_conflict"));
+        }
+        //Elasticsearch 6 reads the same key and only deprecates its older name, _retry_on_conflict
+        try (RestElasticSearchClient elasticsearch6 = new RestElasticSearchClient(restClientMock, 0, false, 0,
+            Collections.emptySet(), 0, 0, 100_000_000, ElasticMajorVersion.SIX)) {
+            elasticsearch6.setRetryOnConflict(3);
+            final Map<String, Object> updateAction = action(elasticsearch6.new RequestBytes(update), "update");
+            Assertions.assertEquals(3, updateAction.get("retry_on_conflict"));
+            Assertions.assertFalse(updateAction.containsKey("_retry_on_conflict"));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> action(RestElasticSearchClient.RequestBytes request, String type) throws IOException {
+        final Map<String, Object> actionLine = new ObjectMapper().readValue(request.requestBytes, Map.class);
+        Assertions.assertEquals(Collections.singleton(type), actionLine.keySet());
+        return (Map<String, Object>) actionLine.get(type);
     }
 
     @Test
@@ -103,6 +138,32 @@ public class RestClientBulkRequestsTest {
             //Verify that despite only calling bulkRequest() once, we had 2 calls to the underlying rest client's
             //perform request (due to the mutations being split across 2 calls)
             verify(restClientMock, times(2)).performRequest(requestCaptor.capture());
+        }
+    }
+
+    @Test
+    public void testLeavingOutACompleteDocumentWhichMakesAnUpdateTooLarge() throws IOException {
+        final int bulkLimit = 1000;
+        final String largeValue = String.join("", Collections.nCopies(2 * bulkLimit, "a"));
+        final ElasticSearchMutation fits = ElasticSearchMutation.createUpdateRequestWithCompleteDocument("some_index",
+            "some_type", "fits", ImmutableMap.<String, Object>builder().put("doc", Collections.singletonMap("small", "value")),
+            Collections.singletonMap("small", "value"), false);
+        final ElasticSearchMutation tooLarge = ElasticSearchMutation.createUpdateRequestWithCompleteDocument(
+            "some_index", "some_type", "too_large",
+            ImmutableMap.<String, Object>builder().put("doc", Collections.singletonMap("small", "value")),
+            Collections.singletonMap("large", largeValue), false);
+        try (RestElasticSearchClient restClientUnderTest = createClient(bulkLimit)) {
+            final RestElasticSearchClient.BulkRequestChunker chunkerUnderTest =
+                restClientUnderTest.new BulkRequestChunker(Arrays.asList(fits, tooLarge));
+            final List<RestElasticSearchClient.RequestBytes> chunk = chunkerUnderTest.next();
+            //Both are sent, and nothing is left over to fail as too large
+            Assertions.assertEquals(2, chunk.size());
+            Assertions.assertFalse(chunkerUnderTest.hasNext());
+            //The one which fits keeps its complete document, the other goes without it
+            Assertions.assertEquals(restClientUnderTest.new RequestBytes(fits).getSerializedSize(),
+                chunk.get(0).getSerializedSize());
+            Assertions.assertEquals(restClientUnderTest.new RequestBytes(tooLarge.withoutCompleteDocument())
+                .getSerializedSize(), chunk.get(1).getSerializedSize());
         }
     }
 

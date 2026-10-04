@@ -2,8 +2,8 @@
 
 Required:
 
-* Java 8
-* Maven 3
+* Java 11 or newer (the build is tested with Java 11, 17, 21 and 25)
+* Maven 3.6.3 or newer
 
 To build without executing tests:
 

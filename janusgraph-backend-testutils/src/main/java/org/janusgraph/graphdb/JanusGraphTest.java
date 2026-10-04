@@ -119,6 +119,7 @@ import org.janusgraph.graphdb.database.management.ManagementSystem;
 import org.janusgraph.graphdb.database.serialize.Serializer;
 import org.janusgraph.graphdb.database.util.IndexRecordUtil;
 import org.janusgraph.graphdb.database.util.StaleIndexRecordUtil;
+import org.janusgraph.graphdb.idmanagement.IDManager;
 import org.janusgraph.graphdb.internal.ElementCategory;
 import org.janusgraph.graphdb.internal.ElementLifeCycle;
 import org.janusgraph.graphdb.internal.InternalElement;
@@ -199,6 +200,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -4575,6 +4577,209 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(1, g.V(next).values("name").toList().size());
     }
 
+    /**
+     * An edge-by-id lookup for a label whose schema vertex is not yet visible must not leave that label with a
+     * cached empty definition once it becomes visible. The lookup here races the label's creation: the id is assigned
+     * when the label is made, but its schema row is only written when the creating transaction commits.
+     */
+    @Test
+    public void testEdgeByIdLookupBeforeLabelIsVisibleDoesNotPoisonSchemaCache() {
+        JanusGraphVertex a = graph.addVertex();
+        JanusGraphVertex b = graph.addVertex();
+        graph.tx().commit();
+        Object aId = a.id();
+        Object bId = b.id();
+
+        JanusGraphTransaction creator = graph.newTransaction();
+        EdgeLabel knows = creator.makeEdgeLabel("knows").multiplicity(Multiplicity.SIMPLE).make();
+
+        JanusGraphTransaction reader = graph.newTransaction();
+        RelationIdentifier notYetVisible = new RelationIdentifier(aId, knows.longId(), 1L, bId);
+        assertFalse(reader.getEdges(notYetVisible).iterator().hasNext());
+        reader.rollback();
+
+        creator.getVertex(aId).addEdge("knows", creator.getVertex(bId));
+        creator.commit();
+
+        newTx();
+        assertEquals(Multiplicity.SIMPLE, tx.getEdgeLabel("knows").multiplicity());
+        assertCount(1, tx.getVertex(aId).query().direction(Direction.OUT).labels("knows").edges());
+        assertEquals(1, tx.traversal().V(aId).outE().count().next());
+        RelationIdentifier eid = (RelationIdentifier) Iterables.getOnlyElement(tx.getVertex(aId).query().labels("knows").edges()).id();
+        assertEquals(eid, Iterables.getOnlyElement(tx.getEdges(eid)).id());
+        // malformed type ids resolve to "no edge" as before: a negative one, and one with valid type bits that lies
+        // outside the schema id range
+        assertFalse(tx.getEdges(new RelationIdentifier(aId, -knows.longId(), 1L, bId)).iterator().hasNext());
+        long typeBits = knows.longId() & ((1L << IDManager.MAX_PADDING_BITWIDTH) - 1);
+        long outOfRange = ((Long.MAX_VALUE >>> IDManager.MAX_PADDING_BITWIDTH) << IDManager.MAX_PADDING_BITWIDTH) | typeBits;
+        assertFalse(tx.getEdges(new RelationIdentifier(aId, outOfRange, 1L, bId)).iterator().hasNext());
+    }
+
+    /**
+     * Definition edges written by ordinary transactions (here connection constraints auto-created under
+     * schema.constraints=true) must be visible to later transactions on the same instance: the second edge must
+     * find the constraint the first one created instead of creating another copy.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsSeenByLaterTransactions() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        for (int i = 0; i < 3; i++) {
+            JanusGraphTransaction t = graph.newTransaction();
+            JanusGraphVertex p1 = t.addVertex("person");
+            JanusGraphVertex p2 = t.addVertex("person");
+            p1.addEdge("knows", p2);
+            t.commit();
+        }
+
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    /**
+     * A transaction which was already open when another one committed a definition edge (here a connection constraint
+     * auto-created under schema.constraints=true) must not keep acting on the definition edges it had loaded: adding
+     * the same kind of edge, it must find the constraint instead of creating a second copy.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsSeenByTransactionsOpenAtCommit() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        assertTrue(open.getVertexLabel("person").mappedConnections().isEmpty());
+
+        final JanusGraphTransaction creator = graph.newTransaction();
+        creator.addVertex("person").addEdge("knows", creator.addVertex("person"));
+        creator.commit();
+
+        open.addVertex("person").addEdge("knows", open.addVertex("person"));
+        open.commit();
+
+        final JanusGraphManagement check = graph.openManagement();
+        try {
+            assertEquals(1, check.getEdgeLabel("knows").mappedConnections().size());
+            assertEquals(1, check.getVertexLabel("person").mappedConnections().size());
+        } finally {
+            check.rollback();
+        }
+    }
+
+    /**
+     * A transaction which had read a relation type's consistency before a management commit changed it must read the
+     * new consistency afterwards: the commit resets the type in the open transactions, and that has to clear the
+     * consistency the type had cached as well.
+     */
+    @Test
+    public void testConsistencyChangeIsSeenByTransactionsOpenAtCommit() {
+        mgmt.makePropertyKey("uid").dataType(String.class).make();
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        try {
+            assertEquals(ConsistencyModifier.DEFAULT,
+                ((InternalRelationType) open.getPropertyKey("uid")).getConsistencyModifier());
+
+            mgmt.setConsistency(mgmt.getPropertyKey("uid"), ConsistencyModifier.LOCK);
+            mgmt.commit();
+
+            assertEquals(ConsistencyModifier.LOCK,
+                ((InternalRelationType) open.getPropertyKey("uid")).getConsistencyModifier());
+        } finally {
+            open.rollback();
+        }
+    }
+
+    /**
+     * Replacing a consistency modifier removes the old modifier vertex. A transaction which had read the old
+     * consistency holds that vertex, and the commit must leave it alone there: it has no definition left to reload,
+     * and reloading it would fail inside the commit's finally block. The transaction reads the new consistency.
+     */
+    @Test
+    public void testConsistencyChangeReplacingAModifierIsSeenByTransactionsOpenAtCommit() {
+        final EdgeLabel knows = mgmt.makeEdgeLabel("knows").multiplicity(Multiplicity.MULTI).make();
+        mgmt.setConsistency(knows, ConsistencyModifier.LOCK);
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        try {
+            assertEquals(ConsistencyModifier.LOCK,
+                ((InternalRelationType) open.getEdgeLabel("knows")).getConsistencyModifier());
+
+            mgmt.setConsistency(mgmt.getEdgeLabel("knows"), ConsistencyModifier.FORK);
+            mgmt.commit();
+
+            assertEquals(ConsistencyModifier.FORK,
+                ((InternalRelationType) open.getEdgeLabel("knows")).getConsistencyModifier());
+        } finally {
+            open.rollback();
+        }
+    }
+
+    /**
+     * Definition edges which an ordinary transaction commits on one instance (here a connection constraint
+     * auto-created under schema.constraints=true) must reach the schema cache of another instance. Otherwise that
+     * instance keeps serving the definition edges it had cached, and adding the same kind of edge there creates a
+     * second copy of the constraint.
+     */
+    //A message whose write takes longer than the read lag is missed, as for testIndexUpdatesWithReindexAndRemove
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void testAutoCreatedConnectionConstraintReachesOtherInstances() throws InterruptedException {
+        //The read lag is left at its default of 500 ms: the test waits for the message anyway, and a shorter lag
+        //would miss it more easily
+        clopen(option(SCHEMA_CONSTRAINTS), true,
+            option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ZERO,
+            option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250));
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        //Opened from the same configuration, which sets no instance id, so the second instance gets one of its own
+        final StandardJanusGraph graph2 = (StandardJanusGraph) JanusGraphFactory.open(config);
+        try {
+            //The second instance caches the vertex label's connections while there are none
+            JanusGraphTransaction tx2 = graph2.newTransaction();
+            assertTrue(tx2.getVertexLabel("person").mappedConnections().isEmpty());
+            tx2.rollback();
+
+            //An ordinary transaction on this instance auto-creates the connection
+            final JanusGraphTransaction creator = graph.newTransaction();
+            creator.addVertex("person").addEdge("knows", creator.addVertex("person"));
+            creator.commit();
+
+            //The second instance learns about it from the management log
+            final long deadline = System.currentTimeMillis() + 30000;
+            int connections;
+            do {
+                Thread.sleep(100);
+                tx2 = graph2.newTransaction();
+                connections = tx2.getVertexLabel("person").mappedConnections().size();
+                tx2.rollback();
+            } while (connections == 0 && System.currentTimeMillis() < deadline);
+            assertEquals(1, connections);
+
+            //...and adding the same kind of edge there does not create a second copy
+            tx2 = graph2.newTransaction();
+            tx2.addVertex("person").addEdge("knows", tx2.addVertex("person"));
+            tx2.commit();
+        } finally {
+            graph2.close();
+        }
+
+        //Read fresh here as well, since this instance's own commit expired the label
+        final JanusGraphManagement check = graph.openManagement();
+        try {
+            assertEquals(1, check.getVertexLabel("person").mappedConnections().size());
+        } finally {
+            check.rollback();
+        }
+    }
+
     private void createStrictSchemaForVertexProperties() {
         clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
         VertexLabel label = mgmt.makeVertexLabel("user").make();
@@ -5182,11 +5387,11 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
 
         // until repeat emit(predicate).
-        // This case is using batches per iteration and not batches per loop
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).emit(__.in("knows").has("depth", "3")).count());
         assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
-        assertEquals(0, countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()));
-        assertTrue(countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()) > ((int) Math.pow(levelVerticesAmount, depth)));
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile);
 
         // until emit(predicate) repeat
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).emit(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).count());
@@ -5194,11 +5399,11 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
 
         // emit(predicate) repeat until
-        // This case is using batches per iteration and not batches per loop
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).until(__.in("knows").has("depth", "3")).count());
         assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
-        assertEquals(0, countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()));
-        assertTrue(countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()) > ((int) Math.pow(levelVerticesAmount, depth)));
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
 
         // repeat emit(predicate) until
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit(__.in("knows").has("depth", "3")).until(__.in("knows").has("depth", "3")).count());
@@ -5216,11 +5421,11 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
 
         // emit repeat until
-        // This case is using batches per iteration and not batches per loop
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit().repeat(__.out("knows").barrier(barrierSize)).until(__.in("knows").has("depth", "3")).count());
         assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
-        assertEquals(0, countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()));
-        assertTrue(countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()) > ((int) Math.pow(levelVerticesAmount, depth)));
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
 
         // repeat emit until
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit().until(__.in("knows").has("depth", "3")).count());
@@ -5228,7 +5433,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
 
         // MultiQueriable inside multi-query compatible parent which is inside repeat step
-        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.union(__.out("knows"), __.<Vertex>where(__.in("knows")).none()).barrier(barrierSize)).emit().count());
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.union(__.out("knows"), __.<Vertex>where(__.in("knows")).discard()).barrier(barrierSize)).emit().count());
         assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
         assertEquals(0, countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()));
         assertTrue(countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()) <= 2);
@@ -5256,10 +5461,12 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         Vertex[] middleVertices = graph.traversal().V(a).repeat(__.out("knows")).times(depth/2+1).toList().toArray(new Vertex[0]);;
 
         // Repeat step mode: CLOSEST_REPEAT_PARENT. multi-nested `repeat` start steps. Early drop.
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once, so the
+        // first iteration of the nested `repeat` prefetches a whole batch of the outer barrier instead of a single vertex.
         profile = testLimitedBatch(() -> graph.traversal().V((Object[]) middleVertices).barrier(barrierSize).repeat(__.barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).until(__.identity())).barrier(barrierSize)).until(__.identity()).limit(1),
             option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.CLOSEST_REPEAT_PARENT.getConfigName());
-        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()));
-        assertEquals(0,countBackendQueriesOfSize(s -> s > levelVerticesAmount, profile.getMetrics()));
+        assertEquals(1,countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0,countBackendQueriesOfSize(s -> s != barrierSize * levelVerticesAmount, profile.getMetrics()));
 
         // Repeat step mode: ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Early drop.
         profile = testLimitedBatch(() -> graph.traversal().V((Object[]) middleVertices).barrier(barrierSize).repeat(__.barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).until(__.identity())).barrier(barrierSize)).until(__.identity()).limit(1),
@@ -5285,13 +5492,17 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(0, countBackendQueriesOfSize(s -> s < levelVerticesAmount, profile.getMetrics()));
 
         // Repeat step mode: STARTS_ONLY_OF_ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Most outer repeat step next iteration not registering new vertices.
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once (the
+        // `barrier(1)` no longer feeds them one by one), so all vertices of the second loop are prefetched together by
+        // the nested `repeat` even though the most outer `repeat` does not register them for the next iteration.
         profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize)
                 .repeat(__.<Vertex>barrier(1)
                     .repeat(__.out("knows").barrier(barrierSize)).until(__.identity().loops().is(P.gt(0))).barrier(barrierSize)
                 ).until(__.identity().loops().is(P.gt(1))),
             option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.STARTS_ONLY_OF_ALL_REPEAT_PARENTS.getConfigName());
-        assertEquals(1+levelVerticesAmount,countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()));
-        assertEquals(0, countBackendQueriesOfSize(s -> s > levelVerticesAmount, profile.getMetrics()));
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()));
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s > levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
         assertEquals(0, countBackendQueriesOfSize(s -> s < levelVerticesAmount, profile.getMetrics()));
     }
 
@@ -5310,11 +5521,30 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         int currentReturnSize = 1;
         int currentLoop = 0;
         while (currentReturnSize < maxReturnSize && currentLoop <= depth){
-            assertTrue(countBackendQueriesOfSize(currentReturnSize, profile.getMetrics()) <= uniqueBatchRequestsAmount * 2);
+            final long queries = countBackendQueriesOfSize(currentReturnSize, profile.getMetrics());
+            assertTrue(queries <= uniqueBatchRequestsAmount * 2, "Expected at most " + uniqueBatchRequestsAmount * 2 +
+                " backend queries of size " + currentReturnSize + " but found " + queries + ". Backend query sizes: " + backendQuerySizes(profile.getMetrics()));
             currentReturnSize*=levelVerticesAmount;
             ++currentLoop;
         }
-        assertEquals(0, countBackendQueriesOfSize(s -> s > maxReturnSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s > maxReturnSize, profile.getMetrics()),
+            "Expected no backend queries larger than " + maxReturnSize + ". Backend query sizes: " + backendQuerySizes(profile.getMetrics()));
+    }
+
+    /**
+     * Returns the sizes of all backend queries of the given metrics mapped to the number of queries of that size.
+     */
+    private Map<Long, Long> backendQuerySizes(Collection<? extends Metrics> metrics) {
+        final Map<Long, Long> sizes = new TreeMap<>();
+        for (Metrics m : metrics) {
+            if (m.getName().equals("backend-query")) {
+                for (Long count : m.getCounts().values()) {
+                    sizes.merge(count, 1L, Long::sum);
+                }
+            }
+            backendQuerySizes(m.getNested()).forEach((size, count) -> sizes.merge(size, count, Long::sum));
+        }
+        return sizes;
     }
 
     private void addTestAdjacentVertices(Vertex vertex, int levelVerticesAmount, int depth, Map<Integer, Integer> levelToNumberOfVertices){
@@ -7069,7 +7299,9 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             assertEquals(4, userChangeCounter.get(Change.REMOVED).get());
         }
 
-        clopen(option(VERBOSE_TX_RECOVERY), true);
+        clopen(option(VERBOSE_TX_RECOVERY), true,
+                option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofMillis(250));
         /*
         Transaction Recovery
          */

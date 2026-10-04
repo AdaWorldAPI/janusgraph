@@ -53,6 +53,7 @@ import org.janusgraph.core.attribute.Cmp;
 import org.janusgraph.core.attribute.Geo;
 import org.janusgraph.core.attribute.Geoshape;
 import org.janusgraph.core.attribute.Text;
+import org.janusgraph.core.log.LogProcessorFramework;
 import org.janusgraph.core.log.TransactionRecovery;
 import org.janusgraph.core.schema.CompositeIndexInfo;
 import org.janusgraph.core.schema.JanusGraphIndex;
@@ -139,6 +140,7 @@ import static org.apache.tinkerpop.gremlin.process.traversal.Order.asc;
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.FORCE_INDEX_USAGE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_BACKEND;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_CDC_ENABLED;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NAME_MAPPING;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_SELECT_STRATEGY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_READ_INTERVAL;
@@ -148,6 +150,7 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MA
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_WRITE_WAITTIME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SYSTEM_LOG_TRANSACTIONS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.TRANSACTION_LOG;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.USER_LOG;
 import static org.janusgraph.graphdb.query.index.ThresholdBasedIndexSelectionStrategy.INDEX_SELECT_BRUTE_FORCE_THRESHOLD;
 import static org.janusgraph.testutil.JanusGraphAssert.assertBackendHit;
 import static org.janusgraph.testutil.JanusGraphAssert.assertCount;
@@ -157,6 +160,7 @@ import static org.janusgraph.testutil.JanusGraphAssert.assertNoBackendHit;
 import static org.janusgraph.testutil.JanusGraphAssert.assertNotEmpty;
 import static org.janusgraph.testutil.JanusGraphAssert.assertTraversal;
 import static org.janusgraph.testutil.JanusGraphAssert.assertTraversalAndIndexUsage;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -185,6 +189,16 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
 
     private static final int RETRY_COUNT = 30;
     private static final long RETRY_INTERVAL = 1000L;
+    //A graph opened by clopen() without these reads the transaction log every 5 s. Recovery started on such a graph
+    //gets them again, so that it reads back what a test has just written within a fraction of a second.
+    private static final Object[] RECOVERY_LOG_READS = {
+        option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofMillis(50),
+        option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofMillis(250)
+    };
+    //Long enough for recovery to count a transaction it read once more, as it used to when a transaction's final status
+    //came in after recovery had given the transaction up: its least wait of 5 s and the 5 s between the passes of its
+    //cleaner, with some to spare
+    private static final Duration RECOVERY_SETTLING = Duration.ofSeconds(12);
 
     public final boolean supportsGeoPoint;
     public final boolean supportsNumeric;
@@ -269,6 +283,58 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals("demigod", h.label());
         assertCount(5, h.query().direction(Direction.BOTH).edges());
         graphOfTheGods.tx().commit();
+    }
+
+    @Test
+    public void testCdcIndexOptionsCanBeChangedOnARunningCluster() {
+        final String cdcEnabled = ConfigElement.getPath(INDEX_CDC_ENABLED, INDEX);
+        assertFalse(cdcBackingIndexNames().contains(INDEX));
+
+        // Unlike a GLOBAL_OFFLINE option, the stored value can be changed while another instance is open
+        final JanusGraph otherInstance = JanusGraphFactory.open(config);
+        try {
+            mgmt.set(cdcEnabled, true);
+            mgmt.commit();
+        } finally {
+            otherInstance.close();
+        }
+        clopen();
+        assertTrue(cdcBackingIndexNames().contains(INDEX));
+
+        // The local configuration of an instance overrides the stored value
+        clopen(option(INDEX_CDC_ENABLED, INDEX), false);
+        assertFalse(cdcBackingIndexNames().contains(INDEX));
+        assertEquals("true", mgmt.get(cdcEnabled));
+    }
+
+    private Set<String> cdcBackingIndexNames() {
+        return GraphDatabaseConfiguration.getCdcBackingIndexNames(graph.getConfiguration().getConfiguration(), false);
+    }
+
+    @Test
+    public void testMixedIndexNamesDifferingOnlyInCaseAreRejected() {
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        PropertyKey age = mgmt.makePropertyKey("age").dataType(Integer.class).make();
+        //Only this index reaches the backend, so its name is one every index backend under test provides: the Solr
+        //tests upload a config set for a fixed list of collection names only
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).buildMixedIndex(INDEX);
+
+        //The backend derives its own index name from this one case insensitively, so the two would share a backend
+        //index and each other's documents. The rejection happens before the backend is asked for anything
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+            () -> mgmt.buildIndex("Mixed", Vertex.class).addKey(age).buildMixedIndex(INDEX));
+        //The message names both the index which was asked for and the one which is in the way
+        assertTrue(e.getMessage().contains("'Mixed'") && e.getMessage().contains("'mixed'"), e.getMessage());
+        //Nor on another element type: the backend index name does not carry it
+        assertThrows(IllegalArgumentException.class,
+            () -> mgmt.buildIndex("MIXED", Edge.class).addKey(age).buildMixedIndex(INDEX));
+
+        //A composite index has no backend index, so it may spell its name any way
+        mgmt.buildIndex("Mixed", Vertex.class).addKey(age).buildCompositeIndex();
+        finishSchema();
+
+        assertTrue(mgmt.getGraphIndex("mixed").isMixedIndex());
+        assertTrue(mgmt.getGraphIndex("Mixed").isCompositeIndex());
     }
 
     @Test
@@ -1175,7 +1241,10 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             assertEquals(190, tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("height").max().next());
             assertEquals(25, tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("age").max().next());
             assertEquals(170, tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("height").min().next());
-            assertEquals(535L, tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("height").sum().next());
+            assertEquals(102.5, ((Number) tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("weight").max().next()).doubleValue(), 0.001);
+            assertEquals(55.3, ((Number) tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("weight").min().next()).doubleValue(), 0.001);
+            // since TinkerPop 3.8 sum() retains the number type of the stream (promoted by bulking), so compare the numeric value only
+            assertEquals(535L, ((Number) tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("height").sum().next()).longValue());
             assertEquals(535.0/3, tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val")).values("height").mean().next());
             Metrics mMixedOr = tx.traversal().V().or(__.has("name", "bob"), __.has("prop", "val"))
                 .profile().next().getMetrics(0);
@@ -1273,7 +1342,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(3, tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).toList().size());
         assertEquals(190, tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).values("height").max().next());
         assertEquals(170, tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).values("height").min().next());
-        assertEquals(535L, tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).values("height").sum().next());
+        assertEquals(535L, ((Number) tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).values("height").sum().next()).longValue());
         assertEquals(535.0/3, tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20)).values("height").mean().next());
         Metrics mMixedOr = tx.traversal().V().or(__.has("name", "bob"), __.has("age", 20))
             .profile().next().getMetrics(0);
@@ -1330,7 +1399,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(1, tx.traversal().V().has("name", "bob").has("prop", "val").toList().size());
         assertEquals(170, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").max().next());
         assertEquals(170, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").min().next());
-        assertEquals(170L, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").sum().next());
+        assertEquals(170L, ((Number) tx.traversal().V().has("name", "bob").has("prop", "val").values("height").sum().next()).longValue());
         assertEquals(170.0, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").mean().next());
         assertEquals(174.8, (double)tx.traversal().V().has("name", "bob").values("weight").sum().next(), 0.001);
         Metrics mMixedAnd = tx.traversal().V().has("name", "bob").has("prop", "val")
@@ -1362,7 +1431,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(1, tx.traversal().V().has("name", "bob").has("prop", "val").toList().size());
         assertEquals(170, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").max().next());
         assertEquals(170, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").min().next());
-        assertEquals(170L, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").sum().next());
+        assertEquals(170L, ((Number) tx.traversal().V().has("name", "bob").has("prop", "val").values("height").sum().next()).longValue());
         assertEquals(170.0, tx.traversal().V().has("name", "bob").has("prop", "val").values("height").mean().next());
         final Metrics mMixedAnd2 = tx.traversal().V().has("name", "bob").has("prop", "val")
             .has("desc", Text.textContains("coding")).profile().next().getMetrics(0);
@@ -2448,7 +2517,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         vs[0].property(VertexProperty.Cardinality.single, "age", 66);
         newTx();
 
-        clopen();
+        clopen(RECOVERY_LOG_READS);
         //Just to make sure nothing has been persisted to index
         evaluateQuery(tx.query().has("name", Text.CONTAINS, "boy"),
                 ElementCategory.VERTEX, 0, new boolean[]{true, true}, "mi");
@@ -2456,8 +2525,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         Transaction Recovery
          */
         final TransactionRecovery recovery = JanusGraphFactory.startTransactionRecovery(graph, startTime);
-        //wait
-        Thread.sleep(12000L);
+        awaitRecoveredTransactions(recovery, 5, RECOVERY_SETTLING);
 
         recovery.shutdown();
         final long[] recoveryStats = ((StandardTransactionLogProcessor) recovery).getStatistics();
@@ -2482,6 +2550,122 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
 
         assertEquals(1, recoveryStats[0]); //schema transaction was successful
         assertEquals(4, recoveryStats[1]); //all 4 index transaction had provoked errors in the indexing backend
+    }
+
+    @Test
+    public void testRecoveryWaitsForAFinalStatusReadOnePollLater() throws Exception {
+        final String userLogName = "recovery";
+        //The commit spends 2.5 s in its index write before it writes its user-log event and its final status, which
+        //leaves the rest of the commit 2.5 s to fit in max-commit-time on a slow index backend. Recovery, started as
+        //the commit returns, reads the log up to 2 s back in its first poll, which takes in the commit's first entries
+        //but not its final status, and reads that in its next poll, 6 s later
+        clopen(option(SYSTEM_LOG_TRANSACTIONS), true
+                , option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofSeconds(2)
+                , option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofSeconds(6)
+                , option(MAX_COMMIT_TIME), Duration.ofSeconds(5)
+                , option(KCVSLog.LOG_READ_LAG_TIME, USER_LOG), Duration.ofMillis(50)
+                , option(LOG_READ_INTERVAL, USER_LOG), Duration.ofMillis(250)
+                , option(LOG_SEND_DELAY, USER_LOG), Duration.ZERO
+                , option(TestMockIndexProvider.INDEX_BACKEND_PROXY, INDEX), readConfig.get(INDEX_BACKEND, INDEX)
+                , option(INDEX_BACKEND, INDEX), TestMockIndexProvider.class.getName()
+                , option(TestMockIndexProvider.INDEX_MOCK_MUTATION_DELAY, INDEX), Duration.ofMillis(2500)
+        );
+        final PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.buildIndex("mi", Vertex.class).addKey(name, getTextMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Instant startTime = graph.getConfiguration().getTimestampProvider().getTime();
+        final JanusGraphTransaction logged = graph.buildTransaction().logIdentifier(userLogName).start();
+        logged.addVertex("name", "Sent Once");
+        logged.commit();
+        final TransactionRecovery recovery = JanusGraphFactory.startTransactionRecovery(graph, startTime);
+        final AtomicInteger userLogEvents = new AtomicInteger();
+        final LogProcessorFramework userLogs = JanusGraphFactory.openTransactionLog(graph);
+        userLogs.addLogProcessor(userLogName).setStartTime(startTime).setRetryAttempts(1)
+                .addProcessor((tx, txId, changes) -> userLogEvents.incrementAndGet()).build();
+        try {
+            //Not settled: with this test's slower reads a second count would come late, and the user-log event which
+            //recovery sends again with it shows the same sooner
+            final long[] recoveryStats = awaitRecoveredTransactions(recovery, 1, Duration.ZERO);
+            //The commit's own event arrives within the user log's read interval, and one recovery had sent again
+            //with the count above would arrive within another, so that gets a second to show
+            final long eventDeadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (userLogEvents.get() < 1 && System.nanoTime() - eventDeadline < 0) {
+                Thread.sleep(100L);
+            }
+            Thread.sleep(1000L);
+            assertEquals(1, userLogEvents.get());
+            assertArrayEquals(new long[]{1, 0, 0}, recoveryStats); //the transaction succeeded
+        } finally {
+            userLogs.shutdown();
+            recovery.shutdown();
+        }
+    }
+
+    @Test
+    public void testRecoveryTimesATransactionByItsFirstEntryAndNotByItsCommitTime() throws Exception {
+        final String userLogName = "backdated";
+        clopen(option(SYSTEM_LOG_TRANSACTIONS), true
+                , option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofMillis(50)
+                , option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofMillis(250)
+                , option(MAX_COMMIT_TIME), Duration.ofSeconds(1)
+                , option(KCVSLog.LOG_READ_LAG_TIME, USER_LOG), Duration.ofMillis(50)
+                , option(LOG_READ_INTERVAL, USER_LOG), Duration.ofMillis(250)
+                , option(LOG_SEND_DELAY, USER_LOG), Duration.ZERO
+        );
+        final PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.buildIndex("mi", Vertex.class).addKey(name, getTextMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Instant startTime = graph.getConfiguration().getTimestampProvider().getTime();
+        final TransactionRecovery recovery = JanusGraphFactory.startTransactionRecovery(graph, startTime);
+        final AtomicInteger userLogEvents = new AtomicInteger();
+        final LogProcessorFramework userLogs = JanusGraphFactory.openTransactionLog(graph);
+        userLogs.addLogProcessor(userLogName).setStartTime(startTime).setRetryAttempts(1)
+                .addProcessor((tx, txId, changes) -> userLogEvents.incrementAndGet()).build();
+        try {
+            //A commit time an hour back, as a job which backdates its writes sets one. The transaction's log entries
+            //carry the times they were written at, and recovery has to time the transaction by those: timed by its
+            //commit time, it would be given up on the moment its first entry is read
+            final JanusGraphTransaction backdated = graph.buildTransaction().logIdentifier(userLogName)
+                .commitTime(startTime.minus(Duration.ofHours(1))).start();
+            backdated.addVertex("name", "Long Ago");
+            backdated.commit();
+
+            //Settled: timed by its commit time, the transaction would be counted once per entry, and the first of those
+            //counts, from its first entry, comes before the others
+            final long[] recoveryStats = awaitRecoveredTransactions(recovery, 1, RECOVERY_SETTLING);
+            assertArrayEquals(new long[]{1, 0, 0}, recoveryStats); //the transaction succeeded, once
+            assertEquals(1, userLogEvents.get());
+        } finally {
+            userLogs.shutdown();
+            recovery.shutdown();
+        }
+    }
+
+    /**
+     * Waits until the recovery has counted the given number of transactions, succeeded or failed, and then for the
+     * settling time on top, or until it counts more, so that a count above the expected one shows instead of being cut
+     * short by the shutdown which follows. Returns its statistics.
+     */
+    private static long[] awaitRecoveredTransactions(TransactionRecovery recovery, long transactions,
+                                                     Duration settling) throws InterruptedException {
+        final StandardTransactionLogProcessor processor = (StandardTransactionLogProcessor) recovery;
+        final long deadline = System.nanoTime() + Duration.ofMinutes(1).toNanos();
+        long[] statistics = processor.getStatistics();
+        while (statistics[0] + statistics[1] < transactions && System.nanoTime() - deadline < 0) {
+            Thread.sleep(100L);
+            statistics = processor.getStatistics();
+        }
+        assertTrue(statistics[0] + statistics[1] >= transactions, "recovery counted " + statistics[0] + " succeeded "
+            + "and " + statistics[1] + " failed transactions within a minute, fewer than the " + transactions
+            + " expected");
+        final long settled = System.nanoTime() + settling.toNanos();
+        while (statistics[0] + statistics[1] <= transactions && System.nanoTime() - settled < 0) {
+            Thread.sleep(100L);
+            statistics = processor.getStatistics();
+        }
+        return statistics;
     }
 
     @Tag(TestCategory.BRITTLE_TESTS)
@@ -2523,7 +2707,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         vs[0].property(VertexProperty.Cardinality.single, "age", 66);
         newTx();
 
-        clopen();
+        clopen(RECOVERY_LOG_READS);
         //Just to make sure nothing has been persisted to index
         evaluateQuery(tx.query().has("name", Text.CONTAINS, "boy"),
                 ElementCategory.VERTEX, 0, new boolean[]{true, true}, "mi");
@@ -2533,10 +2717,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         Transaction Recovery
          */
         final TransactionRecovery recoveryDay1 = JanusGraphFactory.startRecurringTransactionRecovery(graph, startTimeDay1);
-        //wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsDay1 = ((StandardTransactionLogProcessor) recoveryDay1).getStatistics();
+        final long[] recoveryStatsDay1 = awaitRecoveredTransactions(recoveryDay1, 5, RECOVERY_SETTLING);
         recoveryDay1.shutdown();
 
         clopen();
@@ -2591,7 +2772,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         vs2[0].property(VertexProperty.Cardinality.single, "age", 56);
         newTx();
 
-        clopen();
+        clopen(RECOVERY_LOG_READS);
         //Just to make sure nothing has been persisted to index
         evaluateQuery(tx.query().has("name", Text.CONTAINS, "girl"),
                 ElementCategory.VERTEX, 0, new boolean[]{true, true}, "mi");
@@ -2601,10 +2782,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         Transaction Recovery
          */
         final TransactionRecovery recoveryDay2 = JanusGraphFactory.startRecurringTransactionRecovery(graph, startTimeDay2);
-        //wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsDay2 = ((StandardTransactionLogProcessor) recoveryDay2).getStatistics();
+        final long[] recoveryStatsDay2 = awaitRecoveredTransactions(recoveryDay2, 4, RECOVERY_SETTLING);
         recoveryDay2.shutdown();
 
         clopen();
@@ -2663,13 +2841,10 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
          * Transaction Recovery
          */
         final TransactionRecovery recoveryDay3_1 = JanusGraphFactory.startRecurringTransactionRecovery(graph, startTimeDay3);
-        // wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsDay3_1 = ((StandardTransactionLogProcessor) recoveryDay3_1).getStatistics();
+        final long[] recoveryStatsDay3_1 = awaitRecoveredTransactions(recoveryDay3_1, 1, RECOVERY_SETTLING);
         recoveryDay3_1.shutdown();
 
-        clopen();
+        clopen(RECOVERY_LOG_READS);
 
         evaluateQuery(tx.query().has("name", Text.CONTAINS, "random"),
                 ElementCategory.VERTEX, 0, new boolean[] { true, true }, "mi");
@@ -2683,10 +2858,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
 
         // Simulating DAY 3 index recovery when finally indexing backend is up again
         final TransactionRecovery recoveryDay3_2 = JanusGraphFactory.startRecurringTransactionRecovery(graph, startTimeDay3);
-        // wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsDay3_2 = ((StandardTransactionLogProcessor) recoveryDay3_2).getStatistics();
+        final long[] recoveryStatsDay3_2 = awaitRecoveredTransactions(recoveryDay3_2, 1, RECOVERY_SETTLING);
         recoveryDay3_2.shutdown();
 
         clopen();
@@ -2744,10 +2916,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
          */
         final TransactionRecovery recoveryBatch1 = JanusGraphFactory.startRecurringTransactionRecovery(graph,
                 startTimeBatch1);
-        //wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsBatch1 = ((StandardTransactionLogProcessor) recoveryBatch1).getStatistics();
+        final long[] recoveryStatsBatch1 = awaitRecoveredTransactions(recoveryBatch1, 2, RECOVERY_SETTLING);
         recoveryBatch1.shutdown();
 
         assertEquals(0, recoveryStatsBatch1[0]); //no transaction was successful
@@ -2777,10 +2946,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
          */
         final TransactionRecovery recoveryBatch2 = JanusGraphFactory.startRecurringTransactionRecovery(graph,
                 startTimeBatch2);
-        //wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsBatch2 = ((StandardTransactionLogProcessor) recoveryBatch2).getStatistics();
+        final long[] recoveryStatsBatch2 = awaitRecoveredTransactions(recoveryBatch2, 2, RECOVERY_SETTLING);
         recoveryBatch2.shutdown();
 
         assertEquals(0, recoveryStatsBatch2[0]); //no transaction was successful
@@ -2793,10 +2959,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
          */
         final TransactionRecovery recoveryBatch1_2 = JanusGraphFactory.startRecurringTransactionRecovery(graph,
                 startTimeBatch1);
-        //wait
-        Thread.sleep(12000L);
-
-        final long[] recoveryStatsBatch1_2 = ((StandardTransactionLogProcessor) recoveryBatch1_2).getStatistics();
+        final long[] recoveryStatsBatch1_2 = awaitRecoveredTransactions(recoveryBatch1_2, 4, RECOVERY_SETTLING);
         recoveryBatch1_2.shutdown();
 
         assertEquals(0, recoveryStatsBatch1_2[0]); //no transaction was successful

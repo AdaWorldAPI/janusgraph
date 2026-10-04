@@ -14,11 +14,11 @@
 
 ARG BASE_IMAGE=eclipse-temurin:11-jre
 
-FROM debian:bullseye-slim AS builder
+FROM debian:trixie-slim AS builder
 
 ARG TARGETARCH
 ARG JANUS_VERSION=1.0.0-SNAPSHOT
-ARG BUILD_PATH=janusgraph-java-11-1.0.0-SNAPSHOT
+ARG BUILD_PATH=janusgraph-1.0.0-SNAPSHOT
 ARG YQ_VERSION=3.4.1
 
 ENV JANUS_VERSION=${JANUS_VERSION} \

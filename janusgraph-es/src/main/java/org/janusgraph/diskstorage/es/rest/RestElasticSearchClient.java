@@ -36,11 +36,15 @@ import org.apache.tinkerpop.shaded.jackson.databind.module.SimpleModule;
 import org.elasticsearch.client.Request;
 import org.elasticsearch.client.Response;
 import org.elasticsearch.client.ResponseException;
+import org.elasticsearch.client.ResponseListener;
 import org.elasticsearch.client.RestClient;
 import org.janusgraph.core.attribute.Geoshape;
 import org.janusgraph.diskstorage.es.ElasticMajorVersion;
+import org.janusgraph.diskstorage.es.ElasticSearchBulkFailureException;
 import org.janusgraph.diskstorage.es.ElasticSearchClient;
+import org.janusgraph.diskstorage.es.ElasticSearchIndex;
 import org.janusgraph.diskstorage.es.ElasticSearchMutation;
+import org.janusgraph.diskstorage.es.TransientFailures;
 import org.janusgraph.diskstorage.es.mapping.IndexMapping;
 import org.janusgraph.diskstorage.es.mapping.TypedIndexMappings;
 import org.janusgraph.diskstorage.es.mapping.TypelessIndexMappings;
@@ -59,11 +63,14 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -76,6 +83,9 @@ public class RestElasticSearchClient implements ElasticSearchClient {
     private static final String REQUEST_TYPE_DELETE = "DELETE";
     private static final String REQUEST_TYPE_GET = "GET";
     private static final String REQUEST_TYPE_POST = "POST";
+    //The type Elasticsearch names in the error of a bulk item which was answered with a 404 because the index is gone
+    private static final String INDEX_NOT_FOUND_EXCEPTION = "index_not_found_exception";
+    private static final String ERROR_TYPE_KEY = "type";
     private static final String REQUEST_TYPE_PUT = "PUT";
     private static final String REQUEST_TYPE_HEAD = "HEAD";
     private static final String REQUEST_SEPARATOR = "/";
@@ -118,11 +128,17 @@ public class RestElasticSearchClient implements ElasticSearchClient {
 
     private final boolean useMappingTypes;
 
+    //OpenSearch 2 removed the mapping types which Elasticsearch 7 still supports, and JanusGraph supports OpenSearch 2
+    //and newer only
+    private boolean mappingTypesRemoved;
+
     private final boolean esVersion7;
 
     private Integer retryOnConflict;
 
-    private final String retryOnConflictKey;
+    //Whether a failure which produced no HTTP response is reattempted like a status code in retryOnErrorCodes.
+    //Configured through RestClientSetup from RETRY_TRANSPORT_FAILURES, like the other optional client settings
+    private boolean retryTransportFailures;
 
     private final int retryAttemptLimit;
 
@@ -133,16 +149,36 @@ public class RestElasticSearchClient implements ElasticSearchClient {
     private final long retryMaxWaitMs;
 
     private final int bulkChunkSerializedLimitBytes;
+    //Set once the first rejected scroll release has been logged as a warning. Every scroll of the index backend is
+    //released through this client with the same credentials, so later rejections repeat the same problem and are
+    //logged at debug level. Releases complete on the HTTP client's I/O threads, hence the atomic flag
+    private final AtomicBoolean warnedAboutRejectedScrollRelease = new AtomicBoolean();
 
 public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean useMappingTypesForES7,
                                int retryAttemptLimit, Set<Integer> retryOnErrorCodes, long retryInitialWaitMs,
                                long retryMaxWaitMs, int bulkChunkSerializedLimitBytes) {
+        this(delegate, scrollKeepAlive, useMappingTypesForES7, retryAttemptLimit, retryOnErrorCodes, retryInitialWaitMs,
+            retryMaxWaitMs, bulkChunkSerializedLimitBytes, null);
+    }
+
+    /**
+     * @param configuredMajorVersion the major version of the Elasticsearch API to use, or {@code null} to ask the
+     * cluster for it
+     */
+    public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean useMappingTypesForES7,
+                                   int retryAttemptLimit, Set<Integer> retryOnErrorCodes, long retryInitialWaitMs,
+                                   long retryMaxWaitMs, int bulkChunkSerializedLimitBytes,
+                                   ElasticMajorVersion configuredMajorVersion) {
         this.delegate = delegate;
-        majorVersion = getMajorVersion();
+        majorVersion = configuredMajorVersion != null ? configuredMajorVersion : getMajorVersion();
         this.scrollKeepAlive = scrollKeepAlive+"s";
         esVersion7 = ElasticMajorVersion.SEVEN.equals(majorVersion);
-        useMappingTypes = majorVersion.getValue() < 7 || (useMappingTypesForES7 && esVersion7);
-        retryOnConflictKey = majorVersion.getValue() >= 7 ? "retry_on_conflict" : "_retry_on_conflict";
+        if (useMappingTypesForES7 && mappingTypesRemoved) {
+            log.warn("The option index.[X].elasticsearch.{} is ignored: the cluster is OpenSearch, and OpenSearch 2 and " +
+                "newer have no mapping types.",
+                ElasticSearchIndex.USE_MAPPING_FOR_ES7.getName());
+        }
+        useMappingTypes = majorVersion.getValue() < 7 || (useMappingTypesForES7 && esVersion7 && !mappingTypesRemoved);
         this.retryAttemptLimit = retryAttemptLimit;
         this.retryOnErrorCodes = Collections.unmodifiableSet(retryOnErrorCodes);
         this.retryInitialWaitMs = retryInitialWaitMs;
@@ -166,13 +202,30 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
             final Response response = delegate.performRequest(INFO_REQUEST);
             try (final InputStream inputStream = response.getEntity().getContent()) {
                 final ClusterInfo info = mapper.readValue(inputStream, ClusterInfo.class);
-                majorVersion = ElasticMajorVersion.parse(info.getVersion() != null ? (String) info.getVersion().get("number") : null);
+                try {
+                    majorVersion = ElasticMajorVersion.fromServerVersion(info.getVersion());
+                } catch (final IllegalArgumentException e) {
+                    throw new IllegalArgumentException(e.getMessage() + ". Set index.[X].elasticsearch." +
+                        ElasticSearchIndex.MAJOR_VERSION.getName() + " if the cluster provides the API of a supported " +
+                        "Elasticsearch major version.", e);
+                }
+                mappingTypesRemoved = ElasticMajorVersion.isOpenSearch(info.getVersion());
+                if (ElasticMajorVersion.isOpenSearch(info.getVersion())) {
+                    log.info("OpenSearch {} provides the Elasticsearch {} API, which JanusGraph uses.",
+                        info.getVersion().get("number"), majorVersion.getValue());
+                }
             }
         } catch (final IOException e) {
-            log.warn("Unable to determine Elasticsearch server version. Default to {}.", majorVersion, e);
+            log.warn("Unable to determine Elasticsearch server version. Default to {}. Set index.[X].elasticsearch.{} to " +
+                "skip the detection.", majorVersion, ElasticSearchIndex.MAJOR_VERSION.getName(), e);
         }
 
         return majorVersion;
+    }
+
+    @Override
+    public boolean usesMappingTypes() {
+        return useMappingTypes;
     }
 
     @Override
@@ -387,10 +440,9 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
     }
 
     @Override
-    public void clearStore(String indexName, String storeName) throws IOException {
-        String name = indexName + "_" + storeName;
-        if (indexExists(name)) {
-            performRequest(REQUEST_TYPE_DELETE, REQUEST_SEPARATOR + indexName + "_" + storeName, null);
+    public void clearStore(String indexStoreName) throws IOException {
+        if (indexExists(indexStoreName)) {
+            performRequest(REQUEST_TYPE_DELETE, REQUEST_SEPARATOR + indexStoreName, null);
         }
     }
 
@@ -398,9 +450,17 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
     class RequestBytes {
         final byte [] requestBytes;
         final byte [] requestSource;
+        //Retained so that a failed bulk item can be interpreted against the operation which produced it
+        final boolean removesContentOnly;
+        //The document the item belongs to, so that a failed bulk can say which documents did not apply
+        final String store;
+        final String documentId;
 
         @VisibleForTesting
         RequestBytes(final ElasticSearchMutation request) throws JsonProcessingException {
+            this.removesContentOnly = request.removesContentOnly();
+            this.store = request.getType();
+            this.documentId = request.getId();
             Map<String, Object> requestData = new HashMap<>();
             if (useMappingTypes) {
                 requestData.put("_index", request.getIndex());
@@ -411,8 +471,11 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
                 requestData.put("_id", request.getId());
             }
 
-            if (retryOnConflict != null && request.getRequestType() == ElasticSearchMutation.RequestType.UPDATE) {
-                requestData.put(retryOnConflictKey, retryOnConflict);
+            //Elasticsearch's own default is 0, so a request needs the key only above it. Every supported version
+            //reads retry_on_conflict; Elasticsearch 6 merely deprecated the _retry_on_conflict it also accepted
+            if (retryOnConflict != null && retryOnConflict > 0
+                && request.getRequestType() == ElasticSearchMutation.RequestType.UPDATE) {
+                requestData.put("retry_on_conflict", retryOnConflict);
             }
 
             this.requestBytes =  mapWriter.writeValueAsBytes(ImmutableMap.of(request.getRequestType().name().toLowerCase(), requestData));
@@ -471,14 +534,45 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
         for (int itemIndex = 0; itemIndex < bulkResponseItems.size(); itemIndex++) {
             Collection<RestBulkResponse.RestBulkItemResponse> bulkResponseItem = bulkResponseItems.get(itemIndex).values();
             if (bulkResponseItem.size() > 1) {
-                throw new IllegalStateException("There should only be a single item per bulk reponse item entry");
+                throw new IllegalStateException("There should only be a single item per bulk response item entry");
             }
             RestBulkResponse.RestBulkItemResponse item = bulkResponseItem.iterator().next();
-            if (item.getError() != null && item.getStatus() != HttpStatus.SC_NOT_FOUND) {
-                errors.add(Triplet.with(item.getError(), item.getStatus(), submittedBulkRequestItems.get(itemIndex)));
+            final RequestBytes submittedItem = submittedBulkRequestItems.get(itemIndex);
+            if (item.getError() != null && !isAbsentDocumentRemoval(item, submittedItem)) {
+                errors.add(Triplet.with(item.getError(), item.getStatus(), submittedItem));
             }
         }
         return errors;
+    }
+
+    //Removing content which is already absent leaves the index in the state the mutation asked for, so the 404
+    //Elasticsearch answers with is a success. Both a whole document deletion and a script which deletes fields count.
+    //A 404 for a mutation which adds content is a document_missing_exception: the write did not happen, and treating
+    //it as a success drops the mutation with nothing reported.
+    //The one 404 a removal is not exempt from is the index_not_found_exception Elasticsearch answers a deletion
+    //against a missing index with: the whole index being gone is not a state any mutation asked for, and an addition
+    //against the same index is reported, so a removal is too. The reasons a 404 otherwise carries here: a whole
+    //document deletion of an absent document does not reach this method at all, because Elasticsearch answers it
+    //with result not_found and no error; the field deletion script gets a document_missing_exception, which is
+    //exempt; and an update against a missing index, with the default action.auto_create_index, creates the index and
+    //then reports the document as missing
+    private static boolean isAbsentDocumentRemoval(final RestBulkResponse.RestBulkItemResponse item,
+                                                   final RequestBytes submittedItem) {
+        return item.getStatus() == HttpStatus.SC_NOT_FOUND && submittedItem.removesContentOnly
+            && !isIndexNotFound(item.getError());
+    }
+
+    private static Map<String, Set<String>> documentsByStore(final Iterable<RequestBytes> requests) {
+        final Map<String, Set<String>> documentsByStore = new HashMap<>();
+        for (final RequestBytes request : requests) {
+            documentsByStore.computeIfAbsent(request.store, k -> new HashSet<>()).add(request.documentId);
+        }
+        return documentsByStore;
+    }
+
+    //The error of a failed bulk item is a map which names the exception under "type"
+    private static boolean isIndexNotFound(final Object error) {
+        return error instanceof Map && INDEX_NOT_FOUND_EXCEPTION.equals(((Map<?, ?>) error).get(ERROR_TYPE_KEY));
     }
 
     @VisibleForTesting
@@ -492,6 +586,9 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
         // size of a HTTP request to 100mb by default
         private final PeekingIterator<RequestBytes> requestIterator;
         private final int[] exceptionallyLargeRequests;
+        //The documents of the oversized requests, by store: never sent, and reported only once every well sized chunk
+        //went through, so a failure before that has to name them as unsent
+        private final Map<String, Set<String>> oversizedDocumentsByStore = new HashMap<>();
 
         @VisibleForTesting
         BulkRequestChunker(List<ElasticSearchMutation> requests) throws JsonProcessingException {
@@ -500,17 +597,36 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
             for (ElasticSearchMutation request : requests) {
                 RequestBytes requestBytes = new RequestBytes(request);
                 int requestSerializedSize = requestBytes.getSerializedSize();
+                final ElasticSearchMutation withoutCompleteDocument = request.withoutCompleteDocument();
+                if (requestSerializedSize > bulkChunkSerializedLimitBytes && withoutCompleteDocument != null) {
+                    //The element's complete document only matters when the document turns out to be missing. An update
+                    //it makes too large to send goes without it, and updates an existing document exactly the same way
+                    requestBytes = new RequestBytes(withoutCompleteDocument);
+                    requestSerializedSize = requestBytes.getSerializedSize();
+                }
                 if (requestSerializedSize <= bulkChunkSerializedLimitBytes) {
                     //Only keep items that we can actually send in memory
                     serializedRequests.add(requestBytes);
                 } else {
                     requestSizesThatWereTooLarge.add(requestSerializedSize);
+                    oversizedDocumentsByStore.computeIfAbsent(request.getType(), k -> new HashSet<>()).add(request.getId());
                 }
             }
             this.requestIterator = Iterators.peekingIterator(serializedRequests.iterator());
             //Condense request sizes that are too large into an int array to remove Boxed & List memory overhead
             this.exceptionallyLargeRequests = requestSizesThatWereTooLarge.isEmpty() ? null :
                 requestSizesThatWereTooLarge.stream().mapToInt(Integer::intValue).toArray();
+        }
+
+        //The documents which have not been sent, by store: those of the chunks not handed out yet, and the oversized
+        //ones. A failure names them as unsent so that a reattempt does not take them for applied and drop them. This
+        //consumes the chunker, so it is asked once, when a failure ends the request
+        Map<String, Set<String>> unsentDocumentsByStore() {
+            final Map<String, Set<String>> unsent = new HashMap<>();
+            requestIterator.forEachRemaining(request ->
+                unsent.computeIfAbsent(request.store, k -> new HashSet<>()).add(request.documentId));
+            oversizedDocumentsByStore.forEach((store, ids) -> unsent.computeIfAbsent(store, k -> new HashSet<>()).addAll(ids));
+            return unsent;
         }
 
         @Override
@@ -568,8 +684,25 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
                             retryCount++;
                         } else {
                             final List<Object> errorItems = bulkItemsThatFailed.stream().map(Triplet::getValue0).collect(Collectors.toList());
-                            errorItems.forEach(error -> log.error("Failed to execute ES query: {}", error));
-                            throw new IOException("Failure(s) in Elasticsearch bulk request: " + errorItems);
+                            //Summarise rather than log a line per item: a large batch rejected wholesale would
+                            //otherwise emit thousands of lines, once per reattempt, exactly during the outage the
+                            //reattempts exist for. The level which matches the outcome of the whole mutation is the
+                            //caller's to choose, and the thrown exception carries every failed item on a getter
+                            log.warn("{} of {} items in the Elasticsearch bulk request failed, with statuses {}",
+                                bulkItemsThatFailed.size(), bulkRequestChunk.size(), errorCodes);
+                            if (log.isDebugEnabled()) {
+                                for (final Triplet<Object, Integer, RequestBytes> failedItem : bulkItemsThatFailed) {
+                                    log.debug("Failed to execute ES query with status {}: {}",
+                                        failedItem.getValue1(), failedItem.getValue0());
+                                }
+                            }
+                            final List<RequestBytes> failedRequests = bulkItemsThatFailed.stream()
+                                .map(Triplet::getValue2).collect(Collectors.toList());
+                            //Retain the item statuses so callers can classify the failure as transient or permanent,
+                            //and the documents so that a reattempt can leave out those which applied: the ones whose
+                            //items failed here, and the ones of the chunks this failure stops from being sent at all
+                            throw new ElasticSearchBulkFailureException(errorCodes, errorItems,
+                                documentsByStore(failedRequests), bulkRequestChunker.unsentDocumentsByStore());
                         }
                     } else {
                         //The entire bulk request was successful, leave the loop
@@ -578,6 +711,10 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
                 }
             }
         }
+    }
+
+    public void setRetryTransportFailures(boolean retryTransportFailures) {
+        this.retryTransportFailures = retryTransportFailures;
     }
 
     public void setRetryOnConflict(Integer retryOnConflict) {
@@ -684,7 +821,43 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
 
     @Override
     public void deleteScroll(String scrollId) throws IOException {
-        delegate.performRequest(new Request(REQUEST_TYPE_DELETE, REQUEST_SEPARATOR + "_search" + REQUEST_SEPARATOR + "scroll" + REQUEST_SEPARATOR + scrollId));
+        final Request request = new Request(REQUEST_TYPE_DELETE, REQUEST_SEPARATOR + "_search" + REQUEST_SEPARATOR + "scroll");
+        //The id goes in the body: the path form has been deprecated since Elasticsearch 7, and an id can outgrow a URL
+        request.setEntity(new ByteArrayEntity(
+            mapWriter.writeValueAsBytes(ImmutableMap.of("scroll_id", ImmutableList.of(scrollId))), ContentType.APPLICATION_JSON));
+        //Releasing the context shouldn't cost the search a round trip, so the request goes out without waiting for
+        //its answer. Should it be lost, the context expires after the keep-alive anyway
+        delegate.performRequestAsync(request, new ResponseListener() {
+            @Override
+            public void onSuccess(Response response) {
+            }
+
+            @Override
+            public void onFailure(Exception exception) {
+                //A release the cluster rejects, for example for want of the privilege to clear scrolls, means every
+                //context this client opens stays open until it expires, which is worth one warning. A lost request,
+                //a cluster which is momentarily unable to answer, or a context which had expired already isn't
+                if (exception instanceof ResponseException
+                    && isRejectedScrollRelease(((ResponseException) exception).getResponse().getStatusLine().getStatusCode())
+                    && !warnedAboutRejectedScrollRelease.getAndSet(true)) {
+                    log.warn("Elasticsearch rejected the release of the scroll {}, so scroll contexts stay open until they " +
+                        "expire after {}. Further rejections are logged at debug level.", scrollId, scrollKeepAlive, exception);
+                } else {
+                    log.debug("Could not release the Elasticsearch scroll {}, which expires after {}", scrollId, scrollKeepAlive, exception);
+                }
+            }
+        });
+    }
+
+    /**
+     * Whether a status answers the release of a scroll with a rejection which every later release will meet as well:
+     * a request the cluster doesn't accept (400, 405) or doesn't permit (401, 403). A context which is gone already
+     * (404), a busy cluster (429), a timed out request (408) or a server error are passing, not the release's.
+     */
+    @VisibleForTesting
+    static boolean isRejectedScrollRelease(int statusCode) {
+        return statusCode == HttpStatus.SC_BAD_REQUEST || statusCode == HttpStatus.SC_UNAUTHORIZED
+            || statusCode == HttpStatus.SC_FORBIDDEN || statusCode == HttpStatus.SC_METHOD_NOT_ALLOWED;
     }
 
     public void setBulkRefresh(String bulkRefresh) {
@@ -711,6 +884,10 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
         return performRequest(new Request(method, path), requestData);
     }
 
+    //Reattempts a request which failed transiently, up to retryAttemptLimit times. A status code is transient when
+    //it is listed in retryOnErrorCodes; a failure which produced no response at all - and so has no status code -
+    //is transient when retryTransportFailures is set. Both are the same definition ElasticSearchIndex classifies
+    //the final failure by, so a failure which survives these attempts is handed on rather than contradicted
     private Response performRequestWithRetry(Request request) throws IOException {
         int retryCount = 0;
         while (true) {
@@ -720,18 +897,33 @@ public RestElasticSearchClient(RestClient delegate, int scrollKeepAlive, boolean
                 if (!retryOnErrorCodes.contains(e.getResponse().getStatusLine().getStatusCode()) || retryCount >= retryAttemptLimit) {
                     throw e;
                 }
-                performRetryWait(retryCount);
+            } catch (IOException e) {
+                if (!retryTransportFailures || !TransientFailures.hasTransportFailureCause(e) || retryCount >= retryAttemptLimit) {
+                    throw e;
+                }
             }
+            performRetryWait(retryCount);
             retryCount++;
         }
     }
 
+    //Anywhere from half of the backoff to all of it, so that requests which failed together, as they do when
+    //Elasticsearch is overloaded, don't all come back at the same moment
+    @VisibleForTesting
+    long retryWaitMs(int retryCount) {
+        final long backoffMs = Math.min((long) (retryInitialWaitMs * Math.pow(10, retryCount)), retryMaxWaitMs);
+        return backoffMs / 2 + ThreadLocalRandom.current().nextLong(backoffMs - backoffMs / 2 + 1);
+    }
+
     private void performRetryWait(int retryCount) {
-        long waitDurationMs = Math.min((long) (retryInitialWaitMs * Math.pow(10, retryCount)), retryMaxWaitMs);
+        final long waitDurationMs = retryWaitMs(retryCount);
         log.warn("Retrying Elasticsearch request in {} ms. Attempt {} of {}", waitDurationMs, retryCount, retryAttemptLimit);
         try {
             Thread.sleep(waitDurationMs);
         } catch (InterruptedException interruptedException) {
+            //Thread.sleep cleared the interrupt status when it threw. Put it back so that whoever is waiting above -
+            //BackendOperation, which aborts its own backoff on it - can see the operation was cancelled
+            Thread.currentThread().interrupt();
             throw new RuntimeException(String.format("Thread interrupted while waiting for retry attempt %d of %d", retryCount, retryAttemptLimit), interruptedException);
         }
     }

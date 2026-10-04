@@ -9,8 +9,8 @@
 > Overview](https://www.elastic.co/elasticsearch/)
 
 JanusGraph supports [Elasticsearch](https://www.elastic.co/) as an index
-backend. Here are some of the Elasticsearch features supported by
-JanusGraph:
+backend, and [OpenSearch](#opensearch) with the same index backend. Here
+are some of the Elasticsearch features supported by JanusGraph:
 
 -   **Full-Text**: Supports all `Text` predicates to search for text
     properties that matches a given word, prefix or regular expression.
@@ -111,9 +111,34 @@ these options and their accepted values.
 
 ### REST Client Options
 
-The REST client accepts the `index.[X].bulk-refresh` option. This option
+The REST client accepts the `index.[X].elasticsearch.bulk-refresh` option. This option
 controls when changes are made visible to search. See [?refresh documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-refresh.html)
 for more information.
+
+The client of an index backend opens up to `index.[X].elasticsearch.max-connections` connections to all Elasticsearch
+hosts together, 30 by default, and up to `index.[X].elasticsearch.max-connections-per-host` to each host, by default the
+total divided evenly among the hosts, but at least 10. A request waits until a connection is free, so these cap how many
+queries and bulk requests the index backend has in flight at once. A single host, such as a load balancer or the
+endpoint of a hosted cluster, takes all 30 connections by default, while three hosts take 10 each, so that a host which
+stops answering can't hold every connection. A JanusGraph Server which runs more Gremlin threads than that may need
+higher values. Before JanusGraph 1.2.0 the client allowed 10 connections per host, whatever the number of hosts.
+
+The client sends and receives with as many I/O threads as the JVM has processors, unless
+`index.[X].elasticsearch.io-threads` sets another number. They don't wait for Elasticsearch, so a few are enough, which
+matters for a JanusGraph Server with many graphs, as every index backend of every graph has a client of its own.
+
+`index.[X].elasticsearch.compression=true` compresses the bodies of requests with gzip, bulk requests above all, and
+accepts compressed responses, which saves network traffic at the cost of CPU on both sides. The client compresses a
+request on one of its I/O threads, whose other requests wait meanwhile, so a large bulk request can delay queries. More
+I/O threads make it less likely that a query shares that thread, and a smaller
+`index.[X].elasticsearch.bulk-chunk-size-limit-bytes` shortens the wait. A compressed request is sent in chunks without
+a Content-Length header, which some request signers, such as interceptors which sign requests with AWS Signature Version
+4, may not handle.
+
+A load balancer, NAT gateway or firewall between JanusGraph and Elasticsearch may drop a connection which stays idle
+longer than its idle timeout, and the next request on that connection then fails. Set
+`index.[X].elasticsearch.client-keep-alive` below that timeout, so that the client stops reusing a connection before the
+network drops it.
 
 ### REST Client HTTPS Configuration
 
@@ -266,6 +291,58 @@ Add a firewall rule that allows only trusted clients to connect on Elasticsearch
 This is typically done at the host firewall level. Easy to configure,
 but very weak security by itself.
 
+## OpenSearch
+
+JanusGraph supports [OpenSearch](https://opensearch.org/) 2 and 3 with the `elasticsearch` index backend.
+OpenSearch was forked from Elasticsearch 7.10 and provides the Elasticsearch 7 API, which JanusGraph uses
+when the cluster reports an OpenSearch version:
+
+```properties
+index.search.backend=elasticsearch
+index.search.hostname=localhost
+```
+
+JanusGraph rejects other OpenSearch versions like unsupported Elasticsearch versions, unless
+`index.[X].elasticsearch.major-version` is set (see below). That includes OpenSearch 1, which reached its end
+of life in May 2025.
+
+When JanusGraph detects OpenSearch, it ignores `index.[X].elasticsearch.use-mapping-for-es7`, because
+OpenSearch 2 removed mapping types.
+
+OpenSearch doesn't need `compatibility.override_main_response_version` for JanusGraph, and OpenSearch 3
+removed that setting. With it, OpenSearch 2 reports the version 7.10.2, so JanusGraph takes it for
+Elasticsearch 7.
+
+`index.[X].elasticsearch.major-version` sets the major version of the Elasticsearch API which the cluster
+provides, so that JanusGraph doesn't ask the cluster for its version, for example if the JanusGraph user
+may not read the root endpoint of the cluster. For OpenSearch, set it to `7`.
+
+In both of these cases JanusGraph doesn't know that the cluster is OpenSearch, so keep
+`index.[X].elasticsearch.use-mapping-for-es7` disabled.
+
+The security plugin of OpenSearch is configured like a secured Elasticsearch cluster, with the
+[HTTPS](#rest-client-https-configuration) and
+[HTTP authentication](#rest-client-http-authentication) options:
+
+```properties
+index.search.elasticsearch.ssl.enabled=true
+index.search.elasticsearch.http.auth.type=basic
+index.search.elasticsearch.http.auth.basic.username=admin
+index.search.elasticsearch.http.auth.basic.password=<password>
+```
+
+JanusGraph raises the cluster setting `search.max_open_scroll_context` when it opens the index. If the
+JanusGraph user may not update cluster settings (`cluster:admin/settings/update`), set
+`index.[X].elasticsearch.setup-max-open-scroll-contexts` to `false`. Only a result larger than a page holds a
+scroll context, and it is released as soon as the result has been read or its traversal is closed (see
+[Search Requests](#search-requests)), so the default limit of 500 open contexts per node is rarely reached.
+
+Amazon OpenSearch Service domains which use IAM based access control need signed requests, which a
+[custom authenticator](#rest-client-custom-http-authentication) can provide. These domains don't allow
+changing `search.max_open_scroll_context`, so set `index.[X].elasticsearch.setup-max-open-scroll-contexts`
+to `false` for them. Amazon OpenSearch Serverless isn't supported: it provides neither the scroll API nor
+the stored scripts which JanusGraph uses.
+
 ## Index Creation Options
 
 JanusGraph supports customization of the index settings it uses when
@@ -333,6 +410,36 @@ diagnostic utility like `netstat`. Check the JanusGraph configuration.
 
 ## Optimizing Elasticsearch
 
+### Search Requests
+
+JanusGraph fetches the result of a mixed index query with as few requests as it can tell the result needs:
+
+* A query whose offset and limit together are at most 10,000, Elasticsearch's default
+  `index.max_result_window`, is one search request of exactly that size. Elasticsearch applies the offset of a
+  [direct index query](direct-index-query.md) in that request.
+* A query without a limit, or beyond that size, first asks for one hit more than a page after the offset, or
+  for what is left up to the 10,000th hit if that is less. The page size is `index.[X].max-result-set-size`
+  (50 by default). When fewer hits come back than were asked for, that is the whole result. Only a larger
+  result is read through the
+  [scroll API](https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html#scroll-search-results),
+  from its first hit on and in pages of that size, which costs such a result one request more than the pages
+  alone. An offset of 10,000 or more leaves nothing to ask for first, and such a query is read through a
+  scroll at once, however small its result.
+
+A scroll context is released as soon as the result has been read to its end, the limit is reached, or the
+traversal is closed, which JanusGraph Server does after every request. Embedded code which abandons a traversal
+before its end should close it, for example with try-with-resources; otherwise the context expires after
+`index.[X].elasticsearch.scroll-keep-alive` seconds (60 by default), as it did before JanusGraph 1.2.0. A
+release which the cluster rejects, for example for want of the privilege to clear scrolls, is logged as a
+warning once. Neither the single request nor the first request of an unlimited query counts the total number
+of hits; the pages of a scroll do, because Elasticsearch requires it. On an index which JanusGraph did not
+create, `index.max_result_window` must allow 10,000 hits, which is its default; JanusGraph lifts it on the
+indexes it creates.
+
+If large results are common, a larger `index.[X].max-result-set-size` trades the size of one response for the
+number of requests: a result of 5,000 hits is about 100 scroll pages of 50, and one request when it is limited
+to 5,000.
+
 ### Write Optimization
 
 For [bulk loading](../operations/bulk-loading.md) or other write-intense applications,
@@ -381,7 +488,7 @@ is reached, so three settings determine reindex throughput:
     an explicit count with `updateIndex(index, SchemaAction.REINDEX, threads)`.
     More threads issue more concurrent bulk requests and scale best when the
     Elasticsearch index has multiple shards spread across data nodes.
--   **Bulk refresh** (`index.[X].bulk-refresh`). With the default value `false`
+-   **Bulk refresh** (`index.[X].elasticsearch.bulk-refresh`). With the default value `false`
     a reindex is throughput-bound. If it is set to `wait_for` (or `true`) every
     bulk request blocks until the next index refresh, which can dominate the
     total reindex time; in that mode batching helps the most, because it

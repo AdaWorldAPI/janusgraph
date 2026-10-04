@@ -27,7 +27,7 @@ All currently supported versions of JanusGraph are listed below.
 
 | JanusGraph | Storage Version | Cassandra | HBase | Bigtable | ScyllaDB | Elasticsearch | Solr | TinkerPop | Spark | Scala |
 | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
-| 1.2.z | 2 | 3.11.z, 4.0.z, 5.0.z | 2.6.z | 1.3.0, 1.4.0, 1.5.z, 1.6.z, 1.7.z, 1.8.z, 1.9.z, 1.10.z, 1.11.z, 1.14.z | 6.y | 6.y, 7.y, 8.y, 9.y | 8.y | 3.7.z | 3.2.z | 2.12.z |
+| 1.2.z | 2 | 3.11.z, 4.0.z, 5.0.z | 2.6.z | 1.3.0, 1.4.0, 1.5.z, 1.6.z, 1.7.z, 1.8.z, 1.9.z, 1.10.z, 1.11.z, 1.14.z | 6.y | 6.1-6.8.z, 7.y, 8.y, 9.y, OpenSearch 2.y, 3.y | 8.11.z, 9.y | 3.8.z | 3.2.z | 2.12.z |
 | 1.1.z | 2 | 3.11.z, 4.0.z | 2.6.z | 1.3.0, 1.4.0, 1.5.z, 1.6.z, 1.7.z, 1.8.z, 1.9.z, 1.10.z, 1.11.z, 1.14.z | 6.y | 6.y, 7.y, 8.y | 8.y | 3.7.z | 3.2.z | 2.12.z |
 
 !!! info
@@ -75,16 +75,17 @@ compile "org.janusgraph:janusgraph-core:1.2.0"
 * Apache HBase 2.6.0
 * Oracle BerkeleyJE 7.5.11
 * ScyllaDB 6.2.0
-* Elasticsearch 6.0.1, 6.6.0, 7.17.8, 8.15.3, 9.0.3
-* Apache Lucene 8.11.1
-* Apache Solr 8.11.1
-* Apache TinkerPop 3.7.3
-* Java 8, 11
+* Elasticsearch 6.6.0, 7.17.8, 8.15.3, 9.5.4
+* OpenSearch 2.19.6, 3.9.0
+* Apache Lucene 9.12.3
+* Apache Solr 8.11.4, 9.10.1
+* Apache TinkerPop 3.8.2
+* Java 11, 17, 21, 25 (OLAP with Apache Spark: Java 11 and 17 only)
 
 **Installed versions in the Pre-Packaged Distribution:**
 
-* Cassandra 4.0.6
-* Elasticsearch 7.14.0
+* Cassandra 5.0.9
+* Elasticsearch 7.17.29
 
 #### Changes
 
@@ -101,16 +102,220 @@ For more information on features and bug fixes in 1.2.0, see the GitHub mileston
 
 #### Upgrade Instructions
 
+##### Java 11 is now the minimum supported Java version, Java 17, 21 and 25 are supported
+
+Starting from version 1.2.0 JanusGraph requires Java 11 or newer. Support for Java 8 has been dropped
+for building and running JanusGraph, JanusGraph Server, the pre-packaged distribution and the Gremlin
+Console. All JanusGraph artifacts are now compiled for Java 11, so applications embedding JanusGraph
+must run on Java 11 or newer as well. This change is required by the upgrade to Apache TinkerPop 3.8,
+which itself requires Java 11.
+
+JanusGraph is now built and tested with Java 11, 17, 21 and 25. The exceptions are the OLAP modules
+(`janusgraph-hadoop` and the Hadoop/Spark based graph computer of the storage backends): Apache Spark
+3.3.x, which TinkerPop's `spark-gremlin` is based on, only runs on Java 8 through 17, so OLAP jobs are
+only supported on Java 11 and 17. The pre-packaged distribution bundles Cassandra 5.0.9, which itself
+only runs on Java 11 and 17, so the embedded Cassandra of the `janusgraph-full` distribution requires
+Java 11 or 17 while an external Cassandra cluster can be used from JanusGraph running on any supported Java
+version.
+
+Java 17 and newer enforce strong encapsulation of the JDK internals. JanusGraph itself does not need
+any `--add-opens` / `--add-exports` options, but some libraries which can be used with JanusGraph still
+rely on deep reflection (most notably the Kryo serialization used by Gryo and OLAP), in which case the
+options documented by TinkerPop for JDK 17 have to be passed to the JVM (JanusGraph's test suites pass
+them on JDK 17 and newer, see the `jdk17-plus-tests` profile of the root `pom.xml`). The Hadoop client
+artifacts pulled in by Spark (`hadoop-client-api`, `hadoop-client-runtime`) are aligned with the other
+Hadoop 3.4.3 artifacts, because their 3.3.x versions still call `Subject.getSubject()`, which does not
+work on Java 24 and newer (this affected the HBase client's user resolution).
+
+Since the default build now targets Java 11, the separate Java 11 build variant has been removed:
+
+* The `-Pjava-11` Maven profile no longer exists. Build JanusGraph with `mvn clean install` on Java 11+.
+* The `janusgraph-java-11-<version>.zip` and `janusgraph-java-11-full-<version>.zip` distribution archives
+  are no longer produced. Use `janusgraph-<version>.zip` and `janusgraph-full-<version>.zip` instead;
+  they are built for Java 11.
+* The `-java-11` Docker image tag suffix produced by that build variant is gone. The regular
+  `janusgraph/janusgraph:<version>` images are the only ones built; they already use a Java 11 runtime
+  (`eclipse-temurin:11-jre`).
+* `conf/jvm-8.options` has been removed from the distribution. `bin/janusgraph-server.sh` now always
+  reads `conf/jvm-11.options` unless `JAVA_OPTIONS_FILE` is set.
+
+##### Upgrade to Apache TinkerPop 3.8.2
+
+JanusGraph 1.2.0 upgrades Apache TinkerPop from 3.7.3 to 3.8.2. TinkerPop 3.8 is a new minor release
+line with a number of breaking changes to Gremlin semantics that may affect existing traversals and
+applications. The most notable ones are:
+
+* `store()` was removed in favor of `local(aggregate())`, `aggregate(Scope, String)` was removed and
+  `has(key, traversal)` / `has(T, traversal)` were removed (use `where()` instead).
+* `none()` was renamed to `discard()`; `none(P)` is now a collection filtering step complementing
+  `any(P)` and `all(P)`.
+* `P.getOriginalValue()` was removed in favor of `P.getValue()`.
+* `java.time.OffsetDateTime` replaces `java.util.Date` as the default date type: `asDate()`, `dateAdd()`
+  and `dateDiff()` return `OffsetDateTime`, and `dateDiff()` returns milliseconds instead of seconds.
+* The repeat traversal of `repeat()` now consistently uses global semantics: if it contains a barrier step
+  (for example `barrier()`, `order()` or `aggregate()`), all traversers of a loop enter the repeat traversal
+  at once instead of one at a time, which changes the ordering of results and lets barrier steps see all
+  traversers of the loop. JanusGraph's own multi-query batching steps inserted into repeat traversals do
+  not trigger this mode, so a `repeat()` without user-defined barriers keeps processing its traversers in
+  bounded batches. `RepeatUnrollStrategy` only unrolls simple navigation and filter steps, and `cap()` /
+  `inject()` inside `repeat()` are rejected by `StandardVerificationStrategy`.
+* `valueMap()`, `propertyMap()`, `groupCount()`, `sack()`, `dedup()`, `sample()` and `aggregate()` reject
+  more than one `by()` modulator.
+* `property(key, value)` without an explicit cardinality now always resolves the cardinality through
+  `Graph.Features.VertexFeatures.getCardinality(key)`. JanusGraph resolves it against the schema of the
+  calling transaction (including property keys created but not yet committed in that transaction) and
+  falls back to the default cardinality of the configured schema maker for unknown keys.
+* Arithmetic in `sum()` and `sack()` promotes to the next wider numeric type on overflow, `split()` with
+  an empty separator splits a string into its characters, and floating-point literals in `gremlin-lang`
+  scripts are parsed as `Double` instead of `BigDecimal`.
+* GraphSON 2.0 and 3.0 only deserialize `TraversalStrategy` implementations that are registered with
+  `TraversalStrategies.GlobalCache` (all JanusGraph strategies are registered).
+* GraphSON 1.0 with embedded types (`GraphSONMessageSerializerV1`, `TypeInfo.PARTIAL_TYPES`) only deserializes
+  explicitly allowed `@class` type ids. GraphSON 1.0 mappers created through `JanusGraph.io()` allow JanusGraph's
+  own types automatically. A manually configured `GraphSONMessageSerializerV1` needs
+  `allowedTypeIdNames: [org.janusgraph.graphdb.relations.RelationIdentifier, org.janusgraph.core.attribute.Geoshape, org.janusgraph.graphdb.tinkerpop.io.JanusGraphP]`
+  next to `ioRegistries` (see the commented examples in `conf/gremlin-server/*.yaml`), and a hand-built
+  `GraphSONMapper` needs `JanusGraphIoRegistryV1d0.allowGraphSONTypeIds(builder)` (or
+  `addAllowedTypeIdName(...)` with the names of `JanusGraphIoRegistryV1d0.GRAPHSON_ALLOWED_TYPE_ID_NAMES`).
+* The `UnifiedChannelizer` of Gremlin Server has been deprecated.
+
+Please review the TinkerPop upgrade documentation for
+[3.8.0](https://tinkerpop.apache.org/docs/3.8.0/upgrade/#_tinkerpop_3_8_0),
+[3.8.1](https://tinkerpop.apache.org/docs/3.8.1/upgrade/#_tinkerpop_3_8_1) and
+[3.8.2](https://tinkerpop.apache.org/docs/3.8.2/upgrade/#_tinkerpop_3_8_2) before upgrading.
+
+##### Updated third-party libraries
+
+JanusGraph 1.2.0 updates its third-party libraries to their latest versions which are compatible with Java 11
+and with the libraries JanusGraph builds on (TinkerPop 3.8, Spark 3.3 and Hadoop 3.4). Applications embedding
+JanusGraph pick these versions up transitively. The most notable updates are:
+
+* Google Cloud Bigtable HBase client 2.20.2 (from 1.24.0) in `janusgraph-bigtable`. The connection settings
+  described in the [Bigtable documentation](storage-backend/bigtable.md) are unchanged.
+* `janusgraph-cdc` (new in 1.2.0) uses the Apache Kafka 4.3.1 clients, which require Kafka brokers 2.1 or newer.
+* Apache HBase client 2.6.6 (from 2.6.0), Apache ZooKeeper 3.9.6 (from 3.9.2), gRPC 1.84.0 (from 1.66.0),
+  Guava 33.7.1 (from 33.3.0), Jackson 2.22 (from 2.17), Log4j 2.26.1 (from 2.23.1), HPPC 0.10.0 (from 0.9.1)
+  and Vavr 1.0.1 (from 0.10.4).
+
 ##### Apache Cassandra 5.0 support
 
 Starting from version 1.2.0 JanusGraph supports Apache Cassandra 5.0 as a storage backend.
-Apache Cassandra 5.0 requires Java 11 or newer. Since the pre-packaged distribution still
-targets Java 8, it continues to bundle Cassandra 4.0.6; connect JanusGraph to an externally
-managed Cassandra 5.0 cluster (running on Java 11+) to use the new backend.
+The pre-packaged `janusgraph-full` distribution now bundles Cassandra 5.0.9 instead of Cassandra 4.0.6.
+The embedded Cassandra runs on Java 11 and 17 (Cassandra 4.0 only ran on Java 8 and 11). Its
+`cassandra/conf/cassandra.yaml` is regenerated from the stock Cassandra 5.0 configuration with the
+JanusGraph settings (cluster name, `db/cassandra` data directories) applied; `num_tokens` stays at 256 so
+data directories created by earlier `janusgraph-full` distributions keep working. Review the Cassandra
+[5.0 upgrade notes](https://github.com/apache/cassandra/blob/cassandra-5.0/NEWS.txt) before reusing an
+existing `db/cassandra` directory with the new distribution.
 
 ##### ElasticSearch 9 support
 
 Starting from version 1.2.0 JanusGraph supports ElasticSearch 9.
+
+The pre-packaged `janusgraph-full` distribution now bundles Elasticsearch 7.17.29 instead of Elasticsearch 7.17.8.
+Elasticsearch 7.17 is the last Elasticsearch line whose JVM can be Java 11: the bundled Elasticsearch runs on the
+JDK shipped in its Linux x86_64 tarball or, where that JDK cannot run (for example macOS or Linux on ARM), on the
+JDK of the host through `JAVA_HOME`. Elasticsearch 8 requires Java 17 and Elasticsearch 9 requires Java 21 for
+its JVM, and since 9.4 its launcher and native libraries are x86_64 only, so bundling them would have made the
+embedded Elasticsearch Linux x86_64 only. The native machine learning binaries are no longer part of the
+distribution (machine learning is disabled in the bundled `elasticsearch.yml`).
+
+##### OpenSearch 2 and 3 support
+
+Starting from version 1.2.0 JanusGraph supports OpenSearch 2 and 3 with the `elasticsearch` index backend.
+OpenSearch provides the Elasticsearch 7 API, which JanusGraph now uses when the cluster reports an OpenSearch
+version. Before, JanusGraph rejected OpenSearch versions as unsupported Elasticsearch versions, so OpenSearch 2 only
+worked with `compatibility.override_main_response_version`, and OpenSearch 3, which removed that setting, didn't work
+at all. JanusGraph rejects other OpenSearch versions, including OpenSearch 1, which reached its end of life, unless the
+option below is set. When JanusGraph detects OpenSearch, it ignores `index.[X].elasticsearch.use-mapping-for-es7`,
+because OpenSearch 2 removed mapping types.
+
+The new option `index.[X].elasticsearch.major-version` sets the major version of the Elasticsearch API which the
+cluster provides (`7` for OpenSearch). If it is set, JanusGraph doesn't ask the cluster for its version, and so
+doesn't know whether the cluster is OpenSearch. See [OpenSearch](index-backend/elasticsearch.md#opensearch) for
+details, including the settings Amazon OpenSearch Service needs.
+
+##### Elasticsearch 6.0 is no longer supported
+
+JanusGraph 1.2.0 no longer supports Elasticsearch 6.0, and its tests no longer run against it. Elasticsearch 6.0
+reached its end of life in 2019, and unlike later versions it does not run the ingest pipeline of a bulk request on
+the upsert of an update: a document which a mutation creates through an upsert, such as one an addition recreates
+because it is missing from the index, skips the pipeline set with
+`index.[X].elasticsearch.ingest-pipeline.[mixedIndexName]`. Upgrade Elasticsearch 6.0 clusters before upgrading
+JanusGraph; the oldest Elasticsearch 6 release tested is 6.6.0.
+
+##### Solr 9 support, Solr 8 is deprecated
+
+JanusGraph 1.2.0 uses SolrJ 9.10.1 and supports Solr 9. Solr 8.11 is still supported and tested, but deprecated: Solr 8
+reached its end of life, and a future JanusGraph version will drop it. SolrJ 10 requires Java 17 (and Solr 10 Java 21),
+which is newer than JanusGraph's minimum Java version, so Solr 10 isn't supported yet.
+
+JanusGraph can be upgraded before the Solr cluster. The configset in `conf/solr` now works with Solr 8.11 and 9.
+
+Solr 9 removed `LatLonType` and the `LRUCache` and `FastLRUCache` caches, which the configset in `conf/solr` of earlier
+JanusGraph distributions used, so Solr 9 can't load the collections created with that configset. Before upgrading the
+Solr cluster to Solr 9, change the configset of these collections and upload it again (`bin/solr zk upconfig`; in the
+HTTP mode, change the files in the `conf` directory of each core):
+
+* Replace the `location` field type (JanusGraph doesn't use it) with
+  `<fieldType name="location" class="solr.LatLonPointSpatialField" docValues="true"/>`. Changing only the class
+  isn't enough, because `LatLonPointSpatialField` rejects the `subFieldSuffix` attribute of `LatLonType`.
+* Change the class of the caches (`filterCache`, `queryResultCache`, `documentCache` and `perSegFilter`) to
+  `solr.CaffeineCache`.
+
+The data of these collections stays readable, because Solr 9 still supports the Trie field types of that configset,
+although it deprecates them. Solr 9 can't open indexes which were created by Solr 7 or older.
+
+The configset in `conf/solr` now uses the Point field types (with doc values) instead of the Trie field types,
+`LatLonPointSpatialField`, `CurrencyFieldType` instead of `CurrencyField`, `CaffeineCache` and `luceneMatchVersion`
+9.12. Use it for new collections. An existing collection can only switch to it by recreating the collection and
+reindexing the mixed index (`SchemaAction.REINDEX`), because the field types of existing data can't change.
+
+Solr 9 removed the `maxShardsPerNode` parameter of the collection creation, and SolrJ 9 no longer offers it. JanusGraph
+still sends `index.[X].solr.max-shards-per-node` when it creates a collection on Solr 8, which puts at most 1 replica of
+a new collection on a node by default. Before JanusGraph creates a collection, it asks Solr for its version. The new
+option `index.[X].solr.major-version` (for example `8` or `9`) takes precedence over the version Solr reports and saves
+that request. If neither is known, JanusGraph assumes Solr 8, because Solr 9 ignores the parameter.
+
+`index.[X].solr.max-shards-per-node` is deprecated, and JanusGraph logs a warning when it is set for Solr 9. After
+upgrading to Solr 9, remove this `GLOBAL_OFFLINE` option from the graph's configuration (for example with
+`mgmt.remove("index.search.solr.max-shards-per-node")` and `mgmt.commit()` while only one JanusGraph instance is open)
+and from the local configuration files.
+
+JanusGraph keeps using the SolrJ clients based on Apache HttpClient (`CloudLegacySolrClient` for SolrCloud, since
+SolrJ 9's `CloudSolrClient.Builder` builds the Jetty based HTTP/2 client), so the Kerberos configuration is
+unchanged. In the HTTP mode, `index.[X].solr.http-connection-timeout` (5 seconds by default) now applies to the
+requests; SolrJ 8's load balancing client connected with its own timeout of 15 seconds. On the Solr server, the
+Kerberos authentication plugin (`org.apache.solr.security.hadoop.KerberosPlugin`) is part of Solr 9's `hadoop-auth`
+module.
+
+SolrJ 9 is built on Jetty 10, so JanusGraph now manages Jetty 10.0.26 instead of 9.4.58. Applications which embed
+JanusGraph and use Jetty 9.4 themselves have to align their Jetty version.
+
+The JanusGraph distribution no longer contains `noggit-0.8.jar`. SolrJ contains its own, newer copy of the `org.noggit`
+classes, and when the `org.noggit:noggit` 0.8 artifact (a dependency of `janusgraph-driver` for Spatial4j's GeoJSON
+reader) comes first on the classpath, SolrJ fails with
+`NoSuchMethodError: 'java.lang.Object org.noggit.ObjectBuilder.getValStrict()'`. Applications which use
+`janusgraph-solr` should exclude `org.noggit:noggit` as well: Spatial4j works with SolrJ's copy.
+
+##### Apache Lucene 9
+
+`janusgraph-lucene` now uses Apache Lucene 9.12.3 instead of 8.11. A JanusGraph installation can contain only one
+Lucene version, and Solr 9 is built on Lucene 9 (Lucene 10 requires Java 21).
+
+Lucene 9 opens indexes which were created by Lucene 8 (JanusGraph 0.6.0 to 1.1.x), so existing Lucene mixed indexes keep
+working without a reindex. Once JanusGraph 1.2.0 has written to such an index, earlier JanusGraph versions can't open it
+anymore. Lucene 9 can't open indexes created by Lucene 7 or older (JanusGraph 0.5.x and older), even if they were
+written by Lucene 8 later. Delete the directories of such indexes and reindex the mixed indexes.
+
+Minimum and maximum aggregations of `Float` properties which the Lucene index computes (for example
+`g.V().has("name", "bob").values("weight").max()`) now return the right values: they used to read the indexed double
+values as floats.
+
+Custom analyzers (the `string-analyzer` and `text-analyzer` mapping parameters of the Lucene and Solr indexes) are
+loaded by class name, so they have to exist in Lucene 9. Lucene 9 renamed the `lucene-analyzers-common` artifact to
+`lucene-analysis-common` and moved a few analyzers to other packages, for example `ClassicAnalyzer` to
+`org.apache.lucene.analysis.classic` and `UAX29URLEmailAnalyzer` to `org.apache.lucene.analysis.email`.
 
 ##### Zombie instances auto-close during index status update operations
 
@@ -160,7 +365,7 @@ Be aware of the following behavior changes when batching is enabled (the default
 To restore the previous storage-page-sized, flush-once-per-segment behavior, set
 `schema.reindex.mixed-index-batch-enabled=false`. See the
 [Elasticsearch reindex tuning guide](index-backend/elasticsearch.md#reindex-optimization) for tuning
-the batch size, reindex threads and `index.[X].bulk-refresh` together.
+the batch size, reindex threads and `index.[X].elasticsearch.bulk-refresh` together.
 
 ##### Faster OLAP scans (signal-based row hand-off)
 
@@ -346,6 +551,394 @@ If custom vertex ids are used, avoid deleting and re-creating vertices under the
 `REMOVE_STALE_ENTRIES` job is running, because the job could remove the index entries of the re-created vertex
 (run `REINDEX` afterwards to restore them). With automatically assigned ids this race cannot occur because ids are
 never reused.
+
+##### CDC-based mixed index synchronization
+
+Starting from version 1.2.0, JanusGraph can keep mixed indexes (e.g. ElasticSearch) eventually consistent with the
+graph via Change-Data-Capture instead of a synchronous index write during the transaction that can diverge on failure
+(a cause of [permanent stale indexes](advanced-topics/stale-index.md)). This is opt-in and disabled by default.
+
+With Apache Cassandra storage, set `storage.cql.cdc=true` to create the `edgestore` table with Cassandra CDC enabled,
+mark the mixed index backend with `index.[X].cdc.enabled=true` (and `index.[X].cdc.synchronous=false` for cdc-only
+mode, which skips synchronous index additions; the few relation-document deletions that change events cannot
+identify remain synchronous), and run the new `janusgraph-cdc` worker. Like `storage.cql.cdc`, the
+`index.[X].cdc.*` options are `MASKABLE`: they can be changed via `mgmt.set(...)` on a running cluster (instances and
+the worker pick up the new value when they next open the graph) or overridden in the local configuration of a process.
+The worker consumes the Cassandra change stream (e.g. via Debezium and Kafka) and reindexes affected elements from their
+current graph state, which is idempotent and order-independent. See
+[CDC Mixed Index Synchronization](advanced-topics/cdc-mixed-index.md) for the full setup.
+
+##### Transient Elasticsearch failures are retried instead of dropping the index mutation
+
+Previously every Elasticsearch failure except an interrupt was reported as a `PermanentBackendException`. Because
+index mutations are applied after the storage mutations in a commit they cannot be rolled back, so a transient
+failure — a rolling restart, a saturated write queue, a socket timeout during a GC pause — dropped the mutation with
+a single ERROR log line and left the mixed index inconsistent with the graph until a reindex or a transaction-log
+recovery repaired it. The Elasticsearch client did have a retry mechanism, but it was disabled by default
+(`index.[X].elasticsearch.retry-limit=0` and an empty `index.[X].elasticsearch.retry-error-codes`), could only act
+on a failure which produced an HTTP response, and once its attempts ran out the failure was still reported as
+permanent.
+
+Such a failure is now reattempted at two levels, both **enabled by default** and both governed by one definition of
+what counts as transient:
+
+```
+index.[X].elasticsearch.retry-error-codes=429,502,503,504
+index.[X].elasticsearch.retry-transport-failures=true
+index.[X].elasticsearch.retry-limit=3
+```
+
+-   `retry-error-codes` lists the HTTP status codes considered transient, whether answered to a request or reported
+    for an individual bulk item. Its default was previously empty.
+-   `retry-transport-failures` (new) covers the failures which produce no HTTP response at all: connection refused,
+    connection reset, socket timeout, a prematurely closed connection and a TLS failure — the last of which is what a
+    rolling restart of a TLS secured cluster produces.
+-   `retry-limit` is the number of attempts the Elasticsearch client makes. Its default was previously `0`.
+
+The two levels are:
+
+1.  **The Elasticsearch client** reattempts the request `retry-limit` times, with the short waits controlled by
+    `retry-initial-wait` and `retry-max-wait`. For a bulk request it resends only the items which failed, so these
+    attempts never resend an item which already succeeded. This level applies to queries as well as writes.
+2.  **JanusGraph** classifies whatever survives those attempts. An index mutation which still failed transiently is
+    reported as a `TemporaryBackendException`, which the retry loop already present in `BackendOperation` reattempts
+    with exponential backoff for up to `storage.write-time` (default 100s) — the same contract that already applies
+    to a temporary storage failure. A bulk request qualifies only when *every* item which failed did so transiently,
+    since a batch containing a permanently failing item — a mapping conflict, for instance — cannot succeed on a
+    reattempt.
+
+Be aware of the following while the options are enabled:
+
+-   The second level resubmits the mutation without the documents which are known to have applied: every store
+    whose own bulk request had already returned, and in the bulk request which failed every document none of whose
+    items failed or went unsent. A bulk request larger than `index.[X].elasticsearch.bulk-chunk-size-limit-bytes` is
+    sent in chunks, and the documents of the chunks which were never sent are resubmitted. A failure which reports no
+    item statuses — no response at all, or a status for the bulk request as a whole — leaves it unknown what that
+    request applied, so after one the interrupted bulk is resubmitted whole, the chunks which went through before it
+    included. Resubmission is idempotent for whole-document writes, deletions and `SET` cardinality properties, but
+    the values of a `LIST` cardinality property are appended, so a document resubmitted after such a failure can hold
+    them twice. The same holds for a document one of whose items failed while another item of it had succeeded: it
+    is resubmitted whole. Within one bulk request Elasticsearch answers the items of one document, which share a shard
+    request, alike for the statuses it reattempts by default, so this takes either a per-item status which the
+    operator listed as transient, or a document whose items were split between two chunks. Neither can happen to the
+    document of an existing element whose complete indexed content is at hand, which is updated by a single item (see
+    *A missing Elasticsearch document is recreated whole* below).
+-   During an Elasticsearch outage a commit which touches a mixed index now takes up to `storage.write-time` to
+    report the failure instead of failing fast.
+-   While `retry-transport-failures` is enabled every `SSLException` is treated as transient, not only an interrupted
+    handshake, so a write against a persistently misconfigured or untrusted certificate is reattempted for the whole
+    write time before it fails.
+-   Set `index.[X].elasticsearch.retry-error-codes` to an empty list **and**
+    `index.[X].elasticsearch.retry-transport-failures=false` if `LIST` values duplicated after such a failure are less
+    acceptable than a dropped mutation; that restores the previous behavior at both levels. Setting `retry-limit=0`
+    alone disables only the client level and keeps the JanusGraph level.
+
+Deployments which set none of these options get the new behavior. Deployments which set `retry-limit` or
+`retry-error-codes` explicitly keep their values, and those values now also decide what JanusGraph reattempts.
+
+An interrupt is covered by neither option, and its handling changes regardless. Previously `convert` recognised an
+`InterruptedException` only as the exception it was handed directly, and neither the Elasticsearch client nor
+JanusGraph's own retry wait ever hands one over unwrapped, so a cancelled index write was in practice reported as a
+`PermanentBackendException`. It is now recognised anywhere in the cause chain and reported as a
+`TemporaryBackendException`, and the interrupt status of the thread is restored once the `InterruptedException` has
+been consumed, so `BackendOperation` aborts its backoff wait immediately instead of reissuing the request for the
+whole write time budget.
+
+##### An Elasticsearch update which failed because the document is missing is now reported
+
+A bulk request reports item level failures inside an otherwise successful HTTP response. JanusGraph previously treated
+*every* item answered with HTTP 404 as a success, whatever mutation produced it. That is right for a mutation which
+only takes content out of the index — a whole document deletion, or the script which deletes fields — because an
+absent document already satisfies it. It is wrong for a mutation which adds content: there a 404 is a
+`document_missing_exception`, and the write did not happen.
+
+A transaction which takes content out of a document and puts other content in — a property removed and a different one
+set on the same element, or a value of a `LIST` or `SET` cardinality property replaced — sends a field deletion and an
+addition against the same document, and `mutate()` withholds the upsert from the addition once a mutation has deletions.
+So if the Elasticsearch document was already missing, both items were answered with 404, both were discarded, and the
+addition was never indexed. Nothing reported it: the mutation returned normally, so even the
+`<prefix>.indexProvider.<INDEX-NAME>.mutate.exceptions` metric stayed at zero. Changing the value of a `SINGLE`
+cardinality property is not this case: the deletion of the old value is consolidated away because the same field is
+added, so that addition carries an upsert and recreates the document, from the changed field alone.
+
+Such an item is now reported. A 404 is not among the transient status codes of
+`index.[X].elasticsearch.retry-error-codes`, so the failure is classified permanent and the mutation is dropped rather
+than reattempted — reattempting cannot recreate a document whose upsert was withheld. **What a deployment sees changes
+on a graph whose mixed index has already diverged.** The graph commit itself still returns normally, because JanusGraph
+commits the storage backend first and never aborts on a mixed index failure, but the commit now logs the dropped
+mutation at ERROR, counts it in the `<prefix>.indexProvider.<INDEX-NAME>.mutate.exceptions` metric and, where the
+transaction log is enabled, records `SECONDARY_FAILURE` for the transaction, from which transaction log recovery repairs
+the document. That is the intent: the alternative is that the divergence stays invisible. `SchemaAction.REINDEX` repairs
+the affected documents as well.
+
+The same now holds for a removal against an Elasticsearch index which no longer exists. Elasticsearch answers a
+deletion against a missing index with a 404 carrying `index_not_found_exception`, which used to be taken for a success
+like every other 404 of a removal, so the commit passed silently although the index it was meant to update was gone.
+A removal stays exempt from a 404 which says only that the document is missing, since an absent document is the state
+it asked for.
+
+##### Mixed index names on one backing index must now differ in more than case
+
+An index backend derives its own index name from the JanusGraph index name case-insensitively — Elasticsearch
+lowercases it, Lucene names a directory after it — so two mixed indexes on the same backing index whose names differed
+only in case, such as `byName` and `byname`, shared one backend index: each other's documents and mappings, and a
+`SchemaAction.DISCARD_INDEX` of one dropped the other's documents. Creating the second one is now rejected with an
+`IllegalArgumentException` which names the existing index. Existing definitions are not touched: a graph which already
+holds such a pair keeps working as before, and is repaired by discarding one of the two and recreating it under a
+distinct name. Composite indexes have no backend index and are not affected.
+
+##### Index restores are reattempted after a transient failure
+
+`IndexTransaction.restore`, through which `SchemaAction.REINDEX`, stale entry removal, CDC index updates and
+transaction log recovery write their documents, called the index provider directly, so a failure the provider
+classified as transient — for Elasticsearch a 429, a 503 or a dropped connection — failed the batch outright,
+where the same failure during a commit is reattempted. It now runs through `BackendOperation` like a commit does:
+reattempted with backoff for up to `storage.write-time`, and only then reported. A restore writes whole documents, so
+a reattempt is idempotent.
+
+##### Transient Elasticsearch read failures are reattempted
+
+A mixed index query, count or aggregation against Elasticsearch wrapped every failure in a `PermanentBackendException`,
+so a throttled or momentarily unreachable cluster failed the traversal outright — although `BackendTransaction` already
+runs every index read through `BackendOperation`, which reattempts a `TemporaryBackendException` for up to
+`storage.read-time`, as it does for a storage read. The read paths now classify a failure the way the write path has since the retry options were unified: a status
+listed in `index.[X].elasticsearch.retry-error-codes` (`429`, `502`, `503`, `504` by default) and, with
+`index.[X].elasticsearch.retry-transport-failures`, a connection or TLS failure are transient and reattempted with
+backoff within `storage.read-time`; everything else remains permanent. The pages of a scroll are fetched while the
+caller consumes the result stream, outside that budget, and are not covered.
+
+##### A missing Elasticsearch document is recreated whole
+
+When an element exists in the graph but its document is missing from the mixed index — an index write lost earlier, a
+document removed by hand — the next mutation of the element recreated the document from the fields it touched alone, or,
+if the mutation also removed content, could not recreate it at all and was reported as a lost write. The transaction now
+hands the index provider the element's complete indexed content along with every mutation which updates an existing
+document — a property change on an edge or a vertex property included, although it replaces the relation — and the
+Elasticsearch provider sends every change of the document, its removals, its collection additions and its single-valued
+fields, in one script update which carries that content as its upsert. A document which turns out to be missing is
+therefore recreated whole in the same round trip, whichever shape the mutation has, and in a store with an ingest
+pipeline it goes through the pipeline, as Elasticsearch runs the pipeline of a bulk request on the upsert of an update
+whose document is missing. A document which exists is updated as before, except that a single-valued field is assigned
+rather than merged, which replaces an object value such as a geo shape as a whole. Being one item, the update of a
+document is also applied or rejected as a whole: a bulk request split into chunks can no longer separate a document's
+changes, and a reattempt never replays a part of them which had applied. This has two costs. The content is read while
+the transaction commits, so a commit which updates an existing element covered by a mixed index reads that element's
+indexed properties, which are usually loaded already. And every update of an existing document carries that content
+once, so bulk requests grow with the size of the documents they update; an update the content would make larger than
+`index.[X].elasticsearch.bulk-chunk-size-limit-bytes` is sent without it, as before this change, rather than failing. A
+mixed index on a cdc-only backend, whose documents are written asynchronously, is not affected.
+
+##### Elasticsearch searches open a scroll context only for results larger than a page
+
+Every mixed index query whose limit was at least `index.[X].max-result-set-size` (50 by default), and every query
+without a limit, read its result through the scroll API in pages of that size. A query with a limit whose result had at
+least as many hits also left its scroll context open until `index.[X].elasticsearch.scroll-keep-alive` expired, because
+the result stream stopped at the limit before the last page. So a `limit(1000)` was 20 requests and a 60 s scroll
+context, and a lookup without a limit was two requests, the scroll search and the one which released its context, both
+waited for. Elasticsearch also had to count every match of these queries, as a scroll may not switch the total off.
+JanusGraph now fetches a result whose offset and limit together are within 10,000 hits, Elasticsearch's default
+`index.max_result_window`, in one request of exactly that size and without counting the total, and Elasticsearch
+applies the offset of a direct index query in that request. A query without a limit, or beyond that size, first asks
+for one hit more than a page after the offset, or for what is left up to the 10,000th hit if that is less; only when
+the result is larger, or the offset is 10,000 or more, does a scroll take over, which costs such a result one request
+more than before. The scroll context is released as soon as the result has been read to its end,
+the limit is reached, or the traversal is closed, which JanusGraph Server does after every request; embedded code
+should close a traversal it abandons before its end, otherwise the context expires after the keep-alive as before. The
+release no longer waits for the cluster's answer, and a release which fails no longer fails the query; a release the
+cluster rejects is logged as a warning once. Deployments which set
+`index.[X].elasticsearch.setup-max-open-scroll-contexts` to `false`, such as Amazon OpenSearch Service, are therefore
+far less likely to reach the cluster's limit of open scroll contexts.
+
+##### Relations without properties are parsed once
+
+A loaded relation is deserialized in two steps: its type, direction, id and other end first, and its properties only
+once something asks for them. The deserialized form is cached on the entry, and whether the cache already held the
+properties was told from whether it held any. So a relation without properties, which is the common case for a vertex
+property without meta-properties and for an edge without properties, looked like it had never had its properties parsed,
+and every read of them parsed the whole entry again: every `properties()` of a vertex property, every `property(key)` or
+`has(key)` check on an edge, and every vertex which Gremlin Server returns with its properties, since its serializers
+read the meta-properties of each of them. The cache now records whether the properties were parsed, so each loaded entry
+of a relation is parsed with its properties at most once. Moreover, the first step now finds out when nothing follows
+the header, which is the case for a relation without properties whose type has neither a signature nor a sort key, the
+default, and whose entry carries no timestamp, TTL or visibility metadata. Such an entry is parsed exactly once, where
+it was parsed twice by the first read of its properties before. A relation without properties whose type has a
+signature, or which is read through a vertex-centric index, is still parsed twice by its first read, but no longer by
+every later one. An entry with timestamp, TTL or visibility metadata, which the `storage.meta.*` options enable
+(visibility only on a backend with cell-level visibility), is unaffected: the metadata is a property of the relation, so
+its full parse was already kept. The property map is only allocated for a relation which has properties.
+
+##### Composite index lookups of several values read their index rows together
+
+A composite index lookup of several values, as `has(key, within(values))` makes, or as a composite index on more than
+one key makes for every combination of the values given for its keys, read each of the index rows this gives only after
+the previous one had arrived, so each row cost a round trip to the storage backend. Where the backend supports multi-key
+queries, which the CQL backend (Cassandra, ScyllaDB) and HBase do, the rows are now read together, in calls of up to
+1,000 rows which the backend executes concurrently. That happens without a limit, as every row is read then anyway, and
+with a limit for a unique index, whose rows hold at most one element each, in calls of as many rows as the limit can
+still take. The limits which JanusGraph adds itself count as limits: those of `query.smart-limit` and of a
+`query.hard-max-limit` below its default, and the one an order the index can't serve brings. A lookup with a limit on an
+index which isn't unique, and every lookup on a backend without multi-key queries, such as BerkeleyJE, still reads one
+row after the other and stops at the limit. Either way a lookup asks the storage backend for no row which reading one
+row after the other would not ask for. `query.batch.enabled=false` turns reading rows together off, as it turns off
+batching for traversal steps. Building the condition of a `within()` or `without()` also compared each value with every
+value before it to drop duplicates, so it grew with the square of the number of values; it now takes time in proportion
+to them.
+
+##### A vertex which gains relations in a transaction allocates about 2 KB less
+
+Every vertex which gains a relation in a transaction keeps the relations it gained, and since JanusGraph 1.1.0 it sized
+the set of its edges for 300 edges up front, about 2 KB (4 KB on heaps of 32 GB or more), whether it gained one relation
+or hundreds. Once one of its existing relations was replaced by a copy, as setting a property of an existing edge or a
+meta-property of an existing vertex property does, it also sized a table for 330 replaced relations, about 2 KB more.
+Every transaction allocated such a set as well, read-only ones included. The sets and tables now start small and grow
+with the relations added. On the inmemory backend, a transaction which adds 1,000 vertices with two properties and an
+edge each allocates 9% less, one which sets a property of 1,000 existing vertices 24% less, and one which sets a
+property of an edge of each 22% less.
+
+##### Storage operations no longer contend for one random generator
+
+Nearly every storage operation, among them every read of a transaction and every mutation its commit writes, runs
+through a loop which reattempts temporary failures after randomized waits. It drew its first wait before the first
+attempt, from a random generator which all threads shared, although nearly every operation succeeds at once, and threads
+which draw from one generator at the same time contend for its seed. The wait is now drawn only once an operation has
+failed temporarily, from the random generator of its thread, and the waits are the same as before. On the inmemory
+backend, reading a property of 1,000 vertices on each of eight threads takes 18% less time.
+
+##### Elasticsearch clients open up to 30 connections to a single host
+
+The Elasticsearch client of an index backend opened at most 10 connections to each Elasticsearch host and 30 to all
+hosts together, the defaults of the Elasticsearch REST client, which JanusGraph had no option for. A request waits for a
+free connection, so an index backend had no more than 10 queries and bulk requests in flight at a single host, such as a
+load balancer or the endpoint of a hosted cluster, however many threads issued them. The new option
+`index.[X].elasticsearch.max-connections` sets the total, 30 by default, and
+`index.[X].elasticsearch.max-connections-per-host` the connections to each host, by default the total divided evenly
+among the hosts, but at least 10. So a single host now takes all 30 connections and two hosts 15 each, while three or
+more hosts keep 10 each, which keeps a host that stops answering from holding every connection. With 32 threads issuing
+mixed index queries, a single Elasticsearch 9 node on the same machine answers 22% more of them per second, and a host
+which takes 20 ms to answer three times as many. The new option `index.[X].elasticsearch.io-threads` sets the number of
+I/O threads of each client, which is otherwise the number of processors, for every index backend of every graph, and
+`index.[X].elasticsearch.compression` compresses requests and responses with gzip.
+
+##### Conflicting Elasticsearch updates are reattempted
+
+Transactions which change the same element concurrently also update its document in a mixed index concurrently, and
+Elasticsearch fails an update which finds that the document changed after the update read it, with status 409.
+JanusGraph treats that status as permanent, so the change was missing from the mixed index unless transaction recovery
+repaired it. `index.[X].elasticsearch.retry_on_conflict` now defaults to 3, where it was not sent unless set, so
+Elasticsearch reattempts such an update against the latest version of the document. Set it to 0 for the previous
+behavior. The client's own reattempts of a request, after a backoff which starts at
+`index.[X].elasticsearch.retry-initial-wait` and grows tenfold up to `index.[X].elasticsearch.retry-max-wait`, now wait
+a random time between half of the backoff and all of it, so that requests which failed together don't all come back at
+the same moment.
+
+##### `tx.max-commit-time` now defaults to 300 s and is checked against the least a commit may take
+
+`tx.max-commit-time` is the time after which transaction recovery considers a transaction failed and restores the index
+documents of the elements it changed from the storage backend, counted from the transaction's first log entry. A commit
+reattempts its storage write and then each of its index writes in turn, each for up to `storage.write-time` (100 s by
+default), so the option has to exceed `storage.write-time` multiplied by one plus the number of index backends. That is
+only the minimum: the time a commit spends preparing its writes counts as well, a transaction with more than
+`storage.buffer-size` mutations writes storage in several chunks, each reattempted on its own, a storage backend without
+transaction isolation (Cassandra and HBase, or BerkeleyDB with `storage.transactions=false`) commits the schema elements
+a transaction creates in a storage write of their own first, and the last attempt of each write can run past its write
+time. Yet the option defaulted to 10 s, so recovery could restore the documents of a
+transaction which was still committing, and the index writes that commit had yet to make then landed on documents
+which already reflected it — appending the values of a `LIST` cardinality property twice, or removing an occurrence
+which should have stayed. The default is now 300 s: the storage write and one index backend at the default write time,
+with one write time to spare, for instance for a second storage chunk. JanusGraph logs a warning at graph open, when
+transaction logging is enabled, whenever `tx.max-commit-time` does not exceed that minimum for the configured index
+backends; the warning names the minimum and suggests a management system call, ready to paste, which sets one write
+time more, so a graph with two or more index backends is told what to set, and a graph which commits large
+transactions should allow more still. The default stops there because the transaction recovery
+process keeps every transaction it reads, the content of its modifications included, until it has read the log
+`tx.max-commit-time` past the transaction (see below): a recovery process of a write-heavy graph now holds thirty times
+as much in memory as it did with the old default.
+
+After an upgrade a graph which never set the option resolves the new default as soon as its instances are restarted;
+the value of a `GLOBAL` option is only stored when it is set explicitly. A graph which did set it keeps its value, gets
+the warning if that value is too short, and raises it with the management system call the warning suggests, for
+two index backends at the default write time `mgmt.set("tx.max-commit-time", java.time.Duration.parse("PT6M40S"))`
+followed by `mgmt.commit()`, which a transaction recovery processor picks up when it is next started. The recovery of
+a transaction which really did fail starts correspondingly later. A transaction recovery process waits about 146 years
+at most, half the nanoseconds a `long` holds, so that how far it has read past a transaction always compares correctly
+with the wait; a longer `tx.max-commit-time` used to keep it from starting at all and now makes it wait up to that limit.
+
+A transaction which writes a user log (`TransactionBuilder.logIdentifier`) is exposed for longer: its commit writes
+the user-log event after the index writes and only then its final status, and a transaction which expires before
+recovery has read that status gets its user-log event sent again. Such a transaction needs its user-log write (up to
+`log.user.max-write-time` when `log.user.send-delay` is 0; by default the event is sent in the background) inside
+`tx.max-commit-time` as well; the final status's own write does not count, since its log entry is timed from before
+the write (see below). The log identifier is set per transaction, so the warning cannot take it into account.
+
+##### Transaction recovery no longer gives up on a transaction before reading its final status
+
+Transaction recovery gave up on a transaction `tx.max-commit-time` after it had read the transaction's first log entry.
+It reads the transaction log in polls, though, every `log.tx.read-interval` (5 s by default), each of which can spend up
+to `log.tx.max-read-time` on its reads and stops at the end of the 100 s long chunk of the log it is in, so it could
+read a transaction's final status well after its first entry even when the commit took far less than
+`tx.max-commit-time`. Whenever that came too late, recovery took a transaction which had succeeded for a failed one: it
+restored the index documents of every element the transaction changed, sent its user-log event again, so that user-log
+consumers received it twice, and counted the transaction once more when the final status arrived. The closer
+`tx.max-commit-time` was to the read interval, the likelier this was: with both at 5 s, the least recovery waits, a
+final status read one poll after the transaction's first entry arrived within milliseconds of the expiry, before or
+after it.
+
+Recovery now measures the time it gives a transaction by how far it has read the log rather than by how long it has
+waited: it gives a transaction up once it has read and processed the log up to `tx.max-commit-time` past the first of
+the transaction's entries it read, however far apart and however slowly its reads come, so by then it has read
+everything a commit wrote within `tx.max-commit-time` and which became visible within `log.tx.read-lag-time`. A recovery
+process catching up on a backlog no longer holds each transaction for `tx.max-commit-time` of waiting either, and gets
+through the backlog with less in memory. A transaction whose commit does outlast `tx.max-commit-time`, or whose instance
+fails between its user-log write and its final status, still gets its user-log event sent again, the repeat carrying the
+transaction id of the original; the former is counted twice as well, once as failed and once as succeeded when its final
+status arrives. A partition of the log whose reads fail holds the progress back, and with it every expiry, until they
+succeed; one whose reads have failed for good, which stops being read, is left out of the progress once its messages are
+processed, and an error is logged for it. Once that goes for every partition, nothing is read any more, and the progress
+runs on with the clock from where reading stopped, so that recovery still gives the transactions it has in hand up
+rather than hold them for good.
+
+The second of the numbers `getStatistics()` returns, the transactions which failed and whose repair was attempted, now
+counts a transaction once that attempt has finished rather than before it starts, so the repairs of the transactions it
+counts are done and the third number already includes those which could not be repaired.
+
+##### Schema changes committed by ordinary transactions reach the other instances
+
+With `schema.constraints=true` and a schema maker which creates missing constraints, an ordinary transaction adds
+property and connection constraints to the schema, and so do `addConnection(...)` and `addProperties(...)`, on a
+transaction or on the management system, which sent no eviction either. Other JanusGraph instances used to keep the
+definitions they had cached, and so created a second copy of a constraint the first time they used it themselves. Such a
+commit now also sends a cache eviction for the schema elements it changed over the management log, like a management
+commit does, but as one which nothing waits to see acknowledged: an acknowledged eviction registers a trigger which
+waits for every instance to acknowledge once its open transactions have closed, and with
+`graph.management-auto-close-stale-instances` could get an instance with a long-running transaction force-closed because
+of an ordinary write. Every instance which reads the eviction, the sender included, expires the elements from its schema
+cache and its open transactions. A management commit which changes definition edges and sends evictions of its own sends
+both, and receivers expire the elements twice, at the cost of a re-read. Instances of earlier versions process the
+eviction as well and acknowledge it; that acknowledgement is ignored, so a rolling upgrade needs no preparation. During
+the upgrade, each such eviction costs an older instance the thread which waits for its open transactions to close before
+it acknowledges, for up to a minute, and one with a transaction open for longer than that logs the stale-transaction
+error it logs for any eviction it waited that long for.
+
+##### Closing a graph on BerkeleyJE no longer interrupts its log readers
+
+`BackgroundThread.close()` could interrupt the thread's `action()` or `cleanup()`, which its contract rules out, when
+the thread was between its checks. A log's send thread flushes its last messages in `cleanup()`, and BerkeleyJE
+invalidates its whole environment when a thread is interrupted in the middle of a file operation, so every later use of
+that environment in the JVM failed: that is how `BerkeleyGraphTest` lost most of its tests on some CI runs. `close()`
+now decides to interrupt, and interrupts, under a lock which the thread holds while it turns its interruptibility off;
+an interrupt pending before `action()` ends the loop instead of reaching it, and one pending before `cleanup()` is
+cleared.
+
+For the same reason, closing a log on a storage backend which does not support interruption, which is BerkeleyJE, no
+longer interrupts the log's reader threads after a second. This covers `graph.close()` and the stop of a recurring
+transaction recovery. The log waits for the readers to finish the pull under way and the messages they have in hand,
+however long that takes, warning every `log.<name>.max-read-time` (a second at the least) after the first second, and it
+does not give that wait up when the closing thread is interrupted. It holds no lock of the log, of its manager or of the
+log processor framework meanwhile, so a reader which opens a log, registers or unregisters a reader, or adds or removes
+a log processor while the log closes finishes. A `MessageReader` which never returns therefore holds `graph.close()` up
+on BerkeleyJE, where it used to be interrupted after a second. A log closed from one of its own reader threads cannot
+wait for them and keeps the second, and so do the logs of other storage backends. The reader threads of every log are
+now named after it.
 
 ### Version 1.1.0 (Release Date: November 7, 2024)
 
