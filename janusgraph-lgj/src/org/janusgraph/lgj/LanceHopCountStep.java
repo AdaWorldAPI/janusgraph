@@ -17,9 +17,7 @@ package org.janusgraph.lgj;
 import com.adaworldapi.graph.Graph;
 import com.adaworldapi.lancegraph.RowStore;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.NoSuchElementException;
 
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
@@ -58,22 +56,7 @@ final class LanceHopCountStep<S> extends AbstractStep<S, Long> {
     }
 
     private long count() {
-        List<Graph> chain = new ArrayList<>();
-        try {
-            Graph g = Graph.open(store);
-            chain.add(g);
-            g = g.from(seeds);
-            chain.add(g);
-            for (int classid : hops) {
-                g = g.hop(classid);
-                chain.add(g);
-            }
-            return g.count();
-        } finally {
-            for (Graph g : chain) {
-                g.close();
-            }
-        }
+        return HopChain.run(store, seeds, hops, Graph::count);
     }
 
     @Override

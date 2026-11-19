@@ -20,7 +20,11 @@ import com.adaworldapi.lancegraph.FacetId;
 import com.adaworldapi.lancegraph.NativeRuntime;
 import com.adaworldapi.lancegraph.RowStore;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 import org.apache.tinkerpop.gremlin.process.traversal.P;
@@ -47,6 +51,9 @@ import org.janusgraph.graphdb.idmanagement.IDManager;
  *   <li><b>Provenance.</b> Against an EMPTY JanusGraph the lowered traversal still returns the
  *       row store's answer, and plain JanusGraph returns 0. The answer came from the row store.
  *   <li><b>Fallbacks.</b> Shapes that are not lowered are counted and answer as JanusGraph does.
+ *   <li><b>id().</b> The same checks for {@code dedup().id()}, answered by {@link
+ *       LanceHopIdsStep}, compared as sets, with an off-by-one falsifier on the row-to-id
+ *       mapping.
  * </ul>
  */
 public final class JanusLoweringTest {
@@ -74,6 +81,9 @@ public final class JanusLoweringTest {
             parity(c, store, jg, ids);
             provenance(c, store, ids);
             fallbacks(c, store, jg, ids);
+            idParity(c, store, jg, ids);
+            idProvenance(c, store, ids);
+            idFallbacks(c, store, jg, ids);
             jg.close();
         } catch (Exception e) {
             throw new IllegalStateException(e);
@@ -223,6 +233,122 @@ public final class JanusLoweringTest {
                 g -> g.V().out(KNOWS).dedup().count());
         fallback(c, store, jg, ids, "has() between hops",
                 g -> g.V(seeds).out(KNOWS).has("n", P.gt(1)).out(KNOWS).dedup().count());
+        jg.tx().rollback();
+    }
+
+    // ---- the id() shape: g.V(ids).out(label)^k.dedup().id() ----
+
+    /** Strategy with both mappings, so the id() shape can be lowered. */
+    private static LanceHopStrategy idStrategy(RowStore store, IDManager ids) {
+        return new LanceHopStrategy(store, Map.of(KNOWS, Edge.KNOWS),
+                id -> ids.fromVertexId(id) - 1, row -> vid(ids, row));
+    }
+
+    private static boolean ranAsOneIdsStep(Traversal.Admin<?, ?> t) {
+        return t.getSteps().size() == 1 && t.getSteps().get(0) instanceof LanceHopIdsStep;
+    }
+
+    private static List<Object> sorted(List<Object> in) {
+        List<Object> out = new ArrayList<>(in);
+        out.sort(null);
+        return out;
+    }
+
+    private static void idParity(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("id(): lowered ids equal plain JanusGraph's ids");
+        Object[] seeds = seedIds(ids);
+        boolean anyDiffers = false;
+        for (int k = 1; k <= 3; k++) {
+            Set<Object> plain = outN(jg.traversal().V(seeds), k).dedup().id().toSet();
+            long counted = outN(jg.traversal().withStrategies(strategy(store, ids)).V(seeds), k)
+                    .dedup().count().next();
+            LanceHopStrategy s = idStrategy(store, ids);
+            Traversal.Admin<?, Object> t =
+                    outN(jg.traversal().withStrategies(s).V(seeds), k).dedup().id().asAdmin();
+            List<Object> got = t.toList();
+            Set<Object> gotSet = new HashSet<>(got);
+            c.that("k=" + k + ": the id sets are equal", plain.equals(gotSet));
+            c.eq("k=" + k + ": same number of ids as JanusGraph", (long) plain.size(),
+                    (long) got.size());
+            c.eq("k=" + k + ": no duplicate ids", (long) gotSet.size(), (long) got.size());
+            c.eq("k=" + k + ": as many ids as the count shape counts", counted, (long) got.size());
+            c.that("k=" + k + ": the traversal ran as one LanceHopIdsStep (" + t + ")",
+                    ranAsOneIdsStep(t));
+            c.eq("k=" + k + ": counted as lowered", 1L, s.lowered());
+            c.eq("k=" + k + ": not counted as a fallback", 0L, s.fellBack());
+            c.that("k=" + k + ": the answer is not trivially empty (" + plain.size() + ")",
+                    !plain.isEmpty());
+            // Falsifier: a row-to-id mapping off by one row must not reproduce JanusGraph's ids.
+            LanceHopStrategy wrong = new LanceHopStrategy(store, Map.of(KNOWS, Edge.KNOWS),
+                    id -> ids.fromVertexId(id) - 1, row -> ids.toVertexId(row + 2));
+            Set<Object> wrongSet =
+                    outN(jg.traversal().withStrategies(wrong).V(seeds), k).dedup().id().toSet();
+            anyDiffers |= !plain.equals(wrongSet);
+        }
+        c.that("falsifier: a row-to-id mapping off by one row does not reproduce JanusGraph's ids",
+                anyDiffers);
+        // Order: ascending row order.
+        List<Object> list = outN(jg.traversal().withStrategies(idStrategy(store, ids)).V(seeds), 2)
+                .dedup().id().toList();
+        boolean ascending = true;
+        for (int i = 1; i < list.size(); i++) {
+            ascending &= ids.fromVertexId((Long) list.get(i - 1))
+                    < ids.fromVertexId((Long) list.get(i));
+        }
+        c.that("lowered ids come out in ascending row order (" + list.size() + " ids)",
+                ascending && list.size() > 1);
+        // Clone of a lowered id traversal that has already run answers afresh.
+        Traversal.Admin<?, Object> ran = outN(
+                jg.traversal().withStrategies(idStrategy(store, ids)).V(seeds), 2)
+                .dedup().id().asAdmin();
+        Set<Object> first = new HashSet<>(ran.toList());
+        c.that("an id traversal that has run is exhausted", !ran.hasNext());
+        Set<Object> again = new HashSet<>(ran.clone().toList());
+        c.that("clone of a run id traversal: same ids (" + again.size() + ")",
+                !again.isEmpty() && first.equals(again));
+        jg.tx().rollback();
+    }
+
+    private static void idProvenance(Checks c, RowStore store, IDManager ids) {
+        c.section("id() provenance: the ids come from the row store, not from JanusGraph");
+        JanusGraph empty = open();
+        IDManager emptyIds = ((StandardJanusGraph) empty).getIDManager();
+        Object[] seeds = seedIds(emptyIds);
+        Set<Object> plain = outN(empty.traversal().V(seeds), 2).dedup().id().toSet();
+        LanceHopStrategy s = idStrategy(store, emptyIds);
+        Set<Object> lowered =
+                outN(empty.traversal().withStrategies(s).V(seeds), 2).dedup().id().toSet();
+        c.eq("plain JanusGraph over an empty graph returns no ids", 0L, (long) plain.size());
+        c.that("the lowered traversal over the same empty graph returns ids from the row store ("
+                + lowered.size() + ")", !lowered.isEmpty());
+        c.eq("and it was lowered", 1L, s.lowered());
+        empty.close();
+    }
+
+    private static void idFallbacks(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("id() fallbacks: counted, and answered exactly as JanusGraph answers");
+        Object[] seeds = seedIds(ids);
+        List<Object> plainWalks = sorted(jg.traversal().V(seeds).out(KNOWS).out(KNOWS).id().toList());
+        LanceHopStrategy a = idStrategy(store, ids);
+        List<Object> walks = sorted(
+                jg.traversal().withStrategies(a).V(seeds).out(KNOWS).out(KNOWS).id().toList());
+        c.that("no dedup(): answer unchanged (" + walks.size() + " ids, walks)",
+                plainWalks.equals(walks) && !walks.isEmpty());
+        c.eq("no dedup(): counted as a fallback", 1L, a.fellBack());
+        c.eq("no dedup(): not counted as lowered", 0L, a.lowered());
+        c.that("no dedup(): a reason is recorded ('" + a.lastFallbackReason() + "')",
+                a.lastFallbackReason().contains("dedup"));
+
+        Set<Object> plain = outN(jg.traversal().V(seeds), 2).dedup().id().toSet();
+        LanceHopStrategy b = strategy(store, ids);
+        Set<Object> got = outN(jg.traversal().withStrategies(b).V(seeds), 2).dedup().id().toSet();
+        c.that("3-argument constructor: answer unchanged (" + got.size() + " ids)",
+                plain.equals(got) && !got.isEmpty());
+        c.eq("3-argument constructor: counted as a fallback", 1L, b.fellBack());
+        c.eq("3-argument constructor: not counted as lowered", 0L, b.lowered());
+        c.that("3-argument constructor: the reason names the missing mapping ('"
+                + b.lastFallbackReason() + "')",
+                b.lastFallbackReason().contains("row-to-vertex-id"));
         jg.tx().rollback();
     }
 

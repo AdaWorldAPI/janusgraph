@@ -30,6 +30,7 @@ import org.apache.tinkerpop.gremlin.process.traversal.step.HasContainerHolder;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.DedupGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.CountGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.GraphStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.map.IdStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.NoOpBarrierStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.VertexStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.util.EmptyStep;
@@ -53,6 +54,10 @@ import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphStepStrategy
  * <p>The lowered shape is exactly
  *
  * <pre>{@code g.V(ids).out(label)^k.dedup().count()}</pre>
+ *
+ * and, when a row-to-vertex-id mapping is given, also
+ *
+ * <pre>{@code g.V(ids).out(label)^k.dedup().id()}</pre>
  *
  * with k &gt;= 1 and one mapped edge label per hop. It is the shape lance-graph-java's own
  * TinkerPop harness lowers; this class is that strategy for JanusGraph. Two things differ:
@@ -87,6 +92,7 @@ public final class LanceHopStrategy
     private final RowStore store;
     private final Map<String, Integer> edgeClassids;
     private final LongUnaryOperator vertexIdToRow;
+    private final LongUnaryOperator rowToVertexId;
     private final AtomicLong lowered = new AtomicLong();
     private final AtomicLong fellBack = new AtomicLong();
     private volatile String lastFallbackReason = "";
@@ -97,12 +103,23 @@ public final class LanceHopStrategy
      *     is not lowered
      * @param vertexIdToRow JanusGraph vertex id to row number; a result outside
      *     {@code [0, store.rowCount())} means "not a row of this store"
+     *     <p>Count-only: with this constructor the {@code id()} shape is not lowered.
      */
     public LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
                             LongUnaryOperator vertexIdToRow) {
+        this(store, edgeClassids, vertexIdToRow, null);
+    }
+
+    /**
+     * @param rowToVertexId row number to JanusGraph vertex id, the inverse of
+     *     {@code vertexIdToRow}; without it the {@code id()} shape is not lowered
+     */
+    public LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
+                            LongUnaryOperator vertexIdToRow, LongUnaryOperator rowToVertexId) {
         this.store = store;
         this.edgeClassids = Map.copyOf(edgeClassids);
         this.vertexIdToRow = vertexIdToRow;
+        this.rowToVertexId = rowToVertexId;
     }
 
     /** Number of traversals answered by the mask hop chain. */
@@ -148,7 +165,7 @@ public final class LanceHopStrategy
             }
         }
         if (steps.size() < 4) {
-            return "too few steps for V().out()..dedup().count()";
+            return "too few steps for V().out()..dedup().count()/id()";
         }
         if (!(steps.get(0) instanceof GraphStep<?, ?> start) || !start.returnsVertex()) {
             return "does not start with V()";
@@ -161,13 +178,18 @@ public final class LanceHopStrategy
             return "V() needs explicit vertex ids that map to rows of the row store";
         }
         int last = steps.size() - 1;
-        if (!(steps.get(last) instanceof CountGlobalStep)) {
-            return "does not end with count()";
+        boolean ids = steps.get(last) instanceof IdStep;
+        if (!ids && !(steps.get(last) instanceof CountGlobalStep)) {
+            return "does not end with count() or id()";
+        }
+        if (ids && rowToVertexId == null) {
+            return "id() needs the row-to-vertex-id mapping";
         }
         if (!(steps.get(last - 1) instanceof DedupGlobalStep<?> dedup)
                 || !dedup.getLocalChildren().isEmpty()
                 || !dedup.getScopeKeys().isEmpty()) {
-            return "count() without a plain dedup() counts walks, not vertices";
+            return ids ? "id() without a plain dedup() lists walks, not vertices"
+                    : "count() without a plain dedup() counts walks, not vertices";
         }
         int[] hops = new int[last - 2];
         for (int i = 1; i < last - 1; i++) {
@@ -195,7 +217,9 @@ public final class LanceHopStrategy
             }
         }
         TraversalHelper.removeAllSteps(traversal);
-        traversal.addStep(new LanceHopCountStep(traversal, store, seeds, hops));
+        traversal.addStep(ids
+                ? new LanceHopIdsStep(traversal, store, seeds, hops, rowToVertexId)
+                : new LanceHopCountStep(traversal, store, seeds, hops));
         lowered.incrementAndGet();
         return null;
     }
