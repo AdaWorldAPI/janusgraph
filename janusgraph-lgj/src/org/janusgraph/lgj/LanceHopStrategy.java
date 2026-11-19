@@ -14,6 +14,7 @@
 
 package org.janusgraph.lgj;
 
+import com.adaworldapi.lancegraph.FacetId;
 import com.adaworldapi.lancegraph.RowStore;
 
 import java.util.ArrayList;
@@ -23,20 +24,25 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongUnaryOperator;
 
+import org.apache.tinkerpop.gremlin.process.traversal.P;
+import org.apache.tinkerpop.gremlin.process.traversal.Compare;
 import org.apache.tinkerpop.gremlin.process.traversal.Step;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
 import org.apache.tinkerpop.gremlin.process.traversal.TraversalStrategy.ProviderOptimizationStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.step.HasContainerHolder;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.DedupGlobalStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.HasStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.CountGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.GraphStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.IdStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.NoOpBarrierStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.VertexStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.util.EmptyStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.util.HasContainer;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.AbstractTraversalStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.util.TraversalHelper;
 import org.apache.tinkerpop.gremlin.structure.Direction;
+import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.janusgraph.graphdb.tinkerpop.optimize.strategy.AdjacentVertexFilterOptimizerStrategy;
 import org.janusgraph.graphdb.tinkerpop.optimize.strategy.AdjacentVertexHasIdOptimizerStrategy;
@@ -59,7 +65,15 @@ import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphStepStrategy
  *
  * <pre>{@code g.V(ids).out(label)^k.dedup().id()}</pre>
  *
- * with k &gt;= 1 and one mapped edge label per hop. It is the shape lance-graph-java's own
+ * with k &gt;= 1 and one mapped edge label per hop. When the caller maps vertex labels to a label
+ * facet (see {@link Builder#vertexLabels}), one {@code hasLabel(L)} with a single label may stand
+ * between the last hop and {@code dedup()}:
+ *
+ * <pre>{@code g.V(ids).out(label)^k.hasLabel(L).dedup().count()}</pre>
+ *
+ * It is answered as the last frontier intersected, natively, with the mask of the rows whose
+ * label facet carries the class id mapped to L. Only {@code hasLabel} with one string, that is
+ * label equality, is lowered; it is not a general {@code has()} or {@code where()}. It is the shape lance-graph-java's own
  * TinkerPop harness lowers; this class is that strategy for JanusGraph. Two things differ:
  *
  * <ul>
@@ -93,6 +107,8 @@ public final class LanceHopStrategy
     private final Map<String, Integer> edgeClassids;
     private final LongUnaryOperator vertexIdToRow;
     private final LongUnaryOperator rowToVertexId;
+    private final FacetId labelFacet;
+    private final Map<String, Integer> vertexLabelClassids;
     private final AtomicLong lowered = new AtomicLong();
     private final AtomicLong fellBack = new AtomicLong();
     private volatile String lastFallbackReason = "";
@@ -116,10 +132,67 @@ public final class LanceHopStrategy
      */
     public LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
                             LongUnaryOperator vertexIdToRow, LongUnaryOperator rowToVertexId) {
+        this(store, edgeClassids, vertexIdToRow, rowToVertexId, null, Map.of());
+    }
+
+    private LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
+                             LongUnaryOperator vertexIdToRow, LongUnaryOperator rowToVertexId,
+                             FacetId labelFacet, Map<String, Integer> vertexLabelClassids) {
         this.store = store;
         this.edgeClassids = Map.copyOf(edgeClassids);
         this.vertexIdToRow = vertexIdToRow;
         this.rowToVertexId = rowToVertexId;
+        this.labelFacet = labelFacet;
+        this.vertexLabelClassids = Map.copyOf(vertexLabelClassids);
+    }
+
+    /**
+     * A builder for the optional parts, so the constructors do not grow. The three required
+     * arguments are those of the three-argument constructor.
+     */
+    public static Builder builder(RowStore store, Map<String, Integer> edgeClassids,
+                                  LongUnaryOperator vertexIdToRow) {
+        return new Builder(store, edgeClassids, vertexIdToRow);
+    }
+
+    /** Builds a {@link LanceHopStrategy}; every part but the three required ones is optional. */
+    public static final class Builder {
+        private final RowStore store;
+        private final Map<String, Integer> edgeClassids;
+        private final LongUnaryOperator vertexIdToRow;
+        private LongUnaryOperator rowToVertexId;
+        private FacetId labelFacet;
+        private Map<String, Integer> vertexLabelClassids = Map.of();
+
+        private Builder(RowStore store, Map<String, Integer> edgeClassids,
+                        LongUnaryOperator vertexIdToRow) {
+            this.store = java.util.Objects.requireNonNull(store, "store");
+            this.edgeClassids = java.util.Objects.requireNonNull(edgeClassids, "edgeClassids");
+            this.vertexIdToRow = java.util.Objects.requireNonNull(vertexIdToRow, "vertexIdToRow");
+        }
+
+        /** Row number to JanusGraph vertex id; without it the {@code id()} shape is not lowered. */
+        public Builder rowToVertexId(LongUnaryOperator rowToVertexId) {
+            this.rowToVertexId = rowToVertexId;
+            return this;
+        }
+
+        /**
+         * How a vertex label maps to the row store: the rows of that label are the rows whose
+         * {@code labelFacet} carries the mapped class id. Without this, {@code hasLabel} is not
+         * lowered; a label not in the map is not lowered either.
+         */
+        public Builder vertexLabels(FacetId labelFacet, Map<String, Integer> vertexLabelClassids) {
+            this.labelFacet = java.util.Objects.requireNonNull(labelFacet, "labelFacet");
+            this.vertexLabelClassids = java.util.Objects.requireNonNull(vertexLabelClassids,
+                    "vertexLabelClassids");
+            return this;
+        }
+
+        public LanceHopStrategy build() {
+            return new LanceHopStrategy(store, edgeClassids, vertexIdToRow, rowToVertexId,
+                    labelFacet, vertexLabelClassids);
+        }
     }
 
     /** Number of traversals answered by the mask hop chain. */
@@ -191,10 +264,23 @@ public final class LanceHopStrategy
             return ids ? "id() without a plain dedup() lists walks, not vertices"
                     : "count() without a plain dedup() counts walks, not vertices";
         }
-        int[] hops = new int[last - 2];
-        for (int i = 1; i < last - 1; i++) {
+        // A HasStep right before dedup() is the candidate label filter. At this point it is still
+        // a plain TinkerPop HasStep: JanusGraph's strategies, which would fold it into a
+        // JanusGraphStep, run after this one.
+        int hopsEnd = last - 1;
+        Integer labelClassid = null;
+        if (steps.size() > 4 && steps.get(last - 2) instanceof HasStep<?> has) {
+            hopsEnd = last - 2;
+            Object reasonOrClassid = labelFilter(has);
+            if (reasonOrClassid instanceof String reason) {
+                return reason;
+            }
+            labelClassid = (Integer) reasonOrClassid;
+        }
+        int[] hops = new int[hopsEnd - 1];
+        for (int i = 1; i < hopsEnd; i++) {
             if (steps.get(i) instanceof HasContainerHolder) {
-                return "has() at step " + i;
+                return "has()/hasLabel() at step " + i + " (a label filter is only lowered after the last hop)";
             }
             if (!(steps.get(i) instanceof VertexStep<?> v)) {
                 return "step " + i + " is not out(label): " + steps.get(i);
@@ -218,10 +304,44 @@ public final class LanceHopStrategy
         }
         TraversalHelper.removeAllSteps(traversal);
         traversal.addStep(ids
-                ? new LanceHopIdsStep(traversal, store, seeds, hops, rowToVertexId)
-                : new LanceHopCountStep(traversal, store, seeds, hops));
+                ? new LanceHopIdsStep(traversal, store, seeds, hops, rowToVertexId,
+                        labelClassid == null ? null : labelFacet, labelClassid == null ? 0 : labelClassid)
+                : new LanceHopCountStep(traversal, store, seeds, hops,
+                        labelClassid == null ? null : labelFacet, labelClassid == null ? 0 : labelClassid));
         lowered.incrementAndGet();
         return null;
+    }
+
+    /**
+     * The class id of the label a HasStep tests, as an Integer, or the reason (a String) why this
+     * HasStep is not a lowerable label filter.
+     */
+    private Object labelFilter(HasStep<?> has) {
+        if (labelFacet == null) {
+            return "hasLabel() needs the vertex label mapping (label facet and label class ids)";
+        }
+        if (!has.getLabels().isEmpty()) {
+            return "as() labels would be lost";
+        }
+        List<HasContainer> containers = has.getHasContainers();
+        if (containers.size() != 1) {
+            return "hasLabel() step carries " + containers.size()
+                    + " conditions; exactly one hasLabel with one label is lowered";
+        }
+        HasContainer hc = containers.get(0);
+        if (!T.label.getAccessor().equals(hc.getKey())) {
+            return "has('" + hc.getKey() + "', ...) is a property filter, not a label filter";
+        }
+        P<?> p = hc.getPredicate();
+        if (p.getClass() != P.class || p.getBiPredicate() != Compare.eq
+                || !(hc.getValue() instanceof String)) {
+            return "hasLabel() with " + p + " is not a single-label equality";
+        }
+        Integer classid = vertexLabelClassids.get((String) hc.getValue());
+        if (classid == null) {
+            return "vertex label '" + hc.getValue() + "' has no class id in the label facet";
+        }
+        return classid;
     }
 
     /** Row numbers for V(ids), or null when any id does not map to a row of this store. */

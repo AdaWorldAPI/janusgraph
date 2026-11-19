@@ -15,6 +15,8 @@
 package org.janusgraph.lgj;
 
 import com.adaworldapi.graph.Graph;
+import com.adaworldapi.lancegraph.FacetId;
+import com.adaworldapi.lancegraph.Mask;
 import com.adaworldapi.lancegraph.RowStore;
 
 import java.util.ArrayList;
@@ -45,6 +47,59 @@ final class HopChain {
         } finally {
             for (Graph g : chain) {
                 g.close();
+            }
+        }
+    }
+
+    /**
+     * As {@link #run}, then intersects the last frontier with the mask of the rows whose
+     * {@code labelFacet} carries {@code labelClassid}, and runs {@code terminal} on the result.
+     *
+     * <p>Native calls: seed 1, one per hop, the label mask 2 (create, class match), the
+     * intersection 1 ({@code ternlog} with the truth table 0xC0, {@code a & b}), the terminal 1:
+     * k + 5 in all. {@code Graph} has no public {@code and}; {@code a.minus(a.minus(b))} would
+     * cost two calls for the intersection, and {@code Graph} does not expose its frontier
+     * {@code Mask}, so the chain here runs on {@code Mask}s directly. Every Mask is closed.
+     */
+    static <T> T runFiltered(RowStore store, long[] seeds, int[] hops, FacetId labelFacet,
+                             int labelClassid, Function<Mask, T> terminal) {
+        List<Mask> open = new ArrayList<>();
+        Throwable primary = null;
+        try {
+            Mask m = store.importRows(seeds);
+            open.add(m);
+            for (int classid : hops) {
+                m = store.hop(classid, m);
+                open.add(m);
+            }
+            Mask label = store.maskOfFacetClass(labelFacet, labelClassid);
+            open.add(label);
+            // a & b in one native call: ternlog(a, b, b) with truth table 0xC0.
+            Mask both = m.ternlog(label, label, 0xC0);
+            open.add(both);
+            return terminal.apply(both);
+        } catch (RuntimeException | Error e) {
+            primary = e;
+            throw e;
+        } finally {
+            // Close every mask. A failure of the chain itself is never replaced by a close
+            // failure; close failures are attached to it, or thrown if there was none.
+            RuntimeException closeFailure = null;
+            for (Mask m : open) {
+                try {
+                    m.close();
+                } catch (RuntimeException e) {
+                    if (primary != null) {
+                        primary.addSuppressed(e);
+                    } else if (closeFailure == null) {
+                        closeFailure = e;
+                    } else {
+                        closeFailure.addSuppressed(e);
+                    }
+                }
+            }
+            if (closeFailure != null) {
+                throw closeFailure;
             }
         }
     }
