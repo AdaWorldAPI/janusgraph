@@ -32,7 +32,7 @@ if ! "$J/javac" --release 28 --enable-preview -d "$out" -cp "$cp" \
   exit 1
 fi
 failed=""
-for main in JanusLoweringTest; do
+for main in JanusLoweringTest JanusCrossingsTest JanusAllocationTest; do
   "$J/java" --enable-preview --enable-native-access=ALL-UNNAMED -Dlgj.library="$SO" \
     -cp "$out:$cp" "org.janusgraph.lgj.$main" || failed="$failed $main"
 done
