@@ -168,6 +168,17 @@ public final class JanusLoweringTest {
         long plain2 = outN(jg.traversal().V(seeds), 2).dedup().count().next();
         c.eq("repeat(out).times(2): equals JanusGraph's", plain2, viaRepeat);
         c.eq("repeat(out).times(2): counted as lowered", 1L, r.lowered());
+        // A clone of a lowered traversal that has already run answers afresh, as any Gremlin
+        // traversal clone does.
+        LanceHopStrategy cs = strategy(store, ids);
+        Traversal.Admin<?, Long> ran =
+                outN(jg.traversal().withStrategies(cs).V(seeds), 2).dedup().count().asAdmin();
+        long first = ran.next();
+        c.that("a traversal that has run is exhausted", !ran.hasNext());
+        Traversal.Admin<?, Long> copy = ran.clone();
+        c.that("clone of a run traversal: has a result", copy.hasNext());
+        long again = copy.hasNext() ? copy.next() : -1L;
+        c.eq("clone of a run traversal: same count", first, again);
         // Falsifier: the comparison above can fail. With the id mapping off by one row the
         // lowered traversal starts from other vertices and must not agree on every k.
         boolean differs = false;

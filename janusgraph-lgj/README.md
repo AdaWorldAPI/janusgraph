@@ -29,13 +29,14 @@ no storage read for a traversal it answers.
 edge by edge into JanusGraph's in-memory backend. The copy is test code and is
 the oracle. Measured on 2026-11-19, JanusGraph `1.3.0-SNAPSHOT` at `0ce834a`
 (TinkerPop 3.8.2), lance-graph-java at `0286573` (abi 0.14), Temurin
-`28+16-ea`: 42 checks pass.
+`28+16-ea`: 45 checks pass.
 
 | Check | Result |
 |---|---|
 | Same answers, k = 1, 2, 3 | 19, 29, 55 from both |
 | The comparison can fail | with the id mapping off by one row the counts differ |
 | Really lowered | the traversal that ran is one `LanceHopCountStep` |
+| Clone after running | a clone of a lowered traversal that already ran answers afresh, with the same count |
 | Provenance | against an empty JanusGraph, plain Gremlin answers 0 and the lowered traversal answers 29 |
 | Fallbacks | five shapes that are not lowered are counted, give a reason and answer as JanusGraph does |
 
