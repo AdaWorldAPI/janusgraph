@@ -61,6 +61,11 @@ import org.janusgraph.graphdb.idmanagement.IDManager;
  *       class id mapped to L. Parity with JanusGraph for two labels, provenance against an empty
  *       graph, two falsifiers (a wrong label to class id mapping, a wrong label facet), the
  *       fallbacks, and a clone after running.
+ *   <li><b>has(key, value).</b> {@code out^k.has(p, v).dedup().count()} and {@code ...id()}, with
+ *       a Long or Integer value, answered as the last frontier intersected natively with the rows
+ *       whose property facet has v in its low 64 payload bits. The JanusGraph copy holds that
+ *       payload as vertex property {@code p}. Parity, provenance, a wrong-facet falsifier, the
+ *       combination with hasLabel, and the fallbacks.
  * </ul>
  */
 public final class JanusLoweringTest {
@@ -74,6 +79,13 @@ public final class JanusLoweringTest {
     private static final int LABEL_FACET = 3;
     /** Labels with non-trivial answers at k = 1, 2 and 3 on this graph. */
     private static final String[] LABELS = {"c0", "c10"};
+    /** The vertex property key under test, and the facet whose low 64 payload bits hold it. */
+    private static final String PROP = "p";
+    private static final int PROP_FACET = 7;
+    /** Another facet, for the falsifier. */
+    private static final int WRONG_PROP_FACET = 8;
+    /** A value no row of the store holds in any facet (checked in the test). */
+    private static final long ABSENT = 0x7777_7777_7777_7777L;
     private static final long[] SEED_ROWS = {5, 42, 79, 116, 153, 190, 227, 264, 301, 338};
 
     public static void main(String[] args) {
@@ -103,6 +115,12 @@ public final class JanusLoweringTest {
             labelFallbacks(c, store, jg, ids);
             labelReordered(c, store, jg, ids);
             labelClones(c, store, jg, ids);
+            propParity(c, store, jg, ids);
+            propIntegerAndForms(c, store, jg, ids);
+            propWithLabel(c, store, jg, ids);
+            propProvenance(c, store, ids);
+            propFalsifier(c, store, jg, ids);
+            propFallbacks(c, store, jg, ids);
             jg.close();
         } catch (Exception e) {
             throw new IllegalStateException(e);
@@ -165,7 +183,8 @@ public final class JanusLoweringTest {
         Vertex[] vs = new Vertex[(int) n];
         for (long row = 0; row < n; row++) {
             vs[(int) row] = jg.addVertex(T.id, vid(ids, row), T.label,
-                    "c" + store.classidAt(row, FacetId.of(LABEL_FACET)));
+                    "c" + store.classidAt(row, FacetId.of(LABEL_FACET)),
+                    PROP, store.payloadLow64At(row, FacetId.of(PROP_FACET)));
         }
         long edges = 0;
         for (long row = 0; row < n; row++) {
@@ -647,6 +666,340 @@ public final class JanusLoweringTest {
         Set<Object> againIds = new HashSet<>(ranIds.clone().toList());
         c.that("clone: same ids (" + againIds.size() + ")",
                 !againIds.isEmpty() && firstIds.equals(againIds));
+        jg.tx().rollback();
+    }
+
+    // ---- the property equality shape: g.V(ids).out(label)^k.has(key, value).dedup().count() / id() ----
+
+    private static LanceHopStrategy propStrategy(RowStore store, IDManager ids, FacetId facet) {
+        return LanceHopStrategy.builder(store, Map.of(KNOWS, Edge.KNOWS),
+                        id -> ids.fromVertexId(id) - 1)
+                .rowToVertexId(row -> vid(ids, row))
+                .vertexLabels(FacetId.of(LABEL_FACET), labelMap())
+                .vertexProperty(PROP, facet)
+                .build();
+    }
+
+    private static LanceHopStrategy propStrategy(RowStore store, IDManager ids) {
+        return propStrategy(store, ids, FacetId.of(PROP_FACET));
+    }
+
+    private static GraphTraversal<Vertex, Vertex> withProp(GraphTraversalSource g, Object[] seeds,
+                                                          int k, Object value) {
+        return outN(g.V(seeds), k).has(PROP, value);
+    }
+
+    /** Row of a JanusGraph vertex id. */
+    private static long rowOf(IDManager ids, Object vertexId) {
+        return ids.fromVertexId((Long) vertexId) - 1;
+    }
+
+    /**
+     * Test-side choice of values to filter on: the property of the first, a middle and the last
+     * row (in row order) of the plain JanusGraph frontier, so that each value occurs.
+     */
+    private static long[] occurringValues(RowStore store, JanusGraph jg, IDManager ids,
+                                          Object[] seeds, int k) {
+        java.util.TreeSet<Long> values = new java.util.TreeSet<>();
+        for (Object id : outN(jg.traversal().V(seeds), k).dedup().id().toList()) {
+            values.add(store.payloadLow64At(rowOf(ids, id), FacetId.of(PROP_FACET)));
+        }
+        Long[] all = values.toArray(new Long[0]);
+        if (all.length == 0) {
+            return new long[0];
+        }
+        return new long[] {all[0], all[all.length / 2], all[all.length - 1]};
+    }
+
+    private static void propParity(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("has(key, value): lowered equals plain JanusGraph");
+        Object[] seeds = seedIds(ids);
+        boolean absentInStore = true;
+        for (long row = 0; row < store.rowCount(); row++) {
+            for (int f = 0; f < FACETS_PER_ROW; f++) {
+                absentInStore &= store.payloadLow64At(row, FacetId.of(f)) != ABSENT;
+            }
+        }
+        c.that("the 'never occurs' value occurs in no facet of the store", absentInStore);
+        boolean narrows = false;
+        for (int k = 1; k <= 3; k++) {
+            long unfiltered = outN(jg.traversal().V(seeds), k).dedup().count().next();
+            long[] values = occurringValues(store, jg, ids, seeds, k);
+            c.eq("k=" + k + ": three occurring values chosen", 3L, (long) values.length);
+            long[] tried = {values[0], values[1], values[2], ABSENT};
+            for (long v : tried) {
+                String what = "k=" + k + " p=" + v + ": ";
+                long plain = withProp(jg.traversal(), seeds, k, v).dedup().count().next();
+                Set<Object> plainIds = withProp(jg.traversal(), seeds, k, v).dedup().id().toSet();
+                LanceHopStrategy s = propStrategy(store, ids);
+                Traversal.Admin<?, Long> t = withProp(jg.traversal().withStrategies(s), seeds, k, v)
+                        .dedup().count().asAdmin();
+                long lowered = t.next();
+                c.eq(what + "lowered count equals JanusGraph's", plain, lowered);
+                c.that(what + "ran as one LanceHopCountStep (" + t + ")", ranAsOneLoweredStep(t));
+                c.eq(what + "counted as lowered", 1L, s.lowered());
+                c.eq(what + "not counted as a fallback", 0L, s.fellBack());
+                LanceHopStrategy si = propStrategy(store, ids);
+                Traversal.Admin<?, Object> ti = withProp(jg.traversal().withStrategies(si), seeds, k, v)
+                        .dedup().id().asAdmin();
+                List<Object> got = ti.toList();
+                c.that(what + "id sets are equal (" + plainIds.size() + ")",
+                        plainIds.equals(new HashSet<>(got)));
+                c.eq(what + "no duplicate ids", (long) new HashSet<>(got).size(), (long) got.size());
+                c.that(what + "ran as one LanceHopIdsStep (" + ti + ")", ranAsOneIdsStep(ti));
+                if (v == ABSENT) {
+                    c.eq(what + "a value that never occurs gives 0 in JanusGraph", 0L, plain);
+                    c.eq(what + "and 0 lowered", 0L, lowered);
+                } else {
+                    c.that(what + "the answer is not trivially zero (" + plain + ")", plain > 0);
+                    narrows |= plain < unfiltered;
+                }
+            }
+        }
+        c.that("the filter really narrows for at least one (k, value)", narrows);
+        jg.tx().rollback();
+    }
+
+    private static void propIntegerAndForms(Checks c, RowStore store, JanusGraph jg,
+                                            IDManager ids) {
+        c.section("has(key, value): Integer values and has(key, P.eq(value)) are lowered");
+        Object[] seeds = seedIds(ids);
+        // An Integer value: look for an occurring value that fits an int (rows holding an edge
+        // target in that facet).
+        boolean found = false;
+        for (int k = 1; k <= 3 && !found; k++) {
+            for (Object id : outN(jg.traversal().V(seeds), k).dedup().id().toList()) {
+                long v = store.payloadLow64At(rowOf(ids, id), FacetId.of(PROP_FACET));
+                if (v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) {
+                    continue;
+                }
+                found = true;
+                long plain = withProp(jg.traversal(), seeds, k, v).dedup().count().next();
+                LanceHopStrategy s = propStrategy(store, ids);
+                Traversal.Admin<?, Long> t = withProp(jg.traversal().withStrategies(s), seeds, k,
+                        (Object) Integer.valueOf((int) v)).dedup().count().asAdmin();
+                long lowered = t.next();
+                c.eq("Integer " + v + " at k=" + k + ": lowered count equals JanusGraph's (" + plain
+                        + ")", plain, lowered);
+                c.that("Integer value: ran as one LanceHopCountStep", ranAsOneLoweredStep(t));
+                c.that("Integer value: the answer is not trivially zero", plain > 0);
+                LanceHopStrategy s2 = propStrategy(store, ids);
+                Traversal.Admin<?, Long> t2 = outN(jg.traversal().withStrategies(s2).V(seeds), k)
+                        .has(PROP, P.eq(v)).dedup().count().asAdmin();
+                c.eq("has(p, P.eq(" + v + ")): lowered count equals JanusGraph's", plain, t2.next().longValue());
+                c.that("has(p, P.eq(..)): ran as one LanceHopCountStep", ranAsOneLoweredStep(t2));
+                break;
+            }
+        }
+        c.that("an occurring value that fits an Integer was found", found);
+        jg.tx().rollback();
+    }
+
+    private static void propWithLabel(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("has(key, value) together with one hasLabel: both masks intersect the frontier");
+        Object[] seeds = seedIds(ids);
+        int k = 3;
+        boolean any = false;
+        boolean otherLabelEmpties = false;
+        for (String label : LABELS) {
+            String other = label.equals("c0") ? "c10" : "c0";
+            for (Object id : outN(jg.traversal().V(seeds), k).hasLabel(label).dedup().id().toList()) {
+                long v = store.payloadLow64At(rowOf(ids, id), FacetId.of(PROP_FACET));
+                any = true;
+                String what = label + " p=" + v + ": ";
+                for (boolean propFirst : new boolean[] {true, false}) {
+                    java.util.function.BiFunction<GraphTraversalSource, String, GraphTraversal<Vertex, Vertex>> q =
+                            (g, l) -> propFirst
+                                    ? outN(g.V(seeds), k).has(PROP, v).hasLabel(l)
+                                    : outN(g.V(seeds), k).hasLabel(l).has(PROP, v);
+                    String form = what + (propFirst ? "has.hasLabel " : "hasLabel.has ");
+                    long plain = q.apply(jg.traversal(), label).dedup().count().next();
+                    Set<Object> plainIds = q.apply(jg.traversal(), label).dedup().id().toSet();
+                    LanceHopStrategy s = propStrategy(store, ids);
+                    Traversal.Admin<?, Long> t = q.apply(jg.traversal().withStrategies(s), label)
+                            .dedup().count().asAdmin();
+                    c.eq(form + "lowered count equals JanusGraph's", plain, t.next().longValue());
+                    c.that(form + "ran as one LanceHopCountStep (" + t + ")",
+                            ranAsOneLoweredStep(t) && s.lowered() == 1L);
+                    c.that(form + "the answer is not trivially zero (" + plain + ")", plain > 0);
+                    LanceHopStrategy si = propStrategy(store, ids);
+                    Traversal.Admin<?, Object> ti = q.apply(jg.traversal().withStrategies(si), label)
+                            .dedup().id().asAdmin();
+                    c.that(form + "id sets equal", plainIds.equals(new HashSet<>(ti.toList()))
+                            && ranAsOneIdsStep(ti));
+                    // The same value with the other label: the intersection must drop the row.
+                    long plainOther = q.apply(jg.traversal(), other).dedup().count().next();
+                    LanceHopStrategy so = propStrategy(store, ids);
+                    long loweredOther = q.apply(jg.traversal().withStrategies(so), other)
+                            .dedup().count().next();
+                    c.eq(form + "with the other label: equals JanusGraph's (" + plainOther + ")",
+                            plainOther, loweredOther);
+                    otherLabelEmpties |= plainOther < plain;
+                }
+                break;
+            }
+        }
+        c.that("rows for both labels were found at k=3", any);
+        c.that("the label filter is applied as well: the other label gives fewer rows",
+                otherLabelEmpties);
+        jg.tx().rollback();
+    }
+
+    private static void propProvenance(Checks c, RowStore store, IDManager ids) {
+        c.section("has(key, value) provenance: the answer comes from the row store");
+        JanusGraph empty = open();
+        IDManager emptyIds = ((StandardJanusGraph) empty).getIDManager();
+        Object[] seeds = seedIds(emptyIds);
+        // A value that occurs in the store's frontier, chosen from the store through the same
+        // native chain with no filter.
+        long[] rows;
+        try (com.adaworldapi.graph.Graph g = com.adaworldapi.graph.Graph.open(store)) {
+            try (com.adaworldapi.graph.Graph g1 = g.from(SEED_ROWS);
+                    com.adaworldapi.graph.Graph g2 = g1.hop(Edge.KNOWS);
+                    com.adaworldapi.graph.Graph g3 = g2.hop(Edge.KNOWS)) {
+                rows = g3.materializeRows();
+            }
+        }
+        long v = store.payloadLow64At(rows[rows.length / 2], FacetId.of(PROP_FACET));
+        long plain = withProp(empty.traversal(), seeds, 2, v).dedup().count().next();
+        LanceHopStrategy s = propStrategy(store, emptyIds);
+        long lowered = withProp(empty.traversal().withStrategies(s), seeds, 2, v)
+                .dedup().count().next();
+        c.eq("plain JanusGraph over an empty graph answers 0", 0L, plain);
+        c.that("the lowered traversal over the same empty graph answers from the row store ("
+                + lowered + ")", lowered > 0);
+        c.eq("and it was lowered", 1L, s.lowered());
+        Set<Object> plainIds = withProp(empty.traversal(), seeds, 2, v).dedup().id().toSet();
+        LanceHopStrategy si = propStrategy(store, emptyIds);
+        Set<Object> loweredIds = withProp(empty.traversal().withStrategies(si), seeds, 2, v)
+                .dedup().id().toSet();
+        c.eq("plain JanusGraph over an empty graph returns no ids", 0L, (long) plainIds.size());
+        c.eq("the lowered id traversal returns as many ids as the count", lowered,
+                (long) loweredIds.size());
+        empty.close();
+        // A JanusGraph copy whose property differs from the store: the store's answer wins.
+        JanusGraph other = open();
+        IDManager otherIds = ((StandardJanusGraph) other).getIDManager();
+        for (long row = 0; row < store.rowCount(); row++) {
+            other.addVertex(T.id, vid(otherIds, row), T.label,
+                    "c" + store.classidAt(row, FacetId.of(LABEL_FACET)), PROP, -1L);
+        }
+        other.tx().commit();
+        long plainOther = withProp(other.traversal(), seedIds(otherIds), 2, v).dedup().count().next();
+        long loweredOther = withProp(other.traversal().withStrategies(propStrategy(store, otherIds)),
+                seedIds(otherIds), 2, v).dedup().count().next();
+        c.eq("a graph whose property is -1 everywhere: plain JanusGraph answers 0", 0L, plainOther);
+        c.eq("and the lowered traversal still returns the store's answer", lowered, loweredOther);
+        other.close();
+    }
+
+    private static void propFalsifier(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("has(key, value) falsifier: the wrong facet does not reproduce JanusGraph");
+        Object[] seeds = seedIds(ids);
+        boolean countDiffers = false;
+        boolean idsDiffer = false;
+        for (int k = 1; k <= 3; k++) {
+            for (long v : occurringValues(store, jg, ids, seeds, k)) {
+                long plain = withProp(jg.traversal(), seeds, k, v).dedup().count().next();
+                long wrong = withProp(jg.traversal().withStrategies(
+                        propStrategy(store, ids, FacetId.of(WRONG_PROP_FACET))), seeds, k, v)
+                        .dedup().count().next();
+                countDiffers |= plain != wrong;
+                Set<Object> plainIds = withProp(jg.traversal(), seeds, k, v).dedup().id().toSet();
+                idsDiffer |= !plainIds.equals(withProp(jg.traversal().withStrategies(
+                        propStrategy(store, ids, FacetId.of(WRONG_PROP_FACET))), seeds, k, v)
+                        .dedup().id().toSet());
+            }
+        }
+        c.that("the property read from facet " + WRONG_PROP_FACET + " instead of " + PROP_FACET
+                + " changes the counts", countDiffers);
+        c.that("and changes the id sets", idsDiffer);
+        jg.tx().rollback();
+    }
+
+    /** A not-lowered shape that JanusGraph itself rejects: both must fail the same way. */
+    private static void propFallbackThrows(Checks c, JanusGraph jg, RowStore store, IDManager ids,
+                                           String what, String reasonPart,
+                                           Function<GraphTraversalSource, GraphTraversal<?, Long>> q) {
+        Class<?> plainFailure = null;
+        try {
+            q.apply(jg.traversal()).next();
+        } catch (RuntimeException e) {
+            plainFailure = e.getClass();
+        }
+        LanceHopStrategy s = propStrategy(store, ids);
+        Traversal.Admin<?, Long> t = q.apply(jg.traversal().withStrategies(s)).asAdmin();
+        Class<?> failure = null;
+        try {
+            t.next();
+        } catch (RuntimeException e) {
+            failure = e.getClass();
+        }
+        c.that(what + ": plain JanusGraph rejects it (" + (plainFailure == null ? "no" : plainFailure.getSimpleName())
+                + ")", plainFailure != null);
+        c.that(what + ": with the strategy it fails the same way, not with a count",
+                plainFailure == failure);
+        c.eq(what + ": counted as a fallback", 1L, s.fellBack());
+        c.eq(what + ": not counted as lowered", 0L, s.lowered());
+        c.that(what + ": the reason mentions '" + reasonPart + "' ('" + s.lastFallbackReason() + "')",
+                s.lastFallbackReason().contains(reasonPart));
+        c.that(what + ": no lowered step ran", !(t.getSteps().size() == 1
+                && t.getSteps().get(0) instanceof LanceHopCountStep));
+    }
+
+    private static void propFallbacks(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
+        c.section("has(key, value) fallbacks: counted, with a reason, answered as JanusGraph answers");
+        Object[] seeds = seedIds(ids);
+        long v = occurringValues(store, jg, ids, seeds, 2)[1];
+        long w = occurringValues(store, jg, ids, seeds, 2)[2];
+        labelFallback(c, jg, propStrategy(store, ids), "unregistered key", "not registered",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has("n", v).dedup().count());
+        labelFallback(c, jg, labelStrategy(store, ids), "no property registered at all",
+                "not registered",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, v).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "P.gt", "not an equality",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, P.gt(v)).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "P.within", "not an equality",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, P.within(v, w)).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "P.neq", "not an equality",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, P.neq(v)).dedup().count());
+        // JanusGraph itself refuses a value of the wrong type for a Long key, so for these two the
+        // answer to match is the same refusal: the strategy must not turn it into a count.
+        propFallbackThrows(c, jg, store, ids, "String value", "Long or Integer",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, "abc").dedup().count());
+        propFallbackThrows(c, jg, store, ids, "Double value", "Long or Integer",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, 1.5d).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "two has steps", "2 conditions",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, v).has(PROP, w).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "two has steps, one unregistered",
+                "not registered",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, v).has("n", w).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "has + two hasLabel", "3 conditions",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, v).hasLabel("c0").hasLabel("c10")
+                        .dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "has between hops", "step 2",
+                g -> g.V(seeds).out(KNOWS).has(PROP, v).out(KNOWS).dedup().count());
+        labelFallback(c, jg, propStrategy(store, ids), "has without dedup()", "dedup",
+                g -> g.V(seeds).out(KNOWS).out(KNOWS).has(PROP, v).count());
+        // The id() shape.
+        for (Object[] cs : new Object[][] {{"gt", "not an equality"}, {"unregistered", "not registered"}}) {
+            boolean gt = cs[0].equals("gt");
+            LanceHopStrategy s = propStrategy(store, ids);
+            Set<Object> plain = (gt ? outN(jg.traversal().V(seeds), 2).has(PROP, P.gt(v))
+                    : outN(jg.traversal().V(seeds), 2).has("n", v)).dedup().id().toSet();
+            Traversal.Admin<?, Object> t = (gt
+                    ? outN(jg.traversal().withStrategies(s).V(seeds), 2).has(PROP, P.gt(v))
+                    : outN(jg.traversal().withStrategies(s).V(seeds), 2).has("n", v))
+                    .dedup().id().asAdmin();
+            Set<Object> got = t.toSet();
+            c.that("id() " + cs[0] + ": answer unchanged (" + got.size() + " ids)",
+                    plain.equals(got));
+            c.eq("id() " + cs[0] + ": counted as a fallback", 1L, s.fellBack());
+            c.eq("id() " + cs[0] + ": not counted as lowered", 0L, s.lowered());
+            c.that("id() " + cs[0] + ": no lowered step ran", !ranAsOneIdsStep(t));
+            c.that("id() " + cs[0] + ": the reason mentions '" + cs[1] + "' ('"
+                    + s.lastFallbackReason() + "')", s.lastFallbackReason().contains((String) cs[1]));
+        }
         jg.tx().rollback();
     }
 
