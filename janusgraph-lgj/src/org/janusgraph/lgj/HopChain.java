@@ -15,7 +15,6 @@
 package org.janusgraph.lgj;
 
 import com.adaworldapi.graph.Graph;
-import com.adaworldapi.lancegraph.FacetId;
 import com.adaworldapi.lancegraph.Mask;
 import com.adaworldapi.lancegraph.RowStore;
 
@@ -52,19 +51,22 @@ final class HopChain {
     }
 
     /**
-     * As {@link #run}, then intersects the last frontier with the mask of the rows whose
-     * {@code labelFacet} carries {@code labelClassid}, and runs {@code terminal} on the result.
+     * As {@link #run}, then intersects the last frontier with each filter of {@code filter} and
+     * runs {@code terminal} on the result.
      *
-     * <p>Native calls, measured by {@code JanusCrossingsTest}: the seed import 2, two per hop, the
-     * label mask 2 (create, class match), the intersection 2 ({@code ternlog} with the truth
-     * table 0xC0, {@code a & b}: create the destination, run it), the terminal 1, and one per
-     * mask closed, k + 3 of them: 3k + 10 in all. {@code Graph} has no public {@code and};
-     * {@code a.minus(a.minus(b))} would cost four calls for the intersection, and {@code Graph}
-     * does not expose its frontier {@code Mask}, so the chain here runs on {@code Mask}s
-     * directly. Every Mask is closed.
+     * <p>The label filter is the mask of the rows whose label facet carries the class id (2
+     * native calls: create, class match). The property filter is the mask of the rows whose
+     * property facet register matches the value in its low 64 bits, high 32 bits not compared
+     * ({@code maskOfFacetTernaryMatch}, 2 calls: create, match). Each intersection is 2 calls
+     * ({@code ternlog} with the truth table 0xC0, {@code a & b}: create the destination, run it).
+     * Native calls, measured by {@code JanusCrossingsTest}: the seed import 2, two per hop, the
+     * terminal 1, one per mask closed, and per filter 4 plus 2 closes: 3k + 10 with one filter,
+     * 3k + 16 with both. {@code Graph} has no public {@code and}; {@code a.minus(a.minus(b))}
+     * would cost four calls for the intersection, and {@code Graph} does not expose its frontier
+     * {@code Mask}, so the chain here runs on {@code Mask}s directly. Every Mask is closed.
      */
-    static <T> T runFiltered(RowStore store, long[] seeds, int[] hops, FacetId labelFacet,
-                             int labelClassid, Function<Mask, T> terminal) {
+    static <T> T runFiltered(RowStore store, long[] seeds, int[] hops, HopFilter filter,
+                             Function<Mask, T> terminal) {
         List<Mask> open = new ArrayList<>();
         Throwable primary = null;
         try {
@@ -74,12 +76,22 @@ final class HopChain {
                 m = store.hop(classid, m);
                 open.add(m);
             }
-            Mask label = store.maskOfFacetClass(labelFacet, labelClassid);
-            open.add(label);
-            // a & b in one native call: ternlog(a, b, b) with truth table 0xC0.
-            Mask both = m.ternlog(label, label, 0xC0);
-            open.add(both);
-            return terminal.apply(both);
+            if (filter.labelFacet() != null) {
+                Mask label = store.maskOfFacetClass(filter.labelFacet(), filter.labelClassid());
+                open.add(label);
+                // a & b in one native call: ternlog(a, b, b) with truth table 0xC0.
+                m = m.ternlog(label, label, 0xC0);
+                open.add(m);
+            }
+            if (filter.propertyFacet() != null) {
+                // All 64 low bits care, value is the pattern; the high 32 bits are don't-care.
+                Mask prop = store.maskOfFacetTernaryMatch(filter.propertyFacet(),
+                        filter.propertyValue(), 0, -1L, 0);
+                open.add(prop);
+                m = m.ternlog(prop, prop, 0xC0);
+                open.add(m);
+            }
+            return terminal.apply(m);
         } catch (RuntimeException | Error e) {
             primary = e;
             throw e;

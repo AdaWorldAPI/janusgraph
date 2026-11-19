@@ -76,6 +76,7 @@ public final class JanusCrossingsTest {
             Primitives p = primitives(c, store);
             shapes(c, store, jg, ids, p);
             independence(c, store, big, jg, ids, p);
+            propertyShapes(c, store, big, jg, ids, p);
             fallbacks(c, store, jg, ids);
             falsifiers(c, store, jg, ids);
             jg.close();
@@ -122,7 +123,7 @@ public final class JanusCrossingsTest {
     // ---- the primitives ----
 
     private record Primitives(long importRows, long hop, long count, long materialize,
-                              long classMask, long ternlog, long close) {
+                              long classMask, long ternlog, long close, long propertyMask) {
 
         /** Calls of one execution, composed from the primitives, for k hops. */
         long compose(Shape shape, int k) {
@@ -167,12 +168,17 @@ public final class JanusCrossingsTest {
         Mask[] both = new Mask[1];
         long ternlog = delta(x -> both[0] = hopped[0].ternlog(cls[0], cls[0], 0xC0));
         open.add(both[0]);
+        Mask[] prop = new Mask[1];
+        long propertyMask = delta(x -> prop[0] = store.maskOfFacetTernaryMatch(
+                FacetId.of(MeasureSupport.PROP_FACET), 1L, 0, -1L, 0));
+        open.add(prop[0]);
         long closeOne = delta(x -> { open.remove(0).close(); return null; });
 
         c.note("importRows of 1 row: " + importOne + ", of 10 rows: " + importTen
                 + ", hop: " + hop + ", count: " + count + ", materializeRows first call: "
                 + materializeFirst + ", second call: " + materializeSecond
                 + ", maskOfFacetClass: " + classMask + ", ternlog: " + ternlog
+                + ", maskOfFacetTernaryMatch: " + propertyMask
                 + ", close of one mask: " + closeOne);
         c.eq("importRows makes the same number of calls for 1 row and for 10 rows", importOne,
                 importTen);
@@ -186,12 +192,14 @@ public final class JanusCrossingsTest {
                 materializeFirst, materializeSecond);
         c.eq("maskOfFacetClass: 2 calls (create the mask, match the class)", 2L, classMask);
         c.eq("ternlog: 2 calls (create the destination mask, the operation)", 2L, ternlog);
+        c.eq("maskOfFacetTernaryMatch: 2 calls (create the mask, match the register)", 2L,
+                propertyMask);
         c.eq("close of one mask: 1 call, so releasing a handle is counted", 1L, closeOne);
         for (Mask m : open) {
             m.close();
         }
         return new Primitives(importTen, hop, count, materializeFirst, classMask, ternlog,
-                closeOne);
+                closeOne, propertyMask);
     }
 
     // ---- the four shapes at k = 1, 2, 3 ----
@@ -275,6 +283,91 @@ public final class JanusCrossingsTest {
                 b.running);
     }
 
+    // ---- the property equality shapes ----
+
+    /** One execution of a has(PROP, value) shape: planning calls, running calls, answer size. */
+    private static Run measureProperty(RowStore store, JanusGraph jg, IDManager ids,
+                                       long[] seedRows, int k, boolean withLabel, boolean idShape) {
+        LanceHopStrategy s = MeasureSupport.strategy(store, ids);
+        GraphTraversalSource g = jg.traversal().withStrategies(s);
+        long value = MeasureSupport.propertyValue(store, seedRows, k);
+        Traversal.Admin<?, ?> t = MeasureSupport.propertyShape(g,
+                MeasureSupport.seedIds(ids, seedRows), k, value, withLabel, idShape);
+        long a = Diagnostics.crossings();
+        t.applyStrategies();
+        long b = Diagnostics.crossings();
+        List<Object> answer = MeasureSupport.drain(t);
+        long d = Diagnostics.crossings();
+        boolean one = MeasureSupport.isOneLoweredStep(t);
+        long size = answer.isEmpty() ? -1 : (idShape ? answer.size() : (Long) answer.get(0));
+        return new Run(b - a, d - b, size, one, s.lowered(), s.fellBack());
+    }
+
+    private static void propertyShapes(Checks c, RowStore store, RowStore big, JanusGraph jg,
+                                       IDManager ids, Primitives p) {
+        c.section("has(key, value) shapes: one filter 3k + 10 calls, with hasLabel as well 3k + 16");
+        StringBuilder table = new StringBuilder();
+        long[][] seedSets = {{5}, MeasureSupport.SEED_ROWS, MeasureSupport.strideRows(500, 3)};
+        for (boolean withLabel : new boolean[] {false, true}) {
+            for (boolean idShape : new boolean[] {false, true}) {
+                for (int k : KS) {
+                    String what = "has" + (withLabel ? "+hasLabel" : "") + (idShape ? "+id" : "+count")
+                            + " k=" + k;
+                    Set<Long> calls = new HashSet<>();
+                    long planning = 0;
+                    long lowest = Long.MAX_VALUE;
+                    boolean allLowered = true;
+                    for (RowStore s : new RowStore[] {store, big}) {
+                        for (long[] seeds : seedSets) {
+                            Run r = measureProperty(s, jg, ids, seeds, k, withLabel, idShape);
+                            calls.add(r.running);
+                            planning += r.planning;
+                            allLowered &= r.oneLoweredStep && r.lowered == 1L && r.fellBack == 0L;
+                            if (!withLabel) {
+                                lowest = Math.min(lowest, r.answer);
+                            }
+                        }
+                    }
+                    Run r = measureProperty(store, jg, ids, MeasureSupport.SEED_ROWS, k, withLabel,
+                            idShape);
+                    table.append(' ').append(what).append(" -> ").append(r.running).append(';');
+                    long masks = k + 1 + 2 + (withLabel ? 2 : 0);
+                    long expected = p.importRows + k * p.hop + (idShape ? p.materialize : p.count)
+                            + p.propertyMask + p.ternlog
+                            + (withLabel ? p.classMask + p.ternlog : 0) + masks * p.close;
+                    c.eq(what + ": 6 runs (2 stores, 3 seed sets) make the same number of calls", 1L,
+                            (long) calls.size());
+                    c.eq(what + ": calls equal the sum of the primitives", expected, r.running);
+                    c.eq(what + ": calls equal " + (withLabel ? "3k + 16" : "3k + 10"),
+                            withLabel ? 3L * k + 16 : 3L * k + 10, r.running);
+                    c.eq(what + ": planning makes no native call", 0L, planning);
+                    c.that(what + ": every run was one lowered step", allLowered);
+                    if (!withLabel) {
+                        c.that(what + ": the value is from the frontier, so every answer is "
+                                + "non-empty (smallest " + lowest + ")", lowest > 0);
+                    }
+                }
+            }
+        }
+        c.note("measured:" + table);
+        // The same shape with a different value makes the same calls: the count does not depend
+        // on the value or on the answer.
+        Run a = measureProperty(store, jg, ids, MeasureSupport.SEED_ROWS, 2, false, false);
+        LanceHopStrategy s = MeasureSupport.strategy(store, ids);
+        Traversal.Admin<?, ?> absent = MeasureSupport.propertyShape(jg.traversal().withStrategies(s),
+                MeasureSupport.seedIds(ids, MeasureSupport.SEED_ROWS), 2, 0x7777_7777_7777_7777L,
+                false, false);
+        absent.applyStrategies();
+        long before = Diagnostics.crossings();
+        List<Object> answer = MeasureSupport.drain(absent);
+        long calls = Diagnostics.crossings() - before;
+        c.eq("a value that occurs nowhere answers 0", 0L, ((Long) answer.get(0)).longValue());
+        c.eq("and makes the same calls as a value that occurs", a.running, calls);
+        long plain = measure(store, jg, ids, Shape.COUNT, MeasureSupport.SEED_ROWS, 2).running;
+        c.eq("has adds 6 calls to the same k=2 count (mask 2, intersection 2, two closes)", 6L,
+                a.running - plain);
+    }
+
     // ---- not lowered ----
 
     private static void fallbacks(Checks c, RowStore store, JanusGraph jg, IDManager ids) {
@@ -287,7 +380,27 @@ public final class JanusCrossingsTest {
         fallback(c, store, jg, ids, "out().hasLabel(two labels).dedup().count()",
                 g -> g.V(seeds).out(MeasureSupport.KNOWS).hasLabel("c0", "c10").dedup().count()
                         .asAdmin());
+        propertyFallback(c, store, jg, ids, "has(p, gt)",
+                g -> g.V(seeds).out(MeasureSupport.KNOWS).has(MeasureSupport.PROP,
+                        org.apache.tinkerpop.gremlin.process.traversal.P.gt(5L)).dedup().count()
+                        .asAdmin());
+        propertyFallback(c, store, jg, ids, "has(unregistered key)",
+                g -> g.V(seeds).out(MeasureSupport.KNOWS).has("q", 5L).dedup().count().asAdmin());
         jg.tx().rollback();
+    }
+
+    private static void propertyFallback(Checks c, RowStore store, JanusGraph jg, IDManager ids,
+                                         String what,
+                                         Function<GraphTraversalSource, Traversal.Admin<?, ?>> build) {
+        LanceHopStrategy s = MeasureSupport.strategy(store, ids);
+        Traversal.Admin<?, ?> t = build.apply(jg.traversal().withStrategies(s));
+        long a = Diagnostics.crossings();
+        t.applyStrategies();
+        MeasureSupport.drain(t);
+        long calls = Diagnostics.crossings() - a;
+        c.eq(what + ": planning and running make no native call", 0L, calls);
+        c.eq(what + ": counted as a fallback", 1L, s.fellBack());
+        c.eq(what + ": not counted as lowered", 0L, s.lowered());
     }
 
     private static void fallback(Checks c, RowStore store, JanusGraph jg, IDManager ids,

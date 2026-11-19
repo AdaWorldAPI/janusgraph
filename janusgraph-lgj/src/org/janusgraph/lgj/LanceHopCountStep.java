@@ -15,7 +15,6 @@
 package org.janusgraph.lgj;
 
 import com.adaworldapi.graph.Graph;
-import com.adaworldapi.lancegraph.FacetId;
 import com.adaworldapi.lancegraph.Mask;
 import com.adaworldapi.lancegraph.RowStore;
 
@@ -28,27 +27,25 @@ import org.apache.tinkerpop.gremlin.process.traversal.step.util.AbstractStep;
 
 /**
  * The one step a lowered traversal consists of: it answers
- * {@code V(ids).out(label)^k.dedup().count()}, or the same with one {@code hasLabel(L)} before
- * {@code dedup()}, from the row store as a chain of mask hops and emits the count once. It reads nothing from JanusGraph.
+ * {@code V(ids).out(label)^k.dedup().count()}, or the same with one {@code hasLabel(L)} and/or one
+ * property equality before {@code dedup()}, from the row store as a chain of mask hops and emits the count once. It reads nothing from JanusGraph.
  */
 final class LanceHopCountStep<S> extends AbstractStep<S, Long> {
 
     private final transient RowStore store;
     private final long[] seeds;
     private final int[] hops;
-    private final FacetId labelFacet;
-    private final int labelClassid;
+    private final HopFilter filter;
     private boolean done;
 
-    /** {@code labelFacet} is null for the unfiltered shape. */
+    /** {@code filter} is null for the unfiltered shape. */
     LanceHopCountStep(Traversal.Admin<?, ?> traversal, RowStore store, long[] seeds, int[] hops,
-                      FacetId labelFacet, int labelClassid) {
+                      HopFilter filter) {
         super(traversal);
         this.store = store;
         this.seeds = seeds.clone();
         this.hops = hops.clone();
-        this.labelFacet = labelFacet;
-        this.labelClassid = labelClassid;
+        this.filter = filter;
     }
 
     @Override
@@ -64,9 +61,9 @@ final class LanceHopCountStep<S> extends AbstractStep<S, Long> {
     }
 
     private long count() {
-        return labelFacet == null
+        return filter == null
                 ? HopChain.run(store, seeds, hops, Graph::count)
-                : HopChain.runFiltered(store, seeds, hops, labelFacet, labelClassid, Mask::count);
+                : HopChain.runFiltered(store, seeds, hops, filter, Mask::count);
     }
 
     @Override
@@ -78,6 +75,6 @@ final class LanceHopCountStep<S> extends AbstractStep<S, Long> {
     @Override
     public String toString() {
         return "LanceHopCountStep(seeds=" + seeds.length + ", hops=" + Arrays.toString(hops)
-                + (labelFacet == null ? "" : ", label=" + labelFacet + ":" + labelClassid) + ")";
+                + (filter == null ? "" : filter.toString()) + ")";
     }
 }

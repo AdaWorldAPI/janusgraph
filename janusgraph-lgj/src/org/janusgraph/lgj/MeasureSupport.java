@@ -45,6 +45,9 @@ final class MeasureSupport {
     static final long SEED = 0xF00D_CAFEL;
     static final int RADIUS = 25;
     static final int LABEL_FACET = 3;
+    /** The vertex property key {@link #strategy} registers, and the facet it is the payload of. */
+    static final String PROP = "p";
+    static final int PROP_FACET = 7;
     /** A label with a non-trivial answer at k = 1, 2 and 3 on the 2,000-row store. */
     static final String LABEL = "c10";
     /** The seed rows {@link JanusLoweringTest} uses. */
@@ -104,7 +107,32 @@ final class MeasureSupport {
                         id -> ids.fromVertexId(id) - 1)
                 .rowToVertexId(row -> vid(ids, row))
                 .vertexLabels(FacetId.of(LABEL_FACET), Map.of("c0", 0, "c10", 10))
+                .vertexProperty(PROP, FacetId.of(PROP_FACET))
                 .build();
+    }
+
+    /**
+     * Test-side choice of a value to filter on: the property of the middle row of the frontier
+     * {@code V(seedRows).out(KNOWS)^k}, so the lowered filter has something to find. Chosen
+     * here; the lowered traversal does not use this.
+     */
+    static long propertyValue(RowStore store, long[] seedRows, int k) {
+        int[] hops = new int[k];
+        java.util.Arrays.fill(hops, Edge.KNOWS);
+        long[] rows = HopChain.run(store, seedRows, hops, com.adaworldapi.graph.Graph::materializeRows);
+        return rows.length == 0 ? 0L
+                : store.payloadLow64At(rows[rows.length / 2], FacetId.of(PROP_FACET));
+    }
+
+    /** {@code V(seeds).out(KNOWS)^k [.hasLabel(LABEL)] .has(PROP, value) .dedup() .count()|.id()}. */
+    static Traversal.Admin<?, ?> propertyShape(GraphTraversalSource g, Object[] seeds, int k,
+                                               long value, boolean withLabel, boolean ids) {
+        GraphTraversal<Vertex, Vertex> t = outN(g.V(seeds), k);
+        if (withLabel) {
+            t = t.hasLabel(LABEL);
+        }
+        t = t.has(PROP, value).dedup();
+        return ids ? t.id().asAdmin() : t.count().asAdmin();
     }
 
     static Object[] seedIds(IDManager ids, long[] rows) {

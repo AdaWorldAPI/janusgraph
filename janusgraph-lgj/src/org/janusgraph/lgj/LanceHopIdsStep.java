@@ -15,7 +15,6 @@
 package org.janusgraph.lgj;
 
 import com.adaworldapi.graph.Graph;
-import com.adaworldapi.lancegraph.FacetId;
 import com.adaworldapi.lancegraph.Mask;
 import com.adaworldapi.lancegraph.RowStore;
 
@@ -29,8 +28,8 @@ import org.apache.tinkerpop.gremlin.process.traversal.step.util.AbstractStep;
 
 /**
  * The one step a lowered id traversal consists of: it answers
- * {@code V(ids).out(label)^k.dedup().id()}, or the same with one {@code hasLabel(L)} before
- * {@code dedup()}, from the row store. The rows of the last frontier are
+ * {@code V(ids).out(label)^k.dedup().id()}, or the same with one {@code hasLabel(L)} and/or one
+ * property equality before {@code dedup()}, from the row store. The rows of the last frontier are
  * materialized once, mapped to JanusGraph vertex ids, and emitted one traverser each, in
  * ascending row order. It reads nothing from JanusGraph.
  */
@@ -40,29 +39,26 @@ final class LanceHopIdsStep<S> extends AbstractStep<S, Long> {
     private final long[] seeds;
     private final int[] hops;
     private final transient LongUnaryOperator rowToVertexId;
-    private final FacetId labelFacet;
-    private final int labelClassid;
+    private final HopFilter filter;
     private long[] rows;
     private int next;
 
     LanceHopIdsStep(Traversal.Admin<?, ?> traversal, RowStore store, long[] seeds, int[] hops,
-                    LongUnaryOperator rowToVertexId, FacetId labelFacet, int labelClassid) {
+                    LongUnaryOperator rowToVertexId, HopFilter filter) {
         super(traversal);
         this.store = store;
         this.seeds = seeds.clone();
         this.hops = hops.clone();
         this.rowToVertexId = rowToVertexId;
-        this.labelFacet = labelFacet;
-        this.labelClassid = labelClassid;
+        this.filter = filter;
     }
 
     @Override
     protected Traverser.Admin<Long> processNextStart() {
         if (rows == null) {
-            rows = labelFacet == null
+            rows = filter == null
                     ? HopChain.run(store, seeds, hops, Graph::materializeRows)
-                    : HopChain.runFiltered(store, seeds, hops, labelFacet, labelClassid,
-                            Mask::materializeRows);
+                    : HopChain.runFiltered(store, seeds, hops, filter, Mask::materializeRows);
         }
         if (next >= rows.length) {
             throw new NoSuchElementException();
@@ -92,6 +88,6 @@ final class LanceHopIdsStep<S> extends AbstractStep<S, Long> {
     @Override
     public String toString() {
         return "LanceHopIdsStep(seeds=" + seeds.length + ", hops=" + Arrays.toString(hops)
-                + (labelFacet == null ? "" : ", label=" + labelFacet + ":" + labelClassid) + ")";
+                + (filter == null ? "" : filter.toString()) + ")";
     }
 }

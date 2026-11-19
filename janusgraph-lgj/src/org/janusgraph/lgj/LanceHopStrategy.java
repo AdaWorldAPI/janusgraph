@@ -73,7 +73,20 @@ import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphStepStrategy
  *
  * It is answered as the last frontier intersected, natively, with the mask of the rows whose
  * label facet carries the class id mapped to L. Only {@code hasLabel} with one string, that is
- * label equality, is lowered; it is not a general {@code has()} or {@code where()}. It is the shape lance-graph-java's own
+ * label equality, is lowered; it is not a general {@code has()} or {@code where()}.
+ *
+ * <p>When the caller registers a property key with a facet (see {@link Builder#vertexProperty}),
+ * one equality filter on that key may stand in the same place:
+ *
+ * <pre>{@code g.V(ids).out(label)^k.has(key, value).dedup().count()}</pre>
+ *
+ * with a Long or Integer value (written {@code has(key, value)} or {@code has(key, P.eq(value))}).
+ * It is answered as the last frontier intersected, natively, with the mask of the rows whose
+ * facet register has a low 64 bit payload equal to the value. The high 32 bits of the register
+ * are not compared (see {@link Builder#vertexProperty}). The filter may be combined with one
+ * {@code hasLabel(L)} (both masks are intersected with the frontier). Any other predicate, an
+ * unregistered key, a value that is not a Long or Integer, two property filters, or a property
+ * filter between hops is not lowered. It is the shape lance-graph-java's own
  * TinkerPop harness lowers; this class is that strategy for JanusGraph. Two things differ:
  *
  * <ul>
@@ -109,6 +122,7 @@ public final class LanceHopStrategy
     private final LongUnaryOperator rowToVertexId;
     private final FacetId labelFacet;
     private final Map<String, Integer> vertexLabelClassids;
+    private final Map<String, FacetId> vertexProperties;
     private final AtomicLong lowered = new AtomicLong();
     private final AtomicLong fellBack = new AtomicLong();
     private volatile String lastFallbackReason = "";
@@ -132,18 +146,20 @@ public final class LanceHopStrategy
      */
     public LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
                             LongUnaryOperator vertexIdToRow, LongUnaryOperator rowToVertexId) {
-        this(store, edgeClassids, vertexIdToRow, rowToVertexId, null, Map.of());
+        this(store, edgeClassids, vertexIdToRow, rowToVertexId, null, Map.of(), Map.of());
     }
 
     private LanceHopStrategy(RowStore store, Map<String, Integer> edgeClassids,
                              LongUnaryOperator vertexIdToRow, LongUnaryOperator rowToVertexId,
-                             FacetId labelFacet, Map<String, Integer> vertexLabelClassids) {
+                             FacetId labelFacet, Map<String, Integer> vertexLabelClassids,
+                             Map<String, FacetId> vertexProperties) {
         this.store = store;
         this.edgeClassids = Map.copyOf(edgeClassids);
         this.vertexIdToRow = vertexIdToRow;
         this.rowToVertexId = rowToVertexId;
         this.labelFacet = labelFacet;
         this.vertexLabelClassids = Map.copyOf(vertexLabelClassids);
+        this.vertexProperties = Map.copyOf(vertexProperties);
     }
 
     /**
@@ -163,6 +179,7 @@ public final class LanceHopStrategy
         private LongUnaryOperator rowToVertexId;
         private FacetId labelFacet;
         private Map<String, Integer> vertexLabelClassids = Map.of();
+        private final Map<String, FacetId> vertexProperties = new java.util.HashMap<>();
 
         private Builder(RowStore store, Map<String, Integer> edgeClassids,
                         LongUnaryOperator vertexIdToRow) {
@@ -189,9 +206,31 @@ public final class LanceHopStrategy
             return this;
         }
 
+        /**
+         * Registers a vertex property key as the payload of a facet, so that
+         * {@code has(key, value)} with a Long or Integer value can be lowered. A row has the
+         * property value {@code v} exactly when the low 64 bits of that facet's 12 byte register
+         * equal {@code v}.
+         *
+         * <p>The high 32 bits of the register are NOT compared: the native filter is
+         * {@code maskOfFacetTernaryMatch(facet, value, 0, careLo64 = all ones, careHi32 = 0)}, and
+         * with a zero high care the high 32 bits are a don't-care. This is the honest choice
+         * because the facade documents {@code payloadLow64At} as "the low 64 payload bits" and
+         * {@code payloadHi32At} as a separate field that is, for ordinary rows, unrelated noise;
+         * a property whose value is the 64 bit low payload would otherwise match only rows whose
+         * high part happens to be zero. The consequence: the caller must hold the property in the
+         * low 64 bits, and two rows that differ only in the high 32 bits both match.
+         * The facet's class id is not compared either.
+         */
+        public Builder vertexProperty(String key, FacetId facet) {
+            vertexProperties.put(java.util.Objects.requireNonNull(key, "key"),
+                    java.util.Objects.requireNonNull(facet, "facet"));
+            return this;
+        }
+
         public LanceHopStrategy build() {
             return new LanceHopStrategy(store, edgeClassids, vertexIdToRow, rowToVertexId,
-                    labelFacet, vertexLabelClassids);
+                    labelFacet, vertexLabelClassids, vertexProperties);
         }
     }
 
@@ -268,14 +307,14 @@ public final class LanceHopStrategy
         // a plain TinkerPop HasStep: JanusGraph's strategies, which would fold it into a
         // JanusGraphStep, run after this one.
         int hopsEnd = last - 1;
-        Integer labelClassid = null;
+        HopFilter filter = null;
         if (steps.size() > 4 && steps.get(last - 2) instanceof HasStep<?> has) {
             hopsEnd = last - 2;
-            Object reasonOrClassid = labelFilter(has);
-            if (reasonOrClassid instanceof String reason) {
+            Object reasonOrFilter = filterOf(has);
+            if (reasonOrFilter instanceof String reason) {
                 return reason;
             }
-            labelClassid = (Integer) reasonOrClassid;
+            filter = (HopFilter) reasonOrFilter;
         }
         int[] hops = new int[hopsEnd - 1];
         for (int i = 1; i < hopsEnd; i++) {
@@ -304,44 +343,74 @@ public final class LanceHopStrategy
         }
         TraversalHelper.removeAllSteps(traversal);
         traversal.addStep(ids
-                ? new LanceHopIdsStep(traversal, store, seeds, hops, rowToVertexId,
-                        labelClassid == null ? null : labelFacet, labelClassid == null ? 0 : labelClassid)
-                : new LanceHopCountStep(traversal, store, seeds, hops,
-                        labelClassid == null ? null : labelFacet, labelClassid == null ? 0 : labelClassid));
+                ? new LanceHopIdsStep(traversal, store, seeds, hops, rowToVertexId, filter)
+                : new LanceHopCountStep(traversal, store, seeds, hops, filter));
         lowered.incrementAndGet();
         return null;
     }
 
     /**
-     * The class id of the label a HasStep tests, as an Integer, or the reason (a String) why this
-     * HasStep is not a lowerable label filter.
+     * The filter a HasStep carries, as a {@link HopFilter}, or the reason (a String) why this
+     * HasStep is not lowerable: at most one label equality and at most one property equality on
+     * a registered key with a Long or Integer value.
      */
-    private Object labelFilter(HasStep<?> has) {
-        if (labelFacet == null) {
-            return "hasLabel() needs the vertex label mapping (label facet and label class ids)";
-        }
+    private Object filterOf(HasStep<?> has) {
         if (!has.getLabels().isEmpty()) {
             return "as() labels would be lost";
         }
         List<HasContainer> containers = has.getHasContainers();
-        if (containers.size() != 1) {
-            return "hasLabel() step carries " + containers.size()
-                    + " conditions; exactly one hasLabel with one label is lowered";
+        if (containers.size() > 2) {
+            return "has step carries " + containers.size()
+                    + " conditions; at most one hasLabel with one label and one property equality are lowered";
         }
-        HasContainer hc = containers.get(0);
-        if (!T.label.getAccessor().equals(hc.getKey())) {
-            return "has('" + hc.getKey() + "', ...) is a property filter, not a label filter";
+        FacetId lFacet = null;
+        int lClassid = 0;
+        FacetId pFacet = null;
+        long pValue = 0;
+        for (HasContainer hc : containers) {
+            boolean isLabel = T.label.getAccessor().equals(hc.getKey());
+            P<?> p = hc.getPredicate();
+            boolean plainEq = p.getClass() == P.class && p.getBiPredicate() == Compare.eq;
+            if (isLabel) {
+                if (labelFacet == null) {
+                    return "hasLabel() needs the vertex label mapping (label facet and label class ids)";
+                }
+                if (lFacet != null) {
+                    return "has step carries " + containers.size()
+                            + " conditions; exactly one hasLabel with one label is lowered";
+                }
+                if (!plainEq || !(hc.getValue() instanceof String)) {
+                    return "hasLabel() with " + p + " is not a single-label equality";
+                }
+                Integer classid = vertexLabelClassids.get((String) hc.getValue());
+                if (classid == null) {
+                    return "vertex label '" + hc.getValue() + "' has no class id in the label facet";
+                }
+                lFacet = labelFacet;
+                lClassid = classid;
+            } else {
+                FacetId facet = vertexProperties.get(hc.getKey());
+                if (facet == null) {
+                    return "has('" + hc.getKey() + "', ...) is a property filter on a key that is not"
+                            + " registered with a facet, not a label filter";
+                }
+                if (pFacet != null) {
+                    return "has step carries " + containers.size()
+                            + " conditions; exactly one property equality is lowered";
+                }
+                if (!plainEq) {
+                    return "property filter on '" + hc.getKey() + "' with " + p
+                            + " is not an equality";
+                }
+                if (!(hc.getValue() instanceof Long || hc.getValue() instanceof Integer)) {
+                    return "property filter on '" + hc.getKey() + "' needs a Long or Integer value, got "
+                            + (hc.getValue() == null ? "null" : hc.getValue().getClass().getSimpleName());
+                }
+                pFacet = facet;
+                pValue = ((Number) hc.getValue()).longValue();
+            }
         }
-        P<?> p = hc.getPredicate();
-        if (p.getClass() != P.class || p.getBiPredicate() != Compare.eq
-                || !(hc.getValue() instanceof String)) {
-            return "hasLabel() with " + p + " is not a single-label equality";
-        }
-        Integer classid = vertexLabelClassids.get((String) hc.getValue());
-        if (classid == null) {
-            return "vertex label '" + hc.getValue() + "' has no class id in the label facet";
-        }
-        return classid;
+        return new HopFilter(lFacet, lClassid, pFacet, pValue);
     }
 
     /** Row numbers for V(ids), or null when any id does not map to a row of this store. */
