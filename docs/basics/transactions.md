@@ -71,6 +71,25 @@ e = g.E(e).next() //Need to refresh edge
 e.property("time", 99)
 ```
 
+## Queries See the Transaction's Changes
+
+A query in a transaction sees what the transaction has changed before it commits: the vertices and edges it added and
+the values it set, and not the elements or values it removed. Indexes hold what was committed, so JanusGraph corrects
+what an index returns for a query with the changes of the transaction, in memory. That takes time in proportion to the
+transaction's changes which the query's conditions or order may concern, and a query with a limit may read further into
+the index, past elements which the transaction changed. A query in a transaction with very many changes which only
+needs the committed state of the graph can run in a transaction of its own, which sees none of the other's changes:
+```groovy
+committed = graph.buildTransaction().readOnly().start()
+latest = committed.traversal().V().has("kind", "k").order().by("updatedAt", desc).limit(10).toList()
+committed.rollback()
+```
+
+Direct index queries, through `graph.indexQuery()` or a transaction's `indexQuery()`, read the index alone. They leave
+out the elements which the transaction removed, but its other changes don't change what they find: they don't find the
+elements which the transaction added or changed to match, and they return those which it changed to no longer match,
+with their new values. Their totals, such as `vertexTotals()`, count what the index holds.
+
 ## Transaction Failures
 
 When committing a transaction, JanusGraph will attempt to persist all

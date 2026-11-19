@@ -31,13 +31,16 @@ import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Element;
 import org.apache.tinkerpop.gremlin.structure.Graph;
+import org.apache.tinkerpop.gremlin.structure.Property;
 import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.structure.VertexProperty;
+import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 import org.janusgraph.TestCategory;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.EdgeLabel;
 import org.janusgraph.core.JanusGraph;
+import org.janusgraph.core.JanusGraphEdge;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.core.JanusGraphFactory;
@@ -50,6 +53,7 @@ import org.janusgraph.core.Multiplicity;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.VertexLabel;
 import org.janusgraph.core.attribute.Cmp;
+import org.janusgraph.core.attribute.Contain;
 import org.janusgraph.core.attribute.Geo;
 import org.janusgraph.core.attribute.Geoshape;
 import org.janusgraph.core.attribute.Text;
@@ -91,6 +95,7 @@ import org.janusgraph.graphdb.internal.ElementLifeCycle;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.internal.RelationCategory;
 import org.janusgraph.graphdb.log.StandardTransactionLogProcessor;
+import org.janusgraph.graphdb.predicate.OrJanusPredicate;
 import org.janusgraph.graphdb.query.index.ApproximateIndexSelectionStrategy;
 import org.janusgraph.graphdb.query.index.BruteForceIndexSelectionStrategy;
 import org.janusgraph.graphdb.query.index.ThresholdBasedIndexSelectionStrategy;
@@ -99,10 +104,12 @@ import org.janusgraph.graphdb.query.vertex.BaseVertexCentricQuery;
 import org.janusgraph.graphdb.query.vertex.VertexCentricQueryBuilder;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphMixedIndexAggStep;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphMixedIndexAggStrategy;
 import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphMixedIndexCountStrategy;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
 import org.janusgraph.graphdb.types.IndexField;
 import org.janusgraph.graphdb.types.MixedIndexType;
+import org.janusgraph.graphdb.types.ParameterIndexField;
 import org.janusgraph.graphdb.types.ParameterType;
 import org.janusgraph.graphdb.types.StandardEdgeLabelMaker;
 import org.janusgraph.graphdb.types.vertices.JanusGraphSchemaVertex;
@@ -122,23 +129,30 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.asc;
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.FORCE_INDEX_USAGE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.HARD_MAX_LIMIT;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_BACKEND;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_CDC_ENABLED;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NAME_MAPPING;
@@ -251,6 +265,12 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
 
     public String getTextField(String propertyKey) {
         return propertyKey;
+    }
+
+    //The name by which a key's string-analyzer or text-analyzer parameter gives the index Lucene's StandardAnalyzer,
+    //which splits a string into its words in lower case
+    protected String getStandardAnalyzerName() {
+        return "org.apache.lucene.analysis.standard.StandardAnalyzer";
     }
 
     @Override
@@ -570,6 +590,108 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertNotNull(graph.traversal().V().has("compositeInt").properties("compositeInt").as("p").has("bool2").select("p").next());
     }
 
+    /**
+     * has(key) finds the vertices, edges and vertex properties which hold a value of the key, and hasNot(key) the
+     * others, whatever the data type and the cardinality of the key. Lucene indexes the numbers, dates, instants and
+     * booleans of a key of several values as points alone, without the doc values which its exists query read
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"SINGLE", "LIST", "SET"})
+    public void testExistsQueryOnKeysOfEachDataTypeAndCardinality(Cardinality cardinality) {
+        if (!indexFeatures.supportsCardinality(cardinality)) return;
+        //The name, data type and mapping of each key, and two values of it, the second of which the elements keep
+        final List<Object[]> keys = new ArrayList<>(Arrays.asList(
+            new Object[]{"byte", Byte.class, Mapping.DEFAULT, (byte) 1, (byte) -2},
+            new Object[]{"short", Short.class, Mapping.DEFAULT, (short) 1, (short) -2},
+            new Object[]{"int", Integer.class, Mapping.DEFAULT, 1, -2},
+            new Object[]{"long", Long.class, Mapping.DEFAULT, 1L, Long.MIN_VALUE},
+            new Object[]{"float", Float.class, Mapping.DEFAULT, 1.5f, -2.5f},
+            new Object[]{"double", Double.class, Mapping.DEFAULT, 1.5, -2.5},
+            new Object[]{"date", Date.class, Mapping.DEFAULT, new Date(1000), new Date(2000)},
+            new Object[]{"instant", Instant.class, Mapping.DEFAULT, Instant.ofEpochSecond(1), Instant.ofEpochSecond(2)},
+            new Object[]{"bool", Boolean.class, Mapping.DEFAULT, true, false},
+            new Object[]{"defaultString", String.class, Mapping.DEFAULT, "First Value", "second value"}));
+        for (final Object[] string : new Object[][]{{"text", Mapping.TEXT}, {"string", Mapping.STRING},
+                {"textString", Mapping.TEXTSTRING}}) {
+            if (indexFeatures.supportsStringMapping((Mapping) string[1])) {
+                keys.add(new Object[]{string[0], String.class, string[1], "First Value", "second value"});
+            }
+        }
+        //The schema of the Solr tests has no field of several UUIDs
+        if (cardinality == Cardinality.SINGLE || !"solr".equals(readConfig.get(INDEX_BACKEND, INDEX))) {
+            keys.add(new Object[]{"uuid", UUID.class, Mapping.DEFAULT, UUID.randomUUID(), UUID.randomUUID()});
+        }
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("tag", String.class);
+        makeLabel("knows");
+        final List<JanusGraphManagement.IndexBuilder> indexes = Arrays.asList(
+            mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()),
+            mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()),
+            mgmt.buildIndex("psearch", JanusGraphVertexProperty.class).addKey(kind, getStringMapping()));
+        for (final Object[] key : keys) {
+            final PropertyKey propertyKey = mgmt.makePropertyKey((String) key[0]).dataType((Class<?>) key[1])
+                .cardinality(cardinality).make();
+            indexes.forEach(index -> index.addKey(propertyKey, ((Mapping) key[2]).asParameter()));
+        }
+        indexes.forEach(index -> index.buildMixedIndex(INDEX));
+        finishSchema();
+
+        final JanusGraphVertex with = tx.addVertex("kind", "k");
+        final JanusGraphVertex without = tx.addVertex("kind", "k");
+        final JanusGraphVertex removed = tx.addVertex("kind", "k");
+        final JanusGraphEdge withEdge = with.addEdge("knows", without, "kind", "k");
+        final JanusGraphEdge withoutEdge = with.addEdge("knows", without, "kind", "k");
+        final JanusGraphEdge removedEdge = with.addEdge("knows", without, "kind", "k");
+        final JanusGraphVertexProperty<String> withProperty = with.property("tag", "t", "kind", "k");
+        without.property("tag", "t", "kind", "k");
+        for (final Object[] key : keys) {
+            final String name = (String) key[0];
+            for (final JanusGraphVertex vertex : new JanusGraphVertex[]{with, removed}) {
+                vertex.property(cardinality.convert(), name, key[3]);
+                if (cardinality != Cardinality.SINGLE) {
+                    vertex.property(cardinality.convert(), name, key[4]);
+                }
+            }
+            withEdge.property(name, key[3]);
+            removedEdge.property(name, key[3]);
+            withProperty.property(name, key[3]);
+        }
+        newTx();
+        //The first vertex and edge keep the second value of each key, which replaces the first one of a key of one
+        //value, and the vertex and the edge whose values are removed keep none
+        GraphTraversalSource g = tx.traversal();
+        for (final Object[] key : keys) {
+            final String name = (String) key[0];
+            if (cardinality == Cardinality.SINGLE) {
+                g.V(with).property(name, key[4]).iterate();
+            } else {
+                g.V(with).properties(name).hasValue(key[3]).drop().iterate();
+            }
+            g.V(removed).properties(name).drop().iterate();
+            g.E(withEdge).property(name, key[4]).iterate();
+            g.E(removedEdge).properties(name).drop().iterate();
+        }
+        clopen(option(FORCE_INDEX_USAGE), true);
+
+        g = tx.traversal();
+        for (final Object[] key : keys) {
+            final String name = (String) key[0];
+            assertEquals(Collections.singletonList(with.id()), g.V().has(name).id().toList(), name);
+            assertEquals(Collections.singletonList(with.id()), g.V().has("kind", "k").has(name).id().toList(), name);
+            assertEquals(1L, g.V().has(name).count().next(), name);
+            assertEquals(Sets.newHashSet(without.id(), removed.id()), g.V().has("kind", "k").hasNot(name).id().toSet(),
+                name);
+            assertEquals(Collections.singletonList(key[4]), g.V().has(name).values(name).toList(), name);
+            assertEquals(Collections.singletonList(withEdge.id()), g.E().has(name).id().toList(), name);
+            assertEquals(1L, g.E().has(name).count().next(), name);
+            assertEquals(Sets.newHashSet(withoutEdge.id(), removedEdge.id()),
+                g.E().has("kind", "k").hasNot(name).id().toSet(), name);
+            final List<Object> properties = new ArrayList<>();
+            tx.query().has(name).properties().forEach(property -> properties.add(property.id()));
+            assertEquals(Collections.singletonList(withProperty.id()), properties, name);
+        }
+    }
+
     @Test
     public void testSimpleUpdate() {
         final PropertyKey name = makeKey("name", String.class);
@@ -694,6 +816,118 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         clopen();
         assertCount(1, tx.query().has("alias", Text.CONTAINS, "Marko1").vertices());
         assertCount(0, tx.query().has("alias", Text.CONTAINS, "Marko").vertices());
+    }
+
+    //A float removed from a key of several values is no longer found, also one whose decimal string changes when it is
+    //widened to a double, as Lucene stores it: 0.1f as 0.10000000149011612
+    @ParameterizedTest
+    @ValueSource(strings = {"LIST", "SET"})
+    public void testRemovedFloatsOfAKeyOfSeveralValuesAreNotFound(Cardinality cardinality) {
+        if (!indexFeatures.supportsCardinality(cardinality)) return;
+
+        final PropertyKey weights = mgmt.makePropertyKey("weights").dataType(Float.class).cardinality(cardinality)
+            .make();
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeLabel("knows");
+        mgmt.buildIndex("mixed", Vertex.class).addKey(weights).buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(weights).addKey(kind, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        //Each float but 1.5f has a decimal string other than the double's which it widens to
+        final float[] removed = {0.1f, -0.3f, 3.14f, Float.MIN_VALUE, Float.MAX_VALUE, 1.5f};
+        final JanusGraphVertex some = tx.addVertex();
+        final JanusGraphVertex none = tx.addVertex();
+        for (final float value : removed) {
+            some.property(cardinality.convert(), "weights", value);
+            none.property(cardinality.convert(), "weights", value);
+        }
+        some.property(cardinality.convert(), "weights", -2.5f);
+        //The float of an edge is replaced, and that of another edge removed, which keeps its document by its kind
+        final Object replaced = some.addEdge("knows", none, "weights", 0.1f).id();
+        final Object cleared = some.addEdge("knows", none, "weights", 0.1f, "kind", "k").id();
+        clopen();
+
+        GraphTraversalSource g = tx.traversal();
+        for (final float value : removed) {
+            g.V(some.id(), none.id()).properties("weights").hasValue(value).drop().iterate();
+        }
+        g.E(replaced).property("weights", 3.14f).iterate();
+        g.E(cleared).properties("weights").drop().iterate();
+        clopen(option(FORCE_INDEX_USAGE), true);
+
+        g = tx.traversal();
+        for (final float value : removed) {
+            assertFalse(g.V().has("weights", value).hasNext(), Float.toString(value));
+            assertEquals(0L, g.V().has("weights", value).count().next(), Float.toString(value));
+        }
+        assertEquals(Collections.singletonList(some.id()), g.V().has("weights", -2.5f).id().toList());
+        //A range of every finite float doesn't find the vertex whose floats were all removed
+        assertEquals(Collections.singletonList(some.id()), g.V().has("weights", P.gte(-Float.MAX_VALUE)).id().toList());
+        assertEquals(1L, g.V().has("weights", P.gte(-Float.MAX_VALUE)).count().next());
+        assertFalse(g.E().has("weights", 0.1f).hasNext());
+        assertEquals(0L, g.E().has("weights", 0.1f).count().next());
+        assertEquals(Collections.singletonList(replaced), g.E().has("weights", 3.14f).id().toList());
+        assertEquals(Collections.singletonList(replaced), g.E().has("weights", P.gte(-Float.MAX_VALUE)).id().toList());
+        assertEquals(1L, g.E().has("weights", P.gte(-Float.MAX_VALUE)).count().next());
+        assertEquals(Collections.singletonList(cleared), g.E().has("kind", "k").id().toList());
+    }
+
+    //A removed string of a key of several values is no longer found, also one with an unpaired surrogate, which UTF-8
+    //has no encoding for: Lucene stores U+FFFD in its place
+    @ParameterizedTest
+    @ValueSource(strings = {"LIST", "SET"})
+    public void testRemovedStringsWithUnpairedSurrogatesOfAKeyOfSeveralValuesAreNotFound(Cardinality cardinality) {
+        if (!indexFeatures.supportsCardinality(cardinality)) return;
+
+        final List<Object[]> keys = new ArrayList<>();
+        for (final Object[] key : new Object[][]{{"defaultString", Mapping.DEFAULT}, {"text", Mapping.TEXT},
+                {"string", Mapping.STRING}, {"textString", Mapping.TEXTSTRING}}) {
+            if (key[1] == Mapping.DEFAULT || indexFeatures.supportsStringMapping((Mapping) key[1])) {
+                keys.add(key);
+            }
+        }
+        final JanusGraphManagement.IndexBuilder index = mgmt.buildIndex("mixed", Vertex.class);
+        for (final Object[] key : keys) {
+            index.addKey(mgmt.makePropertyKey((String) key[0]).dataType(String.class).cardinality(cardinality).make(),
+                ((Mapping) key[1]).asParameter());
+        }
+        index.buildMixedIndex(INDEX);
+        finishSchema();
+
+        final String removed = "Ab\uD800c Removed";
+        final JanusGraphVertex some = tx.addVertex();
+        final JanusGraphVertex none = tx.addVertex();
+        for (final Object[] key : keys) {
+            some.property(cardinality.convert(), (String) key[0], removed);
+            some.property(cardinality.convert(), (String) key[0], "Kept");
+            none.property(cardinality.convert(), (String) key[0], removed);
+        }
+        clopen(option(FORCE_INDEX_USAGE), true);
+        assertStringsFound(keys, "removed", "Ab", Sets.newHashSet(some.id(), none.id()));
+
+        for (final Object[] key : keys) {
+            tx.traversal().V(some.id(), none.id()).properties((String) key[0]).hasValue(removed).drop().iterate();
+        }
+        clopen(option(FORCE_INDEX_USAGE), true);
+        assertStringsFound(keys, "removed", "Ab", Collections.emptySet());
+        assertStringsFound(keys, "kept", "Kept", Collections.singleton(some.id()));
+    }
+
+    //The vertices found by a word, on a key mapped to the words of its strings, and by a prefix, on a key mapped to its
+    //whole strings: eq of a string with an unpaired surrogate finds nothing on Elasticsearch and Solr
+    private void assertStringsFound(List<Object[]> keys, String word, String prefix, Set<Object> expected) {
+        final GraphTraversalSource g = tx.traversal();
+        for (final Object[] key : keys) {
+            final String name = (String) key[0];
+            if (key[1] != Mapping.STRING) {
+                assertEquals(expected, g.V().has(name, Text.textContains(word)).id().toSet(), name);
+                assertEquals((long) expected.size(), g.V().has(name, Text.textContains(word)).count().next(), name);
+            }
+            if (key[1] == Mapping.STRING || key[1] == Mapping.TEXTSTRING) {
+                assertEquals(expected, g.V().has(name, Text.textPrefix(prefix)).id().toSet(), name);
+                assertEquals((long) expected.size(), g.V().has(name, Text.textPrefix(prefix)).count().next(), name);
+            }
+        }
     }
 
     @Test
@@ -864,6 +1098,100 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
     }
 
     /**
+     * A mixed index sorts by a Byte or a Short key, as by any other whole number, for a graph query and for a direct
+     * index query. Elasticsearch failed such a sort, which JanusGraph gave an unmapped type of null.
+     */
+    @Test
+    public void testMixedIndexOrdersByBytesAndShorts() {
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey small = makeKey("small", Byte.class);
+        final PropertyKey medium = makeKey("medium", Short.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tag, getStringMapping()).addKey(small).addKey(medium)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object min = tx.addVertex("tag", "t", "small", Byte.MIN_VALUE, "medium", Short.MIN_VALUE).id();
+        final Object zero = tx.addVertex("tag", "t", "small", (byte) 0, "medium", (short) 0).id();
+        final Object max = tx.addVertex("tag", "t", "small", Byte.MAX_VALUE, "medium", Short.MAX_VALUE).id();
+        final Object minusOne = tx.addVertex("tag", "t", "small", (byte) -1, "medium", (short) -1).id();
+        tx.commit();
+
+        newTx();
+        for (final String key : Arrays.asList("small", "medium")) {
+            assertEquals(Arrays.asList(min, minusOne, zero, max),
+                tx.traversal().V().has("tag", "t").order().by(key, asc).id().toList(), key);
+            assertEquals(Arrays.asList(max, zero, minusOne, min),
+                tx.traversal().V().has("tag", "t").order().by(key, desc).id().toList(), key);
+            assertEquals(Arrays.asList(min, minusOne),
+                tx.traversal().V().has("tag", "t").order().by(key, asc).limit(2).id().toList(), key);
+            assertEquals(Arrays.asList(max, zero, minusOne, min),
+                tx.indexQuery("mixed", "v.tag:t").orderBy(key, desc).vertexStream()
+                    .map(result -> result.getElement().id()).collect(Collectors.toList()), key);
+        }
+    }
+
+    /**
+     * A comparison of decimals finds what it finds in memory, as Cmp.test has it, on every index: a bound at either
+     * zero finds the same elements, as a comparison holds -0.0 and 0.0 equal and only equality tells them apart, while
+     * the indexes order -0.0 below 0.0; NaN, which they order above positive infinity, equals NaN alone and compares to
+     * no other value; and an infinity is beyond every other value. Elasticsearch, which holds neither NaN nor the
+     * infinities, compares its values with them too.
+     */
+    @Test
+    public void testComparisonsOfDecimalsFindWhatTheyFindInMemory() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey dbl = makeKey("dbl", Double.class);
+        final PropertyKey flt = makeKey("flt", Float.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(dbl).addKey(flt)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final List<Double> values = new ArrayList<>(Arrays.asList(-0.0, 0.0, -1.5, 1.5));
+        if (supportsNonFiniteDecimals()) {
+            values.addAll(Arrays.asList(Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, Double.NaN));
+        }
+        final Map<Object, Double> doubles = new HashMap<>();
+        final Map<Object, Float> floats = new HashMap<>();
+        for (final double value : values) {
+            final Object id = tx.addVertex("kind", "k", "dbl", value, "flt", (float) value).id();
+            doubles.put(id, value);
+            floats.put(id, (float) value);
+        }
+        //A document without either key, which no comparison finds
+        final Object without = tx.addVertex("kind", "k").id();
+        doubles.put(without, null);
+        floats.put(without, null);
+        clopen();
+
+        for (final double bound : new double[]{0.0, -0.0, 1.5, -1.5, Double.POSITIVE_INFINITY,
+                Double.NEGATIVE_INFINITY, Double.NaN}) {
+            for (final Cmp relation : Cmp.values()) {
+                assertDecimalsFound(doubles, "dbl", relation, bound);
+                assertDecimalsFound(floats, "flt", relation, (float) bound);
+            }
+        }
+        //The mixed index answers them alone, without memory
+        newTx();
+        evaluateQuery(tx.query().has("dbl", Cmp.LESS_THAN, 0.0), ElementCategory.VERTEX,
+            supportsNonFiniteDecimals() ? 2 : 1, new boolean[]{true, true}, "mixed");
+    }
+
+    //Whether the index holds the decimals which aren't finite, NaN and the infinities, which Elasticsearch rejects
+    protected boolean supportsNonFiniteDecimals() {
+        return true;
+    }
+
+    //The vertices which a comparison of the key finds, and their count, against those whose value passes it in memory
+    private void assertDecimalsFound(Map<Object, ? extends Number> values, String key, Cmp relation, Number bound) {
+        final Set<Object> expected = values.entrySet().stream().filter(e -> relation.test(e.getValue(), bound))
+            .map(Map.Entry::getKey).collect(Collectors.toSet());
+        final GraphTraversalSource g = tx.traversal();
+        final String message = key + " " + relation + " " + bound;
+        assertEquals(expected, g.V().has(key, new P<>(relation, bound)).id().toSet(), message);
+        assertEquals((long) expected.size(), g.V().has(key, new P<>(relation, bound)).count().next(), message);
+    }
+
+    /**
      * Tests indexing boolean
      */
     @Test
@@ -1023,6 +1351,100 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(v2, getOnlyVertex(graph.query().has("uid", Cmp.NOT_EQUAL, uid1)));
         assertEquals(v1, getOnlyVertex(graph.query().has("uid", Cmp.NOT_EQUAL, uid2)));
 
+    }
+
+    /**
+     * UUIDs come in the order of their string forms, by which Elasticsearch, OpenSearch and Solr sort them: by their
+     * bits as unsigned numbers, where UUID.compareTo compares them as signed numbers. So the transaction's new vertices
+     * come where the index puts the others, a key which no index holds is sorted in the same order, and so are the
+     * ranges of UUIDs, which JanusGraph checks itself, as no index answers them: keyset paging comes through them all.
+     */
+    @Test
+    public void testUUIDsAreOrderedAsTheirStringForms() {
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey uid = makeKey("uid", UUID.class);
+        makeKey("unindexedUid", UUID.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tag, getStringMapping()).addKey(uid).buildMixedIndex(INDEX);
+        finishSchema();
+        //The first digit of either half of each UUID from 8 up, or below it
+        final List<UUID> byString = Arrays.asList(UUID.fromString("00000000-0000-0000-0000-000000000001"),
+            UUID.fromString("12345678-0000-0000-7fff-ffffffffffff"),
+            UUID.fromString("12345678-0000-0000-8000-000000000000"),
+            UUID.fromString("7fffffff-ffff-ffff-ffff-ffffffffffff"),
+            UUID.fromString("80000000-0000-0000-0000-000000000000"),
+            UUID.fromString("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+        for (int i = 0; i < byString.size(); i += 2) {
+            tx.addVertex("tag", "t", "uid", byString.get(i), "unindexedUid", byString.get(i));
+        }
+        clopen();
+        final GraphTraversalSource g = tx.traversal();
+        for (int i = 1; i < byString.size(); i += 2) {
+            tx.addVertex("tag", "t", "uid", byString.get(i), "unindexedUid", byString.get(i));
+        }
+        final List<UUID> reversed = ImmutableList.copyOf(byString).reverse();
+        for (final String key : Arrays.asList("uid", "unindexedUid")) {
+            //Sorted by the index, with the new vertices merged in, or in memory, by a key which no index holds or which
+            //the index can't sort by, as Lucene can't by a UUID key
+            assertEquals(byString, g.V().has("tag", "t").order().by(key, asc).values(key).toList(), key);
+            assertEquals(byString.subList(0, 3), g.V().has("tag", "t").order().by(key, asc).limit(3).values(key)
+                .toList(), key);
+            assertEquals(reversed.subList(0, 3), g.V().has("tag", "t").order().by(key, desc).limit(3).values(key)
+                .toList(), key);
+            //Ranges in the same order
+            assertEquals(byString.subList(2, 6), g.V().has("tag", "t").has(key, P.gt(byString.get(1)))
+                .order().by(key, asc).values(key).toList(), key);
+            assertEquals(byString.subList(1, 3), g.V().has("tag", "t")
+                .has(key, P.between(byString.get(1), byString.get(3))).order().by(key, asc).values(key).toList(), key);
+            //Keyset paging, each page from the last UUID of the page before
+            final List<UUID> paged = new ArrayList<>();
+            List<UUID> page = g.V().has("tag", "t").order().by(key, asc).limit(2).<UUID>values(key).toList();
+            for (int i = 0; !page.isEmpty(); i++) {
+                assertTrue(i < 10, "pages without end: " + paged);
+                paged.addAll(page);
+                page = g.V().has("tag", "t").has(key, P.gt(page.get(page.size() - 1))).order().by(key, asc).limit(2)
+                    .<UUID>values(key).toList();
+            }
+            assertEquals(byString, paged, key);
+        }
+    }
+
+    /**
+     * An index which sorts by a UUID key puts the elements without the key last, whichever the direction, as
+     * JanusGraph does where it orders elements itself, so that the transaction's new vertices are merged in where they
+     * belong. Solr put them first when ascending, as the uuid field type of its schema didn't sort them last. A graph
+     * query keeps the elements without the key; a traversal is checked on the elements which have it.
+     */
+    @Test
+    public void testOrderByUUIDPutsElementsWithoutTheKeyLast() {
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey uid = makeKey("uid", UUID.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tag, getStringMapping()).addKey(uid).buildMixedIndex(INDEX);
+        finishSchema();
+        final Object first = tx.addVertex("tag", "t", "uid", UUID.fromString("00000000-0000-0000-0000-000000000001"))
+            .id();
+        final Object without = tx.addVertex("tag", "t").id();
+        tx.commit();
+
+        newTx();
+        final Object last = tx.addVertex("tag", "t", "uid", UUID.fromString("ffffffff-ffff-ffff-ffff-ffffffffffff"))
+            .id();
+        assertEquals(Arrays.asList(first, last),
+            idsOfVerticesOf(tx.query().has("tag", "t").orderBy("uid", asc).limit(2)));
+        assertEquals(Arrays.asList(first, last, without),
+            idsOfVerticesOf(tx.query().has("tag", "t").orderBy("uid", asc)));
+        assertEquals(Arrays.asList(last, first, without),
+            idsOfVerticesOf(tx.query().has("tag", "t").orderBy("uid", desc)));
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(Arrays.asList(first, last),
+            g.V().has("tag", "t").has("uid").order().by("uid", asc).id().toList());
+        assertEquals(Arrays.asList(last, first),
+            g.V().has("tag", "t").has("uid").order().by("uid", desc).id().toList());
+    }
+
+    private static List<Object> idsOfVerticesOf(JanusGraphQuery<?> query) {
+        final List<Object> ids = new ArrayList<>();
+        query.vertices().forEach(vertex -> ids.add(vertex.id()));
+        return ids;
     }
 
 
@@ -1292,11 +1714,11 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             assertEquals(QueryProfiler.GRAPH_CENTRIC_QUERY, nested.getName());
             assertTrue(nested.getDuration(TimeUnit.MICROSECONDS) > 0);
             annotations = new HashMap() {{
-                put("condition", "(((name = bob) OR (prop = val2)) AND ((name = alex) OR (prop = val)))");
+                put("condition", "((name = bob OR prop = val2) AND (name = alex OR prop = val))");
                 put("orders", "[]");
                 put("isFitted", "true");
                 put("isOrdered", "true");
-                put("query", "[(((name = bob) OR (prop = val2)) AND ((name = alex) OR (prop = val)))]:mixed");
+                put("query", "[((name = bob OR prop = val2) AND (name = alex OR prop = val))]:mixed");
                 put("index", "mixed");
                 put("index_impl", "search");
             }};
@@ -1327,12 +1749,13 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             assertTrue(nested.getDuration(TimeUnit.MICROSECONDS) > 0);
             Map<String, Object> metricsAnnotations = nested.getAnnotations();
             assertEquals(5, metricsAnnotations.size());
-            assertEquals("(((name = alex) OR (prop = val2)) AND ((desc textContains coding) OR (pet textContains cats)))", metricsAnnotations.get("condition"));
+            assertEquals("((name = alex OR prop = val2) AND (desc textContains coding OR pet textContains cats))", metricsAnnotations.get("condition"));
             assertEquals("[]", metricsAnnotations.get("orders"));
             assertEquals("true", metricsAnnotations.get("isFitted"));
             assertEquals("true", metricsAnnotations.get("isOrdered"));
-            assertTrue(metricsAnnotations.get("query").equals("[mixed:[(((name = alex) OR (prop = val2)))]:mixed, mi:[(((desc textContains coding) OR (pet textContains cats)))]:mi]") ||
-                metricsAnnotations.get("query").equals("[mi:[(((desc textContains coding) OR (pet textContains cats)))]:mi, mixed:[(((name = alex) OR (prop = val2)))]:mixed]"));
+            assertTrue(metricsAnnotations.get("query").equals("[mixed:[((name = alex OR prop = val2))]:mixed, mi:[((desc textContains coding OR pet textContains cats))]:mi]") ||
+                metricsAnnotations.get("query").equals("[mi:[((desc textContains coding OR pet textContains cats))]:mi, mixed:[((name = alex OR prop = val2))]:mixed]"),
+                metricsAnnotations.get("query").toString());
         }
 
         // satisfied by two graph-centric queries, one is mixed index query and the other one is full scan
@@ -2285,6 +2708,37 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
     }
 
     /**
+     * A count which a mixed index answers is exact past a thousand matches, beyond which the total hits of a Lucene
+     * search are only a lower bound, and so is a mean which Lucene divides by it
+     */
+    @Test
+    public void testMixedIndexCountsPastAThousandMatches() {
+        final int vertices = 2500;
+        final int matches = 2000;
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(age).buildMixedIndex(INDEX);
+        finishSchema();
+        for (int i = 0; i < vertices; i++) {
+            tx.addVertex("age", i);
+        }
+        tx.commit();
+        // an update leaves the old document deleted, where Lucene can't count from the index statistics
+        newTx();
+        tx.traversal().V().has("age", 0).property("age", 1).iterate();
+        tx.commit();
+
+        // the ages 0 to matches - 1 sum up to matches * (matches - 1) / 2, plus the 1 of the update
+        final double mean = ((long) matches * (matches - 1) / 2 + 1) / (double) matches;
+        newTx();
+        assertTrue(tx.traversal().V().has("age", P.lt(matches)).count().profile().next().getMetrics().stream()
+            .anyMatch(metrics -> metrics.getName().contains(JanusGraphMixedIndexAggStep.class.getSimpleName())),
+            "the count isn't answered by the index");
+        assertEquals(matches, (long) tx.traversal().V().has("age", P.lt(matches)).count().next());
+        assertEquals(matches, graph.indexQuery("mixed", "v.age:[0 TO " + (matches - 1) + "]").vertexTotals());
+        assertEquals(mean, ((Number) tx.traversal().V().has("age", P.lt(matches)).values("age").mean().next()).doubleValue(), 0.0001);
+    }
+
+    /**
      * Tests index parameters (mapping and names) with raw indexQuery
      */
     @Test
@@ -2414,6 +2868,152 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             .forEachOrdered(e -> assertEquals(vertices.get(idx.getAndDecrement()), e));
     }
 
+    //A comparison of a TEXTSTRING key, a range or a not-equal, compares its strings whole, in the order the index
+    //sorts them by, and not the words or phrases of its text, which are in lower case
+    @Test
+    public void testComparisonsOfADualMappedKeyCompareTheStringsWhole() {
+        if (!indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)) return;
+
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, Mapping.TEXTSTRING.asParameter()).addKey(age)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Map<Object, String> names = addNamedVertices();
+        //Without a name, which no comparison of names finds
+        tx.addVertex("age", 30);
+        clopen();
+
+        //The mixed index answers them alone, without memory
+        evaluateQuery(tx.query().has("name", Cmp.LESS_THAN, "Long Zed"), ElementCategory.VERTEX,
+            4, new boolean[]{true, true}, "mixed");
+        evaluateQuery(tx.query().has("name", Cmp.GREATER_THAN_EQUAL, "Long Little Lewis"), ElementCategory.VERTEX,
+            4, new boolean[]{true, true}, "mixed");
+        evaluateQuery(tx.query().has("name", Cmp.NOT_EQUAL, "Long John Don"), ElementCategory.VERTEX,
+            6, new boolean[]{true, true}, "mixed");
+        assertNamesFound(names, P.lt("Long Zed"));
+        assertNamesFound(names, P.lte("Middle Sister Mabel"));
+        assertNamesFound(names, P.gt("Middle Sister Mabel"));
+        assertNamesFound(names, P.gte("Long Little Lewis"));
+        assertNamesFound(names, P.between("Long", "Middle"));
+        assertNamesFound(names, P.neq("Long John Don"));
+        assertEquals(Arrays.asList("Long John Don", "Long John Don Jr", "Long Little Lewis"), tx.traversal().V()
+            .has("name", P.between("Long", "Middle")).order().by("name", asc).values("name").toList());
+    }
+
+    //The text predicates on a TEXTSTRING key which an index may leave to memory, the negated ones and
+    //textContainsPhrase, find what they match either way
+    @Test
+    public void testNegatedAndPhraseTextPredicatesOfADualMappedKey() {
+        if (!indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)) return;
+
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, Mapping.TEXTSTRING.asParameter()).addKey(age)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Map<Object, String> names = addNamedVertices();
+        tx.addVertex("age", 30);
+        clopen();
+
+        assertNamesFound(names, Text.textNotPrefix("Long"));
+        assertNamesFound(names, Text.textNotRegex("Long.*"));
+        assertNamesFound(names, Text.textNotFuzzy("Zod"));
+        assertNamesFound(names, Text.textContainsPhrase("john don"));
+        assertNamesFound(names, Text.textNotContains("long"));
+        assertNamesFound(names, Text.textNotContainsPrefix("lit"));
+        assertNamesFound(names, Text.textNotContainsRegex("lit.*"));
+        assertNamesFound(names, Text.textNotContainsFuzzy("lewys"));
+        assertNamesFound(names, Text.textNotContainsPhrase("john don"));
+    }
+
+    //Removing one value of a TEXTSTRING key of several values removes it from both of its fields: from the words, which
+    //textContains reads, and from the whole strings, which equalities and ranges read
+    @ParameterizedTest
+    @ValueSource(strings = {"LIST", "SET"})
+    public void testRemovedValueOfADualMappedKeyOfSeveralValuesIsNotFound(Cardinality cardinality) {
+        if (!indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)
+                || !indexFeatures.supportsCardinality(cardinality)) return;
+
+        final PropertyKey alias = mgmt.makePropertyKey("alias").dataType(String.class).cardinality(cardinality).make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(alias, Mapping.TEXTSTRING.asParameter()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex vertex = tx.addVertex();
+        vertex.property(cardinality.convert(), "alias", "Marko");
+        final Object id = vertex.id();
+        clopen();
+
+        tx.traversal().V(id).properties("alias").hasValue("Marko").drop().iterate();
+        tx.traversal().V(id).property(cardinality.convert(), "alias", "zed").iterate();
+        clopen();
+
+        assertFalse(tx.traversal().V().has("alias", Text.textContains("marko")).hasNext());
+        assertFalse(tx.traversal().V().has("alias", P.lt("N")).hasNext());
+        assertFalse(tx.traversal().V().has("alias", "Marko").hasNext());
+        assertEquals(Collections.singletonList(id), tx.traversal().V().has("alias", "zed").id().toList());
+    }
+
+    //The values of a SET key which differ only in case have the same words, which the key holds for each of them:
+    //removing one of the values leaves the words of the other, and a value put back is held once
+    @ParameterizedTest
+    @ValueSource(strings = {"DEFAULT", "TEXT", "TEXTSTRING"})
+    public void testWordsOfASetValueStayWhenACaseVariantOfItIsRemoved(Mapping mapping) {
+        if (!indexFeatures.supportsCardinality(Cardinality.SET)
+                || (mapping != Mapping.DEFAULT && !indexFeatures.supportsStringMapping(mapping))) return;
+
+        final PropertyKey alias = mgmt.makePropertyKey("alias").dataType(String.class).cardinality(Cardinality.SET)
+            .make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(alias, mapping.asParameter()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object addedLater = tx.addVertex("alias", "zed").id();
+        final JanusGraphVertex vertex = tx.addVertex("alias", "abc");
+        vertex.property(VertexProperty.Cardinality.set, "alias", "ABC");
+        final Object addedTogether = vertex.id();
+        final Object putBack = tx.addVertex("alias", "qq").id();
+        clopen();
+        //A case variant added in a transaction of its own, and a value set again, which replaces its property
+        tx.traversal().V(addedLater).property(VertexProperty.Cardinality.set, "alias", "Zed").iterate();
+        tx.traversal().V(putBack).property(VertexProperty.Cardinality.set, "alias", "qq").iterate();
+        clopen();
+        tx.traversal().V(addedLater).properties("alias").hasValue("zed").drop().iterate();
+        tx.traversal().V(addedTogether).properties("alias").hasValue("abc").drop().iterate();
+        tx.traversal().V(putBack).properties("alias").drop().iterate();
+        clopen();
+
+        assertEquals(Collections.singletonList(addedLater),
+            tx.traversal().V().has("alias", Text.textContains("zed")).id().toList());
+        assertEquals(Collections.singletonList(addedTogether),
+            tx.traversal().V().has("alias", Text.textContains("abc")).id().toList());
+        assertFalse(tx.traversal().V().has("alias", Text.textContains("qq")).hasNext());
+        if (mapping == Mapping.TEXTSTRING) {
+            assertEquals(Collections.singletonList(addedLater), tx.traversal().V().has("alias", "Zed").id().toList());
+            assertFalse(tx.traversal().V().has("alias", "zed").hasNext());
+            assertFalse(tx.traversal().V().has("alias", "qq").hasNext());
+        }
+    }
+
+    //Vertices with names of mixed case and several words, by their ids
+    private Map<Object, String> addNamedVertices() {
+        final Map<Object, String> names = new HashMap<>();
+        for (final String n : Arrays.asList("Long John Don", "Don John Long", "Long John Don Jr", "Long Little Lewis",
+                "Middle Sister Mabel", "big brother bob", "Zed")) {
+            names.put(tx.addVertex("name", n).id(), n);
+        }
+        return names;
+    }
+
+    //The vertices which a predicate on names finds, against those whose names match it
+    @SuppressWarnings("unchecked")
+    private <V> void assertNamesFound(Map<Object, String> names, P<V> predicate) {
+        final Set<Object> expected = names.entrySet().stream().filter(e -> predicate.test((V) e.getValue()))
+            .map(Map.Entry::getKey).collect(Collectors.toSet());
+        assertEquals(expected, tx.traversal().V().has("name", predicate).id().toSet(), predicate.toString());
+    }
+
     @Test
     public void testDualMapping() {
         if (!indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)) return;
@@ -2438,6 +3038,11 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         evaluateQuery(tx.query().has("name", Text.CONTAINS_PREFIX, "Lon"), ElementCategory.VERTEX,
                 2, new boolean[]{true, true}, "mixed");
         evaluateQuery(tx.query().has("name", Text.CONTAINS_REGEX, "Lit*le"), ElementCategory.VERTEX,
+                1, new boolean[]{true, true}, "mixed");
+        //The expression matches a word whole, not a part of it: "lit" none, "l.*e" only "little" and not "middle"
+        evaluateQuery(tx.query().has("name", Text.CONTAINS_REGEX, "lit"), ElementCategory.VERTEX,
+                0, new boolean[]{true, true}, "mixed");
+        evaluateQuery(tx.query().has("name", Text.CONTAINS_REGEX, "l.*e"), ElementCategory.VERTEX,
                 1, new boolean[]{true, true}, "mixed");
         evaluateQuery(tx.query().has("name", Text.REGEX, "Long.*"), ElementCategory.VERTEX,
                 2, new boolean[]{true, true}, "mixed");
@@ -2478,6 +3083,103 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         evaluateQuery(tx.query().has("name", Text.PREFIX, "Middle"), ElementCategory.VERTEX,
                 0, new boolean[]{true, true}, "mixed");
 
+    }
+
+    /**
+     * Strings come in the order of their code points, the order of their UTF-8 bytes in which the indexes sort them,
+     * whether an index sorts them, the transaction's new vertices are merged into what it returns, or JanusGraph sorts
+     * them in memory: U+E000 to U+FFFF come before the characters from U+10000 by code point, after them by UTF-16
+     * unit.
+     */
+    @Test
+    public void testStringsAreOrderedByCodePoint() {
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        makeKey("unindexedName", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tag, getStringMapping()).addKey(name, getStringMapping())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final List<String> stored = Arrays.asList("z", "\uE000", "\uFFFF", "\uD83D\uDE00a");
+        for (final String s : stored) {
+            tx.addVertex("tag", "t", "name", s, "unindexedName", s);
+        }
+        clopen();
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(stored, g.V().has("tag", "t").order().by("name", asc).values("name").toList());
+        assertEquals(stored.subList(0, 2),
+            g.V().has("tag", "t").order().by("name", asc).limit(2).values("name").toList());
+        assertEquals(Arrays.asList("\uD83D\uDE00a", "\uFFFF"),
+            g.V().has("tag", "t").order().by("name", desc).limit(2).values("name").toList());
+
+        final List<String> byCodePoint = Arrays.asList("a", "z", "\uE000", "\uE000a", "\uFFFF", "\uD83D\uDE00",
+            "\uD83D\uDE00a", "\uD83D\uDE01");
+        for (final String s : Arrays.asList("a", "\uE000a", "\uD83D\uDE00", "\uD83D\uDE01")) {
+            tx.addVertex("tag", "t", "name", s, "unindexedName", s);
+        }
+        final List<String> reversed = ImmutableList.copyOf(byCodePoint).reverse();
+        //The new vertices merged into the order of the index
+        assertEquals(byCodePoint, g.V().has("tag", "t").order().by("name", asc).values("name").toList());
+        assertEquals(byCodePoint.subList(0, 5),
+            g.V().has("tag", "t").order().by("name", asc).limit(5).values("name").toList());
+        assertEquals(reversed.subList(0, 5),
+            g.V().has("tag", "t").order().by("name", desc).limit(5).values("name").toList());
+        //All of them sorted in memory, by a key which no index holds
+        assertEquals(byCodePoint,
+            g.V().has("tag", "t").order().by("unindexedName", asc).values("unindexedName").toList());
+        assertEquals(byCodePoint.subList(0, 5),
+            g.V().has("tag", "t").order().by("unindexedName", asc).limit(5).values("unindexedName").toList());
+        assertEquals(reversed.subList(0, 5),
+            g.V().has("tag", "t").order().by("unindexedName", desc).limit(5).values("unindexedName").toList());
+    }
+
+    /**
+     * A condition on strings which JanusGraph checks itself compares them by code point, as the index which answers it
+     * and the query's order do: on what the index returns where it doesn't answer the whole query, on the vertices the
+     * transaction changed, which the index has as they were, and on those it added. By UTF-16 unit, U+1F600 and
+     * U+1F601, whose first units are surrogates, come before U+E000.
+     */
+    @Test
+    public void testConditionsCheckedInMemoryCompareStringsByCodePoint() {
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        makeKey("unindexed", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tag, getStringMapping()).addKey(name, getStringMapping())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        for (final String s : Arrays.asList("a", "\uE000", "\uFFFF", "\uD83D\uDE00")) {
+            tx.addVertex("tag", "t", "name", s, "unindexed", "u");
+        }
+        clopen();
+        final GraphTraversalSource g = tx.traversal();
+        //Answered by the index alone, and checked in memory as well, as the index doesn't hold the other key
+        assertEquals(Arrays.asList("\uFFFF", "\uD83D\uDE00"), g.V().has("tag", "t").has("name", P.gt("\uE000"))
+            .order().by("name", asc).values("name").toList());
+        assertEquals(Arrays.asList("\uFFFF", "\uD83D\uDE00"), g.V().has("tag", "t").has("name", P.gt("\uE000"))
+            .has("unindexed", "u").order().by("name", asc).values("name").toList());
+        assertEquals(Arrays.asList("a", "\uE000", "\uFFFF"), g.V().has("tag", "t").has("name", P.lt("\uD83D\uDE00"))
+            .has("unindexed", "u").order().by("name", asc).values("name").toList());
+
+        //A stored vertex which the transaction changes, and new ones
+        g.V().has("tag", "t").has("name", "\uD83D\uDE00").property("unindexed", "v").iterate();
+        for (final String s : Arrays.asList("\uE000a", "\uD83D\uDE01")) {
+            tx.addVertex("tag", "t", "name", s, "unindexed", "u");
+        }
+        final List<String> byCodePoint = Arrays.asList("a", "\uE000", "\uE000a", "\uFFFF", "\uD83D\uDE00",
+            "\uD83D\uDE01");
+        assertEquals(byCodePoint.subList(2, 6), g.V().has("tag", "t").has("name", P.gt("\uE000"))
+            .order().by("name", asc).values("name").toList());
+        //Keyset paging, each page from the last name of the page before
+        final List<String> paged = new ArrayList<>();
+        List<String> page = g.V().has("tag", "t").order().by("name", asc).limit(2).<String>values("name").toList();
+        for (int i = 0; !page.isEmpty(); i++) {
+            assertTrue(i < 10, "pages without end: " + paged);
+            paged.addAll(page);
+            page = g.V().has("tag", "t").has("name", P.gt(page.get(page.size() - 1))).order().by("name", asc).limit(2)
+                .<String>values("name").toList();
+        }
+        assertEquals(byCodePoint, paged);
     }
 
     @Tag(TestCategory.BRITTLE_TESTS)
@@ -3534,6 +4236,160 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(r.property("name").value(), "hercules was here");
     }
 
+    @Test
+    // A CONTAINS condition of several words is, in Solr, a conjunction of its words, and a not-equal one requires the
+    // key and excludes the value. Their clauses have to stay together within another condition: a conjunction ("++"
+    // doesn't parse), or a disjunction, whose other alternatives they would restrict
+    public void testConditionsOfSeveralClausesWithinOtherConditions() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey num = makeKey("num", Integer.class);
+        mgmt.buildIndex("store1", Vertex.class).addKey(name).addKey(num).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex redGreen = tx.addVertex("name", "red green", "num", 1);
+        final JanusGraphVertex redBlue = tx.addVertex("name", "red blue", "num", 2);
+        final JanusGraphVertex greenBlue = tx.addVertex("name", "green blue", "num", 3);
+        final JanusGraphVertex redGreenBlue = tx.addVertex("name", "red green blue", "num", 4);
+        final JanusGraphVertex yellow = tx.addVertex("name", "yellow", "num", 5);
+        final JanusGraphVertex nameless = tx.addVertex("num", 6);
+        newTx();
+
+        // the index answers each condition whole
+        evaluateQuery(tx.query().has("name", Text.CONTAINS, "red green").has("num", Cmp.LESS_THAN, 4),
+            ElementCategory.VERTEX, 1, new boolean[]{true, true}, "store1");
+        evaluateQuery(tx.query().has("name", new OrJanusPredicate(Arrays.asList(Text.CONTAINS, Text.CONTAINS)),
+            Arrays.asList("red green", "yellow")), ElementCategory.VERTEX, 3, new boolean[]{true, true}, "store1");
+        evaluateQuery(tx.query().has("num", new OrJanusPredicate(Arrays.asList(Cmp.NOT_EQUAL, Cmp.LESS_THAN)),
+            Arrays.asList(3, 4)), ElementCategory.VERTEX, 6, new boolean[]{true, true}, "store1");
+
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(Collections.singletonList(redGreen),
+            g.V().has("name", Text.textContains("red green")).has("num", P.lt(4)).toList());
+        assertEquals(Arrays.asList(redGreen, redGreenBlue, yellow),
+            g.V().has("name", Text.textContains("red green").or(Text.textContains("yellow"))).order().by("num")
+                .toList());
+        // 3 isn't excluded from all of the disjunction
+        assertEquals(Arrays.asList(redGreen, redBlue, greenBlue, redGreenBlue, yellow, nameless),
+            g.V().has("num", P.neq(3).or(P.lt(4))).order().by("num").toList());
+    }
+
+    /**
+     * A text predicate of a value which the analyzer turns into no terms, such as punctuation, finds no element, as
+     * JanusGraph finds none in memory: alone, next to another condition, counted and as an alternative to a condition
+     * which finds elements, also where the key has a custom text analyzer, and its negation finds every element with a
+     * value. Solr dropped such a condition, so it found what the other conditions found, and a count of it alone
+     * counted every document. The results are those of a TinkerGraph which holds the same elements.
+     */
+    @Test
+    public void testTextPredicatesOfAValueWithoutTermsFindNothing() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        final PropertyKey text = makeKey("text", String.class);
+        makeKey("uid", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(title, getTextMapping())
+            .addKey(text, getTextMapping(), ParameterType.TEXT_ANALYZER.getParameter(getStandardAnalyzerName()))
+            .buildMixedIndex(INDEX);
+        finishSchema();
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        addVerticesWithWords(reference, "title", "text");
+
+        // the index answers the condition with the other one
+        evaluateQuery(tx.query().has("kind", "p").has("title", Text.CONTAINS, "!!!"), ElementCategory.VERTEX, 0,
+            new boolean[]{true, true}, "mixed");
+        evaluateQuery(tx.query().has("kind", "p").has("text", Text.CONTAINS, "!!!"), ElementCategory.VERTEX, 0,
+            new boolean[]{true, true}, "mixed");
+        for (final String key : new String[]{"title", "text"}) {
+            for (final Function<String, P<Object>> predicate : Arrays.<Function<String, P<Object>>>asList(
+                    Text::textContains, Text::textContainsPhrase, Text::textNotContains, Text::textNotContainsPhrase)) {
+                final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals =
+                    traversalsOfACondition(key, () -> predicate.apply("!!!"), () -> Text.textContains("Tom"));
+                assertFindsAsTheReference(reference, traversals, traversals);
+            }
+        }
+    }
+
+    /**
+     * A key with a custom string analyzer equals a value where it holds every term which the analyzer gives for the
+     * value, in any order, as a text contains them, and a not-equal finds the other elements with a value: those which
+     * lack one of the terms or more. So the equality of a value without terms, such as punctuation, finds no element,
+     * and its not-equal every element with a value. Solr dropped such an equality, so it found what the other
+     * conditions found, and its not-equal of several terms found only the elements which lack all of them. The results
+     * are those which a TinkerGraph holding the same elements gives for textContains and textNotContains, which split
+     * these strings into the same words as the standard analyzer.
+     */
+    @Test
+    public void testEqualityOfAKeyWithAStringAnalyzerComparesTheTermsOfTheValue() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey words = makeKey("words", String.class);
+        makeKey("uid", Integer.class);
+        // Solr analyzes a field as its schema says, and the custom analyzer splits the value of a condition alone: the
+        // field is that of a text key, which Solr's schema analyzes as the standard analyzer does
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(words, getStringMapping(),
+            ParameterType.STRING_ANALYZER.getParameter(getStandardAnalyzerName()),
+            ParameterType.MAPPED_NAME.getParameter(getTextField("words"))).buildMixedIndex(INDEX);
+        finishSchema();
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        addVerticesWithWords(reference, "words");
+
+        // the index answers the condition with the other one
+        evaluateQuery(tx.query().has("kind", "p").has("words", Cmp.EQUAL, "!!!"), ElementCategory.VERTEX, 0,
+            new boolean[]{true, true}, "mixed");
+        for (final String value : new String[]{"!!!", "Tom", "Jerry Tom", "Tom Spike"}) {
+            assertFindsAsTheReference(reference,
+                traversalsOfACondition("words", () -> Text.textContains(value), () -> Text.textContains("Spike")),
+                traversalsOfACondition("words", () -> P.eq(value), () -> P.eq("Spike")));
+            assertFindsAsTheReference(reference,
+                traversalsOfACondition("words", () -> Text.textNotContains(value), () -> Text.textContains("Spike")),
+                traversalsOfACondition("words", () -> P.neq(value), () -> P.eq("Spike")));
+        }
+    }
+
+    //Commits vertices of a uid and a kind, "p" or "q", and the same words under each of the keys, which some lack, and
+    //adds them to the reference graph
+    private void addVerticesWithWords(GraphTraversalSource reference, String... keys) {
+        final Object[][] vertices = {{1, "p", "Tom and Jerry"}, {2, "p", "Spike"}, {3, "p", null}, {4, "q", "Tom"},
+            {5, "q", null}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                final GraphTraversal<Vertex, Vertex> added = g.addV().property("uid", vertex[0])
+                    .property("kind", vertex[1]);
+                if (vertex[2] != null) {
+                    for (final String key : keys) {
+                        added.property(key, vertex[2]);
+                    }
+                }
+                return added;
+            });
+        }
+        tx.commit();
+        newTx();
+    }
+
+    //Traversals of a condition on the key of the vertices of addVerticesWithWords: alone, next to a condition on their
+    //kind, counted, and as an alternative to a condition on their kind or to another one on the key
+    private static List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversalsOfACondition(String key,
+            Supplier<P<Object>> condition, Supplier<P<Object>> alternative) {
+        return Arrays.asList(
+            g -> g.V().has(key, condition.get()),
+            g -> g.V().has("kind", "p").has(key, condition.get()),
+            g -> g.V().has(key, condition.get()).count(),
+            g -> g.V().has("kind", "p").has(key, condition.get()).count(),
+            g -> g.V().or(__.has(key, condition.get()), __.has("kind", "q")),
+            g -> g.V().has(key, condition.get().or(alternative.get())));
+    }
+
+    //Each traversal finds in the transaction of the test, in any order, what the reference graph finds with the
+    //reference traversal at the same position
+    private void assertFindsAsTheReference(GraphTraversalSource reference,
+                                           List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> references,
+                                           List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals) {
+        for (int i = 0; i < traversals.size(); i++) {
+            assertEquals(new HashSet<>(results(references.get(i).apply(reference))),
+                new HashSet<>(results(traversals.get(i).apply(tx.traversal()))),
+                traversals.get(i).apply(tx.traversal()).toString());
+        }
+    }
+
     private void testNestedWrites(String initialValue, String updatedValue, TestInfo testInfo) throws BackendException {
         // This method touches a single vertex with multiple transactions,
         // leading to deadlock under BDB and cascading test failures. Check for
@@ -3608,6 +4464,28 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         }
         queryTx.rollback();
         return true;
+    }
+
+    //A string longer than 1,024 units with an unpaired high surrogate right before a surrogate pair, which Lucene's
+    //stored fields wrote two bytes longer than they counted where the surrogate ended a window of 1,023 units, can be
+    //read back, and keeps its words when an update of the element writes it again from what the index stored
+    @Test
+    public void testAStringWithAnUnpairedSurrogateBeforeAPairKeepsItsWordsAfterAnUpdate() {
+        final PropertyKey text = makeKey("text", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(text).addKey(name, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final String value = "x".repeat(1022) + "\uD800\uD83D\uDE00 tail words";
+        final Object alone = tx.addVertex("text", value).id();
+        final Object named = tx.addVertex("text", value, "name", "first").id();
+        clopen(option(FORCE_INDEX_USAGE), true);
+        tx.traversal().V(alone, named).property("name", "second").iterate();
+        clopen(option(FORCE_INDEX_USAGE), true);
+
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(Sets.newHashSet(alone, named), g.V().has("text", Text.textContains("words")).id().toSet());
+        assertEquals(Sets.newHashSet(alone, named), g.V().has("name", "second").id().toSet());
     }
 
     /**
@@ -3965,12 +4843,19 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertTraversal(g.V().or(__.has("name", "Totoro"),__.has("age", 2)).order().by(ORDER_AGE_ASC), totoro, hiro);
         assertTraversal(g.V().or(__.has("name", "Hiro"),__.has("age", 2)).order().by(ORDER_AGE_ASC), hiro);
 
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_LENGTH_DESC)), totoro, john, hiro);
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_LENGTH_ASC)), totoro, hiro, john);
-        assertTraversal(g.V().or(__.has("name", "John"), __.has("length", P.lte(120)).order().by(ORDER_LENGTH_ASC)), john, hiro);
+        //An or() checks each element against each of its branches on its own, as TinkerPop does, so an order() of a
+        //branch doesn't order its results
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(120)).order().by(ORDER_LENGTH_DESC)), totoro, john, hiro);
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(120)).order().by(ORDER_LENGTH_ASC)), totoro, hiro, john);
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "John"),
+            __.has("length", P.lte(120)).order().by(ORDER_LENGTH_ASC)), john, hiro);
 
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_AGE_DESC)), totoro, john, hiro);
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_AGE_ASC)), totoro, hiro, john);
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(120)).order().by(ORDER_AGE_DESC)), totoro, john, hiro);
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(120)).order().by(ORDER_AGE_ASC)), totoro, hiro, john);
 
         assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_LENGTH_DESC)).order().by(ORDER_AGE_ASC), totoro, hiro, john);
         assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120)).order().by(ORDER_LENGTH_ASC)).order().by(ORDER_AGE_DESC), john, hiro, totoro);
@@ -3978,10 +4863,15 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120))).order().by(ORDER_AGE_ASC).limit(2), totoro, hiro);
         assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(120))).order().by(ORDER_AGE_ASC).range(2, 3), john);
 
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).limit(1)), totoro, hiro);
-        assertTraversal(g.V().or(__.has("name", "Hiro"), __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).limit(1)), hiro);
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).range(1, 2)), totoro, john);
-        assertTraversal(g.V().or(__.has("name", "Totoro"), __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).range(1, 3)).limit(2), totoro, john);
+        //and a limit() of a branch lets each element through, while a range() which skips one lets none through
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).limit(1)), totoro, hiro, john, mike);
+        assertTraversalInAnyOrder(g.V().or(__.has("name", "Hiro"),
+            __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).limit(1)), hiro, john, mike);
+        assertTraversal(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).range(1, 2)), totoro);
+        assertTraversal(g.V().or(__.has("name", "Totoro"),
+            __.has("length", P.lte(130)).order().by(ORDER_LENGTH_ASC).range(1, 3)).limit(2), totoro);
 
         assertTraversal(g.V().has("length", P.gte(130).or(P.lt(100))).order().by(ORDER_AGE_ASC), hiro, mike);
         assertTraversal(g.V().has("length", P.gte(80).and(P.gte(130).or(P.lt(100)))).order().by(ORDER_AGE_ASC), hiro, mike);
@@ -4015,6 +4905,184 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
                 JanusGraphFactory.close(customGraph);
             }
         }
+    }
+
+    //The elements which the traversal returns, each once, in any order
+    @SafeVarargs
+    private static <E extends Element> void assertTraversalInAnyOrder(GraphTraversal<?, E> traversal, E... expected) {
+        final List<E> results = traversal.toList();
+        assertEquals(expected.length, results.size(), results.toString());
+        assertEquals(new HashSet<>(Arrays.asList(expected)), new HashSet<>(results));
+    }
+
+    /**
+     * TinkerPop runs each branch of an or() for each element on its own, so a limit() or range() in a branch lets the
+     * element through, unless it skips it or its limit is 0, and an order() lets it through where each of its
+     * by(key) modulators has a value. JanusGraph answers the or() by one query, which a mixed index answers, or by a
+     * query of each branch where no index answers the or() as a whole, and returns what a TinkerGraph which holds the
+     * same elements does
+     */
+    @Test
+    public void testOrBranchesCheckEachElementAsTinkerGraphDoes() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        final PropertyKey ckind = makeKey("ckind", String.class);
+        makeKey("uid", Integer.class);
+        makeKey("tag", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(name, getStringMapping())
+            .addKey(age).buildMixedIndex(INDEX);
+        mgmt.buildIndex("byCkind", Vertex.class).addKey(ckind).buildCompositeIndex();
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        //uid, kind, name and age; every vertex has a name, and some have no age
+        final Object[][] vertices = {{1, "p", "c", 5}, {2, "p", "a", 3}, {3, "p", "f", null}, {4, "p", "e", null},
+            {5, "p", "g", 1}, {6, "p", "b", 2}, {7, "q", "d", 7}, {8, "q", "h", null}, {9, "q", "i", 8},
+            {10, "r", "j", 9}};
+        for (final GraphTraversalSource g : Arrays.asList(tx.traversal(), reference)) {
+            for (final Object[] vertex : vertices) {
+                final GraphTraversal<Vertex, Vertex> added = g.addV().property("uid", vertex[0])
+                    .property("kind", vertex[1]).property("ckind", vertex[1]).property("name", vertex[2])
+                    .property("tag", "q".equals(vertex[1]) ? "u" : "t");
+                (vertex[3] == null ? added : added.property("age", vertex[3])).iterate();
+            }
+        }
+        tx.commit();
+        newTx();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> unordered = Arrays.asList(
+            g -> g.V().or(__.has("kind", "p").limit(1), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "q"), __.has("kind", "p").limit(1)),
+            g -> g.V().or(__.has("kind", "p").limit(2), __.has("kind", "q").limit(1)),
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").range(0, 3), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").limit(0), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").order().by("age").limit(1), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").order().by("age").order().by("name", desc), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").limit(1).has("age", 3), __.has("kind", "q")),
+            g -> g.V().or(__.limit(1).has("kind", "p"), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").has("age"), __.has("kind", "q")),
+            //Every element has an id and a label, which a branch's order by them needs
+            g -> g.V().or(__.has("kind", "p").order().by(T.label), __.has("kind", "q")),
+            g -> g.V().or(__.has("kind", "p").order().by(T.id, desc).limit(1), __.has("name", "d")),
+            //TinkerPop merges ranges next to each other into one
+            g -> g.V().or(__.has("kind", "p").range(0, 2).has("age").range(1, 2), __.has("kind", "q")),
+            //No branch lets an element through
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q").limit(0)),
+            //Two or() steps, with offsets and orders in branches, or a branch on a key which doesn't exist
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q"))
+                .or(__.has("age", 1), __.has("name", "d")),
+            g -> g.V().or(__.has("kind", "p").order().by("age").limit(1), __.has("kind", "q"))
+                .or(__.has("age", 1), __.has("name", "d")),
+            g -> g.V().or(__.has("nickname", "x"), __.has("kind", "p")).or(__.has("age", 1), __.has("name", "d")),
+            //The step's has() is copied into each branch, so the second branch of the first or() repeats the within()
+            g -> g.V().has("kind", P.within("p", "q")).or(__.has("name", "a"), __.has("kind", P.within("p", "q")))
+                .or(__.has("age", 1), __.has("name", "b")),
+            //A not-equal among the branches of an or() next to another or(), which Solr writes as two clauses
+            g -> g.V().or(__.has("kind", P.neq("p")), __.has("name", "a")).or(__.has("age", 3), __.has("name", "d")),
+            //No index answers these or() steps as a whole: a composite index, and a key which no index holds
+            g -> g.V().or(__.has("ckind", "p").limit(1), __.has("ckind", "q")),
+            g -> g.V().or(__.has("ckind", "p").order().by("age").range(0, 1), __.has("tag", "t").limit(1)),
+            g -> g.V().or(__.has("tag", "u").range(1, 2), __.has("ckind", "q")),
+            //The vertices of given ids, each checked against the branches
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).or(__.has("kind", "p"), __.has("name", "d")),
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).or(__.has("kind", "p").limit(1),
+                __.has("kind", "q").has("age", 7)),
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).or(__.has("kind", "p").order().by("age"), __.has("name", "d")),
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).or(__.has("kind", "p").range(1, 2), __.has("name", "j")),
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).has("age").or(__.has("kind", "p"), __.has("name", "j")),
+            g -> g.V().hasId(withUids(g, 1, 3, 7, 10)).or(__.has("kind", "p").range(1, 3),
+                __.has("kind", "q").limit(0)));
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> ordered = Arrays.asList(
+            g -> g.V().or(__.has("kind", "p").order().by("age", desc).limit(2), __.has("kind", "q")).order().by("name"),
+            g -> g.V().or(__.has("kind", "p").limit(1), __.has("kind", "q")).order().by("name").limit(3),
+            g -> g.V().or(__.has("kind", "p").limit(1), __.has("kind", "q")).order().by("name", desc).range(2, 5),
+            g -> g.V().or(__.has("kind", "p").limit(1), __.has("kind", "q")).count(),
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q")).count(),
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q").limit(0)).count(),
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q").limit(0)).order().by("name"),
+            g -> g.V().or(__.has("kind", "p").range(1, 3), __.has("kind", "q").limit(0)).order().by("name", desc)
+                .limit(2),
+            g -> g.V().or(__.has("tag", "u").range(1, 2), __.has("ckind", "p").limit(1)).order().by("name").limit(2));
+        final Function<GraphTraversal<?, ?>, List<Object>> toUids = traversal -> traversal.toList().stream()
+            .map(result -> result instanceof Element ? ((Element) result).value("uid") : result)
+            .collect(Collectors.toList());
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : unordered) {
+            final List<Object> expected = toUids.apply(traversal.apply(reference));
+            final List<Object> actual = toUids.apply(traversal.apply(tx.traversal()));
+            expected.sort(Comparator.comparing(uid -> (Integer) uid));
+            actual.sort(Comparator.comparing(uid -> (Integer) uid));
+            assertEquals(expected, actual, traversal.apply(reference).toString());
+        }
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : ordered) {
+            assertEquals(toUids.apply(traversal.apply(reference)), toUids.apply(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+        }
+
+        //A branch of the API's or() which every element holds, as one which asks for no value of a key which doesn't
+        //exist, makes the or() hold for every element
+        assertEquals(Arrays.asList(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+            uidsOfOr(tx.query(), tx.query().hasNot("nickname"), tx.query().has("kind", "p")));
+        assertEquals(Arrays.asList(7, 8, 9),
+            uidsOfOr(tx.query().has("kind", "q"), tx.query().hasNot("nickname"), tx.query().has("name", "a")));
+        //A not-equal among the sub-queries of an or() call next to a condition of the query
+        assertEquals(Collections.singletonList(2), uidsOfOr(tx.query().has("age", 3),
+            tx.query().has("kind", Cmp.NOT_EQUAL, "p"), tx.query().has("name", "a")));
+        //The or() calls of a sub-query hold along with its own conditions
+        assertEquals(Arrays.asList(1, 2, 3, 4, 5, 6, 7, 8, 9), uidsOfOr(tx.query(),
+            withOr(tx.query(), tx.query().has("kind", "p"), tx.query().has("kind", "q")), tx.query().has("name", "a")));
+        assertEquals(Arrays.asList(2, 5, 8), uidsOfOr(tx.query(),
+            withOr(tx.query().has("kind", "p"), tx.query().has("age", 1), tx.query().has("age", 3)),
+            tx.query().has("name", "h")));
+
+        //A union() of traversals which start from V() takes the first elements of a branch, by a query of each branch,
+        //which forced index usage allows
+        clopen(option(FORCE_INDEX_USAGE), true);
+        assertEquals(4L, (long) tx.traversal().union(__.V().has("kind", "p").limit(1), __.V().has("kind", "q"))
+            .dedup().count().next());
+        //and so does an or() with a branch ordered by the label
+        assertEquals(9L, (long) tx.traversal().V().or(__.has("kind", "p").order().by(T.label), __.has("kind", "q"))
+            .count().next());
+        //The query's own conditions, and those of an or() call of one branch, are one conjunction, of which the
+        //composite index answers a part
+        assertEquals(Collections.singletonList(7), uidsOfOr(tx.query().has("uid", 7), tx.query().has("ckind", "q")));
+        assertEquals(Collections.emptyList(), uidsOfOr(tx.query().has("uid", 5), tx.query().has("ckind", "q")));
+        //An or() call of sub-queries of a single condition each joins that conjunction as a disjunction of those
+        //conditions, which keeps it in the normal form which the composite index needs, also where one is a within()
+        assertEquals(Arrays.asList(7, 8, 9),
+            uidsOfOr(tx.query().has("ckind", "q"), tx.query().has("tag", "t"), tx.query().has("tag", "u")));
+        assertEquals(Arrays.asList(7, 9),
+            uidsOfOr(tx.query().has("ckind", "q"), tx.query().has("uid", 7), tx.query().has("uid", 9)));
+        assertEquals(Arrays.asList(7, 8, 9), uidsOfOr(tx.query().has("ckind", "q"),
+            tx.query().has("uid", Contain.IN, Arrays.asList(7, 8)),
+            tx.query().has("name", "i")));
+        //as is the disjunction of a sub-query's own or() call of such sub-queries
+        assertEquals(Arrays.asList(7, 8, 9), uidsOfOr(tx.query().has("ckind", "q"),
+            withOr(tx.query(), tx.query().has("tag", "t"), tx.query().has("tag", "u"))));
+        //and the composite index answers such a disjunction on its key
+        assertEquals(Arrays.asList(7, 8, 9),
+            uidsOfOr(tx.query().has("tag", "u"), tx.query().has("ckind", "p"), tx.query().has("ckind", "q")));
+    }
+
+    //The uids of the vertices of the query and an or() call of the given branches, in the order of the uids
+    private static List<Object> uidsOfOr(JanusGraphQuery<?> query, JanusGraphQuery<?>... branches) {
+        final List<Object> uids = new ArrayList<>();
+        withOr(query, branches).vertices().forEach(vertex -> uids.add(vertex.value("uid")));
+        uids.sort(Comparator.comparing(uid -> (Integer) uid));
+        return uids;
+    }
+
+    //The query with an or() call of the given branches
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static JanusGraphQuery<?> withOr(JanusGraphQuery<?> query, JanusGraphQuery<?>... branches) {
+        ((JanusGraphQuery) query).or(Arrays.asList(branches));
+        return query;
+    }
+
+    //The ids of the vertices of the given uids
+    private static P<Object> withUids(GraphTraversalSource g, Object... uids) {
+        return P.within(g.V().has("uid", P.within(uids)).id().toList());
     }
 
     @Test
@@ -4620,16 +5688,22 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
 
         PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
         PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        PropertyKey scores = mgmt.makePropertyKey("scores").dataType(Integer.class).cardinality(Cardinality.LIST)
+            .make();
         JanusGraphManagement.IndexBuilder indexBuilder = mgmt.buildIndex("theIndex", Vertex.class)
             .addKey(name, getStringMapping());
         if (multipleFields) {
             indexBuilder.addKey(time);
+            //The documents are enumerated by an exists query on each field, also on one of a key of several values
+            if (indexFeatures.supportsCardinality(Cardinality.LIST)) {
+                indexBuilder.addKey(scores);
+            }
         }
         indexBuilder.buildMixedIndex(INDEX);
         finishSchema();
 
-        tx.addVertex("name", "stale", "time", 1);
-        tx.addVertex("name", "alive", "time", 2);
+        tx.addVertex("name", "stale", "time", 1, "scores", 1);
+        tx.addVertex("name", "alive", "time", 2, "scores", 2);
         newTx();
 
         //Disable the index and delete a vertex while the index does not receive updates -> stale document
@@ -5003,6 +6077,180 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals(2, graph.indexQuery(indexName, nameIndexField+":"+nameValue).edgeTotals());
         // Check that Gremlin query doesn't return a stale edge and doesn't skip edges after a stale one
         assertEquals(1, tx.traversal().E().has(namePropKeyStr, nameValue).toList().size());
+        // Nor does a query whose limit the stale edge alone fills in the index: it reads on past it
+        assertEquals(1, tx.traversal().E().has(namePropKeyStr, nameValue).limit(1).toList().size());
+    }
+
+    //The index still holds the edges which the transaction removed, and a query leaves them out of what the index
+    //returns: one with a limit reads on past them, and a direct index query neither fails on them nor returns them
+    @Test
+    public void testLimitedQueriesOfEdgesReadPastTheEdgesWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey weight = makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).addKey(weight).buildMixedIndex(INDEX);
+        finishSchema();
+        //The edges which the transaction removes have the lowest weights, which an index sorting by weight returns
+        //first. They are also committed first, so an index which returns its hits in the order it got them, as one
+        //which ranks them all alike may, returns them first without an order too. The assertions hold either way
+        Vertex from = tx.addVertex();
+        Vertex to = tx.addVertex();
+        for (long w = 1; w <= 15; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+        from = tx.traversal().V(from).next();
+        to = tx.traversal().V(to).next();
+        for (long w = 16; w <= 30; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+        tx.traversal().E().has("weight", P.lte(12L)).toList().forEach(Edge::remove);
+
+        assertEquals(Arrays.asList(13L, 14L, 15L, 16L, 17L, 18L, 19L, 20L, 21L, 22L),
+            tx.traversal().E().has("kind", "paved").order().by("weight", asc).limit(10).values("weight").toList());
+        assertEquals(Arrays.asList(13L, 14L, 15L, 16L, 17L, 18L, 19L, 20L, 21L, 22L),
+            ImmutableList.copyOf(tx.query().has("kind", "paved").orderBy("weight", asc).limit(10).edges()).stream()
+                .map(edge -> edge.<Long>value("weight")).collect(Collectors.toList()));
+        final List<Edge> anyTen = tx.traversal().E().has("kind", "paved").limit(10).toList();
+        assertEquals(10, anyTen.stream().distinct().count());
+        for (final Edge edge : anyTen) {
+            assertTrue(edge.<Long>value("weight") > 12);
+        }
+        final List<Long> found = tx.indexQuery("edges", "e.kind:\"paved\"").edgeStream()
+            .map(result -> result.getElement().<Long>value("weight")).collect(Collectors.toList());
+        assertEquals(18, found.size());
+        for (final long w : found) {
+            assertTrue(w > 12);
+        }
+    }
+
+    //As above, for the vertex properties which a property index holds by their meta-properties
+    @Test
+    public void testLimitedQueriesOfPropertiesReadPastThePropertiesWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey weight = makeKey("weight", Long.class);
+        mgmt.makePropertyKey("tag").dataType(String.class).cardinality(Cardinality.LIST).make();
+        mgmt.buildIndex("psearch", JanusGraphVertexProperty.class).addKey(kind, getStringMapping()).addKey(weight)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+        Vertex vertex = tx.addVertex();
+        for (long w = 1; w <= 15; w++) {
+            vertex.property(VertexProperty.Cardinality.list, "tag", "t" + w, "kind", "paved", "weight", w);
+        }
+        newTx();
+        vertex = tx.traversal().V(vertex).next();
+        for (long w = 16; w <= 30; w++) {
+            vertex.property(VertexProperty.Cardinality.list, "tag", "t" + w, "kind", "paved", "weight", w);
+        }
+        newTx();
+        tx.traversal().V(vertex).properties("tag").has("weight", P.lte(12L)).toList()
+            .forEach(property -> property.remove());
+
+        assertEquals(Arrays.asList(13L, 14L, 15L, 16L, 17L, 18L, 19L, 20L, 21L, 22L),
+            ImmutableList.copyOf(tx.query().has("kind", "paved").orderBy("weight", asc).limit(10).properties()).stream()
+                .map(property -> property.<Long>value("weight")).collect(Collectors.toList()));
+        final List<JanusGraphVertexProperty> anyTen =
+            ImmutableList.copyOf(tx.query().has("kind", "paved").limit(10).properties());
+        assertEquals(10, anyTen.stream().distinct().count());
+        for (final JanusGraphVertexProperty property : anyTen) {
+            assertTrue(property.<Long>value("weight") > 12);
+        }
+        final List<Long> found = tx.indexQuery("psearch", "p.kind:\"paved\"").propertyStream()
+            .map(result -> result.getElement().<Long>value("weight")).collect(Collectors.toList());
+        assertEquals(18, found.size());
+        for (final long w : found) {
+            assertTrue(w > 12);
+        }
+    }
+
+    /**
+     * An ordered query which a mixed index answers without sorting it, as the index doesn't hold the order key, leaves
+     * out the vertices which the transaction removed, which the index still returns, before JanusGraph sorts them, as
+     * the order values of a removed vertex can't be read; the edges which it removed, whose ids turn into no element,
+     * are left out as well
+     */
+    @Test
+    public void testQueriesSortedInMemorySkipTheElementsWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("name", String.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+        final Vertex from = tx.addVertex("kind", "q");
+        for (final String name : Arrays.asList("a", "b", "c", "d")) {
+            from.addEdge("road", tx.addVertex("kind", "p", "name", name), "kind", "p", "name", name);
+        }
+        newTx();
+        final GraphTraversalSource g = tx.traversal();
+        //The vertex named b, and with it its edge, and the edge named c
+        g.V().has("kind", "p").has("name", "b").drop().iterate();
+        g.E().has("kind", "p").has("name", "c").drop().iterate();
+        assertEquals(Arrays.asList("a", "c", "d"), g.V().has("kind", "p").order().by("name").values("name").toList());
+        assertEquals(Arrays.asList("d", "c"),
+            g.V().has("kind", "p").order().by("name", desc).limit(2).values("name").toList());
+        final List<Object> vertexNames = new ArrayList<>();
+        tx.query().has("kind", "p").orderBy("name", asc).vertices().forEach(v -> vertexNames.add(v.value("name")));
+        assertEquals(Arrays.asList("a", "c", "d"), vertexNames);
+        assertEquals(Arrays.asList("a", "d"), g.E().has("kind", "p").order().by("name").values("name").toList());
+        assertEquals(Collections.singletonList("d"),
+            g.E().has("kind", "p").order().by("name", desc).limit(1).values("name").toList());
+        final List<Object> edgeNames = new ArrayList<>();
+        tx.query().has("kind", "p").orderBy("name", asc).edges().forEach(e -> edgeNames.add(e.value("name")));
+        assertEquals(Arrays.asList("a", "d"), edgeNames);
+        assertEquals(Arrays.asList("a", "d"),
+            g.V(from).local(__.outE("road").order().by("name")).values("name").toList());
+        tx.rollback();
+    }
+
+    //A query which removes the edges it reads, as it reads them, gets each of its edges once: a read under a larger
+    //limit skips what the index returned before, rather than as many edges as were returned, which are removed by then
+    @Test
+    public void testLimitedQueriesOfEdgesWhichTheTransactionRemovesAsItReadsThem() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey weight = makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).addKey(weight).buildMixedIndex(INDEX);
+        finishSchema();
+        Vertex from = tx.addVertex();
+        Vertex to = tx.addVertex();
+        for (long w = 1; w <= 15; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+        from = tx.traversal().V(from).next();
+        to = tx.traversal().V(to).next();
+        for (long w = 16; w <= 30; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+
+        //Only the edges of weight 9 to 15 are left, which the query reads before it reads on and finds no more
+        tx.traversal().E().has("weight", P.lte(8L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("weight", P.gte(16L)).toList().forEach(Edge::remove);
+        final AtomicInteger read = new AtomicInteger();
+        for (final Edge edge : tx.query().has("kind", "paved").limit(10).edges()) {
+            edge.remove();
+            read.incrementAndGet();
+        }
+        assertEquals(7, read.get());
+        assertFalse(tx.traversal().E().has("kind", "paved").hasNext());
+        tx.rollback();
+        newTx();
+
+        tx.traversal().E().has("weight", P.lte(8L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("weight", P.gte(16L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("kind", "paved").limit(10).drop().iterate();
+        assertFalse(tx.traversal().E().has("kind", "paved").hasNext());
+        tx.rollback();
+        newTx();
+
+        //The first ten by weight of those left are those of weight 9 to 18, of which 16 to 18 come after a read on
+        tx.traversal().E().has("weight", P.lte(8L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("kind", "paved").order().by("weight", asc).limit(10).drop().iterate();
+        assertEquals(Arrays.asList(19L, 20L, 21L, 22L, 23L, 24L, 25L, 26L, 27L, 28L, 29L, 30L),
+            tx.traversal().E().has("kind", "paved").order().by("weight", asc).values("weight").toList());
     }
 
     @Test
@@ -5049,6 +6297,855 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
                 addedVerticesAmount,
                 graph.traversal().V().has(namePropKeyStr, nameValue).limit(limit).count().next()
             );
+        }
+    }
+
+    /**
+     * The aggregations which a mixed index answers are those TinkerPop computes from the values the matching elements
+     * hold, with no result when there is no value. A traversal aggregates in memory what the index can't answer alike:
+     * a minimum, maximum, sum or mean after a limit or an offset, as the index aggregates every match, the changes of
+     * its transaction to the keys it reads, which the index doesn't hold, and a key the index doesn't hold the values of
+     * yet
+     */
+    @Test
+    public void testMixedIndexAggregationsOfTheValuesThereAre() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey height = makeKey("height", Integer.class);
+        final PropertyKey weight = makeKey("weight", Double.class);
+        final PropertyKey big = makeKey("big", Long.class);
+        makeKey("length", Integer.class);
+        final PropertyKey scores = mgmt.makePropertyKey("scores").dataType(Integer.class).cardinality(Cardinality.LIST).make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(height).addKey(weight).addKey(big)
+            .addKey(scores).buildMixedIndex(INDEX);
+        final PropertyKey code = makeKey("code", Integer.class);
+        mgmt.buildIndex("codes", Vertex.class).addKey(code).buildCompositeIndex();
+        finishSchema();
+
+        final JanusGraphVertex first = tx.addVertex("name", "some", "height", 170, "weight", -10.5, "code", 1, "length", 30);
+        first.property("scores", 3);
+        first.property("scores", -7);
+        tx.addVertex("name", "some", "height", 190, "scores", 10);
+        tx.addVertex("name", "some");
+        tx.addVertex("name", "none");
+        // each vertex without the value before the one with it, which holds the value an index may sort a missing one as
+        tx.addVertex("name", "greatest");
+        tx.addVertex("name", "least");
+        tx.commit();
+        newTx();
+        tx.addVertex("name", "greatest", "big", Long.MAX_VALUE);
+        tx.addVertex("name", "least", "big", Long.MIN_VALUE);
+        tx.commit();
+
+        newTx();
+        assertAggregations("some", "height", 170, 190, 360, 180.0);
+        assertAggregations("some", "weight", -10.5, -10.5, -10.5, -10.5);
+        assertAggregations("some", "scores", -7, 10, 6, 2.0);
+        assertAggregations("none", "height", null, null, null, null);
+        assertAggregations("nobody", "height", null, null, null, null);
+        assertAggregation(Long.MAX_VALUE, true, g -> g.V().has("name", "greatest").values("big").min());
+        assertAggregation(Long.MIN_VALUE, true, g -> g.V().has("name", "least").values("big").max());
+
+        // the index aggregates every match: a count stops at the limit of the traversal and leaves out the offset of
+        // a range, while the other aggregations aggregate in memory after a limit or an offset
+        assertAggregation(2, true, g -> g.V().has("name", "some").limit(2).count());
+        assertAggregation(2, true, g -> g.V().has("name", "some").range(1, 3).count());
+        assertAggregation(0, true, g -> g.V().has("name", "some").range(5, 10).count());
+        assertAggregation(170, false, g -> g.V().has("name", "some").order().by("height", asc).limit(1).values("height").sum());
+        assertAggregation(190, false, g -> g.V().has("name", "some").order().by("height", asc).range(1, 2).values("height").min());
+
+        // the index doesn't hold the changes of the transaction, which the traversal sees, to a key of the condition
+        tx.addVertex("name", "some", "height", 200);
+        assertAggregation(4, false, g -> g.V().has("name", "some").count());
+        assertAggregation(200, false, g -> g.V().has("name", "some").values("height").max());
+        tx.rollback();
+        // or to the aggregated key; a change which can't change the result leaves it to the index
+        newTx();
+        tx.addVertex("length", 5);
+        assertAggregation(3, true, g -> g.V().has("name", "some").count());
+        assertAggregation(190, true, g -> g.V().has("name", "some").values("height").max());
+        tx.addVertex("height", 300);
+        assertAggregation(3, true, g -> g.V().has("name", "some").count());
+        assertAggregation(190, false, g -> g.V().has("name", "some").values("height").max());
+        tx.rollback();
+        // a vertex removed in the transaction takes its properties with it
+        newTx();
+        tx.traversal().V().has("name", "some").has("height", 170).drop().iterate();
+        assertAggregation(2, false, g -> g.V().has("name", "some").count());
+        assertAggregation(190, false, g -> g.V().has("name", "some").values("height").max());
+        tx.rollback();
+
+        // nor the values of the elements it indexed before a key was added to it, until the key is enabled
+        newTx();
+        mgmt.addIndexKey(mgmt.getGraphIndex("mixed"), mgmt.getPropertyKey("length"));
+        finishSchema();
+        assertAggregation(30, false, g -> g.V().has("name", "some").values("length").max());
+
+        // a key which doesn't exist leaves no mixed index query to aggregate on, and neither does a composite index
+        assertFalse(tx.traversal().V().has("nokey", 1).values("height").max().hasNext());
+        assertEquals(170, tx.traversal().V().has("code", 1).values("height").max().next());
+        assertFalse(tx.traversal().V().has("code", 1).values("height").max().profile().next().getMetrics().stream()
+            .anyMatch(metrics -> metrics.getName().contains(JanusGraphMixedIndexAggStep.class.getSimpleName())));
+
+        // a count covers every match, where query.hard-max-limit only caps the index queries which fetch them
+        clopen(option(HARD_MAX_LIMIT), 1);
+        assertAggregation(3, true, g -> g.V().has("name", "some").count());
+    }
+
+    private void assertAggregations(String name, String key, Number min, Number max, Number sum, Number mean) {
+        assertAggregation(min, true, g -> g.V().has("name", name).values(key).min());
+        assertAggregation(max, true, g -> g.V().has("name", name).values(key).max());
+        assertAggregation(sum, true, g -> g.V().has("name", name).values(key).sum());
+        assertAggregation(mean, true, g -> g.V().has("name", name).values(key).mean());
+    }
+
+    // The result of the traversal, by the index when byIndex, and in memory, is the expected value, or none for null
+    private void assertAggregation(Number expected, boolean byIndex, Function<GraphTraversalSource, GraphTraversal<Vertex, ?>> aggregation) {
+        assertEquals(byIndex, aggregation.apply(tx.traversal()).profile().next().getMetrics().stream()
+            .anyMatch(metrics -> metrics.getName().contains(JanusGraphMixedIndexAggStep.class.getSimpleName())));
+        final List<?> optimized = aggregation.apply(tx.traversal()).toList();
+        final List<?> inMemory = aggregation.apply(tx.traversal()
+            .withoutStrategies(JanusGraphMixedIndexAggStrategy.class, JanusGraphMixedIndexCountStrategy.class)).toList();
+        for (final List<?> result : Arrays.asList(inMemory, optimized)) {
+            if (expected == null) {
+                assertEquals(Collections.emptyList(), result);
+            } else {
+                assertEquals(1, result.size(), result.toString());
+                if (expected instanceof Double) {
+                    assertEquals(expected.doubleValue(), ((Number) result.get(0)).doubleValue(), 0.0001);
+                } else {
+                    // whole numbers exactly, as doubles can't tell those beyond 2^53 apart
+                    assertEquals(expected.longValue(), ((Number) result.get(0)).longValue());
+                }
+            }
+        }
+    }
+
+    /**
+     * A mixed index orders the elements without the key last, whichever the direction, as JanusGraph does when it
+     * orders them in memory, for a query which keeps them; a traversal's order().by(key) leaves them out
+     */
+    @Test
+    public void testMixedIndexOrdersElementsWithoutTheKeyLast() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey height = makeKey("height", Integer.class);
+        final PropertyKey weight = makeKey("weight", Double.class);
+        final PropertyKey tag = makeKey("tag", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(height).addKey(weight)
+            .addKey(tag, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object low = tx.addVertex("name", "x", "height", -10, "weight", -10.5, "tag", "a").id();
+        final Object middle = tx.addVertex("name", "x", "height", 5, "weight", 5.5, "tag", "b").id();
+        final Object without = tx.addVertex("name", "x").id();
+        final Object high = tx.addVertex("name", "x", "height", 30, "weight", 30.5, "tag", "c").id();
+        tx.commit();
+
+        newTx();
+        for (final String key : Arrays.asList("height", "weight", "tag")) {
+            assertEquals(Arrays.asList(low, middle, high, without),
+                ids(tx.query().has("name", "x").orderBy(key, asc).vertices()), key);
+            assertEquals(Arrays.asList(high, middle, low, without),
+                ids(tx.query().has("name", "x").orderBy(key, desc).vertices()), key);
+            assertEquals(Arrays.asList(low, middle),
+                ids(tx.query().has("name", "x").orderBy(key, asc).limit(2).vertices()), key);
+            assertEquals(Arrays.asList(high, middle),
+                ids(tx.query().has("name", "x").orderBy(key, desc).limit(2).vertices()), key);
+            assertEquals(Arrays.asList(low, middle, high),
+                tx.traversal().V().has("name", "x").order().by(key, asc).id().toList(), key);
+            assertEquals(Arrays.asList(high, middle, low),
+                tx.traversal().V().has("name", "x").order().by(key, desc).id().toList(), key);
+        }
+    }
+
+    // A boolean sorts as an int in Lucene, and the elements without it come last in either direction as well
+    @Test
+    public void testMixedIndexOrdersElementsWithoutABooleanKeyLast() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey active = makeKey("active", Boolean.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(active).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object off = tx.addVertex("name", "x", "active", false).id();
+        final Object on = tx.addVertex("name", "x", "active", true).id();
+        final Object without = tx.addVertex("name", "x").id();
+        tx.commit();
+
+        newTx();
+        assertEquals(Arrays.asList(off, on, without),
+            ids(tx.query().has("name", "x").orderBy("active", asc).vertices()));
+        assertEquals(Arrays.asList(on, off, without),
+            ids(tx.query().has("name", "x").orderBy("active", desc).vertices()));
+        assertEquals(Arrays.asList(off), ids(tx.query().has("name", "x").orderBy("active", asc).limit(1).vertices()));
+        assertEquals(Arrays.asList(on), ids(tx.query().has("name", "x").orderBy("active", desc).limit(1).vertices()));
+        assertEquals(Arrays.asList(off, on),
+            tx.traversal().V().has("name", "x").order().by("active", asc).id().toList());
+        assertEquals(Arrays.asList(on, off),
+            tx.traversal().V().has("name", "x").order().by("active", desc).id().toList());
+    }
+
+    private static List<Object> ids(Iterable<? extends JanusGraphElement> elements) {
+        final List<Object> ids = new ArrayList<>();
+        elements.forEach(element -> ids.add(element.id()));
+        return ids;
+    }
+
+    /**
+     * An order().by(key) which JanusGraph folds into its query leaves out the elements without a value of the key, as
+     * TinkerPop leaves out an element for which a by() modulator has none: where a mixed index sorts the query, which
+     * then skips them, where JanusGraph sorts it, among the elements a transaction added or changed, and where it
+     * orders the edges of a vertex. The results are those of a TinkerGraph which holds the same elements.
+     */
+    @Test
+    public void testOrderLeavesOutTheElementsWithoutAKeyItOrdersBy() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        final PropertyKey ckind = makeKey("ckind", String.class);
+        final PropertyKey ekind = makeKey("ekind", String.class);
+        final PropertyKey weight = makeKey("weight", Integer.class);
+        final PropertyKey title = makeKey("title", String.class);
+        makeKey("uid", Integer.class);
+        makeKey("tag", String.class);
+        mgmt.makeEdgeLabel("link").make();
+        //A text predicate on the title, and an order by it, which a TEXTSTRING key takes
+        final Parameter titleMapping = indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)
+            ? Mapping.TEXTSTRING.asParameter() : getStringMapping();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(name, getStringMapping())
+            .addKey(age).addKey(title, titleMapping).buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(ekind, getStringMapping()).addKey(weight).buildMixedIndex(INDEX);
+        mgmt.buildIndex("byCkind", Vertex.class).addKey(ckind).buildCompositeIndex();
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        //uid, kind, name and age, some without a name or an age, and a title with each name
+        final Object[][] vertices = {{1, "p", "c", 5}, {2, "p", "a", 3}, {3, "p", null, 4}, {4, "p", "e", null},
+            {5, "p", null, 1}, {6, "p", "b", 2}, {7, "q", "d", 7}, {8, "q", null, 6}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                GraphTraversal<Vertex, Vertex> added = g.addV().property("uid", vertex[0]).property("kind", vertex[1])
+                    .property("ckind", vertex[1]).property("tag", "t");
+                if (vertex[2] != null) {
+                    added = added.property("name", vertex[2]).property("title", "about " + vertex[2]);
+                }
+                return vertex[3] == null ? added : added.property("age", vertex[3]);
+            });
+        }
+        //The edges of vertex 1 to the others, some without a weight
+        final Integer[] weights = {3, null, 1, 2, null, 5};
+        for (int i = 0; i < weights.length; i++) {
+            final int to = i + 2;
+            final int uid = i + 11;
+            final Integer w = weights[i];
+            onBoth(reference, g -> {
+                final GraphTraversal<Vertex, Edge> added = g.V().has("uid", 1).addE("link")
+                    .to(__.V().has("uid", to)).property("uid", uid).property("ekind", "e");
+                return w == null ? added : added.property("weight", w);
+            });
+        }
+        tx.commit();
+        newTx();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = Arrays.asList(
+            g -> g.V().has("kind", "p").order().by("name"),
+            g -> g.V().has("kind", "p").order().by("name", desc),
+            g -> g.V().has("kind", "p").order().by("name").limit(3),
+            g -> g.V().has("kind", "p").order().by("name", desc).range(1, 3),
+            g -> g.V().has("kind", "p").order().by("name").by("age"),
+            g -> g.V().has("kind", "p").order().by("age", desc).by("name").limit(4),
+            g -> g.V().has("kind", "p").order().by("age").order().by("name"),
+            g -> g.V().has("kind", "p").order().by("name").count(),
+            g -> g.V().has("kind", "p").has("age", P.gt(2)).order().by("age"),
+            g -> g.V().has("kind", "p").has("age", P.within(1, 3, 4, 10)).order().by("age"),
+            g -> g.V().has("kind", "p").or(__.has("age", P.lt(2)), __.has("age", P.gt(4))).order().by("age", desc),
+            g -> g.V().or(__.has("kind", "q"), __.has("name", P.gt("b"))).order().by("name"),
+            g -> g.V().has("kind", "p").has("age", (Object) null).order().by("age"),
+            //A composite index, of which JanusGraph sorts the results, and a key which no index holds
+            g -> g.V().has("ckind", "p").order().by("name").limit(3),
+            g -> g.V().has("tag", "t").order().by("age", desc).limit(5),
+            g -> g.E().has("ekind", "e").order().by("weight").limit(3),
+            g -> g.E().has("ekind", "e").order().by("weight", desc),
+            g -> g.V().has("uid", 1).local(__.outE("link").order().by("weight", desc).limit(3)),
+            g -> g.V().has("uid", 1).local(__.outE("link").order().by("weight")));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+        }
+        //The mixed indexes skip the elements without the key, as a new transaction's profile shows
+        tx.rollback();
+        newTx();
+        assertTrue(readsIndexWith(tx.traversal().V().has("kind", "p").order().by("name").limit(3), "name <> null"));
+        assertTrue(readsIndexWith(tx.traversal().E().has("ekind", "e").order().by("weight"), "weight <> null"));
+        //also next to another condition on the key, as an index may find that one in documents without the key: Solr
+        //dropped the clause of a text predicate whose value its analyzer turns into no terms, where the other backends
+        //find nothing
+        final List<Vertex> titled = tx.traversal().V().has("kind", "p").has("title", Text.textContains("!!!"))
+            .order().by("title").toList();
+        assertTrue(titled.stream().allMatch(vertex -> vertex.property("title").isPresent()), titled.toString());
+        assertTrue(readsIndexWith(tx.traversal().V().has("kind", "p").has("age", P.gt(2)).order().by("age"),
+            "age <> null"));
+        tx.rollback();
+
+        //A transaction adds elements with and without the key, gives one a value of it and takes another one's
+        newTx();
+        onBoth(reference, g -> g.addV().property("uid", 9).property("kind", "p").property("ckind", "p")
+            .property("tag", "t").property("name", "ab").property("age", 9));
+        onBoth(reference, g -> g.addV().property("uid", 10).property("kind", "p").property("ckind", "p")
+            .property("tag", "t").property("age", 10));
+        onBoth(reference, g -> g.V().has("uid", 3).property("name", "bb"));
+        onBoth(reference, g -> g.V().has("uid", 6).properties("name").drop());
+        onBoth(reference, g -> g.V().has("uid", 2).properties("age").drop());
+        onBoth(reference, g -> g.E().has("uid", 12).property("weight", 4));
+        onBoth(reference, g -> g.E().has("uid", 14).properties("weight").drop());
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                "in a transaction: " + traversal.apply(reference));
+        }
+        tx.rollback();
+    }
+
+    //Applies the change to the transaction of the test and to the reference graph
+    protected void onBoth(GraphTraversalSource reference, Function<GraphTraversalSource, GraphTraversal<?, ?>> change) {
+        change.apply(tx.traversal()).iterate();
+        change.apply(reference).iterate();
+    }
+
+    //The uids of the elements which the traversal returns, in its order, or its values which aren't elements
+    protected static List<Object> results(GraphTraversal<?, ?> traversal) {
+        final List<Object> results = new ArrayList<>();
+        traversal.forEachRemaining(result -> results.add(result instanceof Element
+            ? ((Element) result).value("uid") : result));
+        return results;
+    }
+
+    /**
+     * An order by a key of several values, which only an index that can sort by such a key answers, leaves out the
+     * elements without a value of any of its keys, as an order by a key of one value does. JanusGraph compares the
+     * elements which a transaction changed or added by such a key in memory as the index sorts them, by the greatest
+     * value descending.
+     */
+    @Test
+    public void testOrderByAKeyOfSeveralValuesLeavesOutTheElementsWithoutIt() {
+        if (!supportsOrderingListProperty) {
+            return;
+        }
+        final PropertyKey gender = makeKey("gender", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        final PropertyKey names = mgmt.makePropertyKey("names").dataType(String.class).cardinality(Cardinality.LIST)
+            .make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(gender, getStringMapping()).addKey(age)
+            .addKey(names, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex two = tx.addVertex("gender", "female", "age", 20);
+        two.property(VertexProperty.Cardinality.list, "names", "a");
+        two.property(VertexProperty.Cardinality.list, "names", "b");
+        final JanusGraphVertex one = tx.addVertex("gender", "female");
+        one.property(VertexProperty.Cardinality.list, "names", "c");
+        tx.addVertex("gender", "female", "age", 10);
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(Arrays.asList(one.id(), two.id()),
+            g.V().has("gender", "female").order().by("names", desc).id().toList());
+        //A key of one value next to it leaves out the vertices without a value of that key as well
+        assertEquals(Collections.singletonList(two.id()),
+            g.V().has("gender", "female").order().by("names", desc).by("age").id().toList());
+        //and so do the orders of the vertices which the transaction changed or added
+        g.V(two.id()).property(VertexProperty.Cardinality.list, "names", "z").iterate();
+        g.V(two.id()).property("age", 40).iterate();
+        final Object added = g.addV().property("gender", "female").property("names", "y").next().id();
+        g.addV().property("gender", "female").property("age", 30).iterate();
+        assertEquals(Arrays.asList(two.id(), added, one.id()),
+            g.V().has("gender", "female").order().by("names", desc).id().toList());
+        assertEquals(Collections.singletonList(two.id()),
+            g.V().has("gender", "female").order().by("names", desc).by("age").id().toList());
+        tx.rollback();
+    }
+
+    /**
+     * The value of each key which a traversal's order().by(key) requires takes part in choosing the indexes where no
+     * index answers the traversal's conditions, as for one which has none: a single mixed index which answers them all
+     * along with the order keys then answers it as it answers a has(key), sorted by the index, where JanusGraph read
+     * every element and sorted them in memory, and counts and aggregates what it holds. An index restricted to a label
+     * answers a traversal of that label. The traversal still reads every element where no such index answers it
+     * whole: where no mixed index holds an order key, where a condition would be left to JanusGraph, as one on a key
+     * which no index holds or a label which the index isn't restricted to, and where two mixed indexes hold the keys,
+     * of which a joint query would read the second whole. An order of vertices by a key which an index of edges holds
+     * reads every vertex too. A traversal whose conditions an index answers, as a
+     * composite index does, reads the indexes it read before, also in each branch of an or() which no index answers
+     * whole, while such a branch which no index answers reads every element, as do several or() steps, which make a
+     * single query. The results are those of a TinkerGraph which holds the same elements, also in a transaction which
+     * adds, changes and removes them.
+     */
+    @Test
+    public void testOrderReadsAMixedIndexOfItsKeysWhereNoIndexAnswersTheConditions() {
+        final GraphTraversalSource reference = loadElementsOrderedByMixedIndexKeys();
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = Arrays.asList(
+            g -> g.V().order().by("name").limit(3),
+            g -> g.V().order().by("name", desc).limit(3),
+            g -> g.V().order().by("name"),
+            g -> g.V().order().by("name", desc).range(1, 4),
+            g -> g.V().order().by("name").count(),
+            //by two keys of the index, of which the second orders the ties of the first
+            g -> g.V().order().by("age").by("name").limit(4),
+            g -> g.V().order().by("age", desc).by("name", desc),
+            //by a key of the index and one which no mixed index holds
+            g -> g.V().order().by("name").by("tag").limit(3),
+            //by a key which no mixed index holds, one which an index of edges holds, and one which an index holds for
+            //the persons only
+            g -> g.V().order().by("tag").limit(3),
+            g -> g.V().order().by("weight").limit(3),
+            g -> g.V().order().by("nick").limit(3),
+            g -> g.V().hasLabel("person", "org").order().by("nick"),
+            g -> g.V().hasLabel("org").order().by("nick"),
+            //of the persons, which the index of the persons answers whole, and the index of every vertex in part
+            g -> g.V().hasLabel("person").order().by("nick").limit(3),
+            g -> g.V().hasLabel("person").order().by("nick", desc),
+            g -> g.V().hasLabel("person").order().by("nick").count(),
+            g -> g.V().hasLabel("person").order().by("name").limit(3),
+            //of the persons by keys of both indexes
+            g -> g.V().hasLabel("person").order().by("nick").by("name").limit(3),
+            //conditions which no index answers
+            g -> g.V().has("tag").order().by("name"),
+            g -> g.V().has("tag", P.gt("t3")).order().by("age", desc).limit(3),
+            //conditions which a composite index answers, also in each branch of an or()
+            g -> g.V().has("ckind", "p").order().by("name").limit(3),
+            g -> g.V().has("ckind", P.within("p", "q")).order().by("name").limit(3),
+            g -> g.V().or(__.has("ckind", "p"), __.has("uid", 8)).order().by("name").limit(3),
+            //an or() with a branch which no index answers, and two or() steps, which no index answers
+            g -> g.V().or(__.has("tag", P.gt("t5")), __.has("ckind", "q")).order().by("name").limit(4),
+            g -> g.V().or(__.has("ckind", "p"), __.has("tag", "t4")).or(__.has("age", P.gt(20)), __.has("nick", "n0"))
+                .order().by("name").limit(3),
+            //edges
+            g -> g.E().order().by("weight").limit(3),
+            g -> g.E().order().by("weight", desc),
+            g -> g.E().hasLabel("link").order().by("weight").count());
+        newTx();
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+        }
+        tx.rollback();
+
+        //A new transaction's profiles show what each query reads
+        newTx();
+        final GraphTraversalSource g = tx.traversal();
+        assertReadsMixedIndex(g.V().order().by("name").limit(3), "[(name <> null)][ASC(name)]:mixed");
+        assertReadsMixedIndex(g.V().order().by("name", desc).limit(3), "[(name <> null)][DESC(name)]:mixed");
+        assertReadsMixedIndex(g.V().order().by("age").by("name").limit(4),
+            "[(age <> null AND name <> null)][ASC(age), ASC(name)]:mixed");
+        assertReadsMixedIndex(g.V().hasLabel("person").order().by("nick").limit(3),
+            "[(nick <> null)][ASC(nick)]:vertices");
+        assertReadsMixedIndex(g.E().order().by("weight").limit(3), "[(weight <> null)][ASC(weight)]:edges");
+        //and the index counts and aggregates what it holds
+        assertTrue(g.V().order().by("name").count().profile().next().getMetrics(0).getName()
+            .contains(JanusGraphMixedIndexAggStep.class.getSimpleName()));
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> aggregations = Arrays.asList(
+            s -> s.V().order().by("name").values("age").min(),
+            s -> s.V().order().by("name").values("age").max(),
+            s -> s.V().order().by("name").values("age").sum(),
+            s -> s.V().order().by("name").values("age").mean());
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> aggregation : aggregations) {
+            final String message = aggregation.apply(reference).toString();
+            assertTrue(aggregation.apply(g).profile().next().getMetrics(0).getName()
+                .contains(JanusGraphMixedIndexAggStep.class.getSimpleName()), message);
+            assertEquals(((Number) aggregation.apply(reference).next()).doubleValue(),
+                ((Number) aggregation.apply(g).next()).doubleValue(), 0.0001, message);
+        }
+        //Every element is read where the index which holds the order keys would leave a condition to JanusGraph
+        assertReadsEveryElement(g.V().order().by("name").by("tag").limit(3));
+        assertReadsEveryElement(g.V().hasLabel("person").order().by("name").limit(3));
+        assertReadsEveryElement(g.V().has("tag").order().by("name").limit(3));
+        //and where only two indexes together hold them, or no index of the traversal's elements and label does
+        assertReadsEveryElement(g.V().hasLabel("person").order().by("nick").by("name").limit(3));
+        assertReadsEveryElement(g.V().order().by("tag").limit(3));
+        assertReadsEveryElement(g.V().order().by("weight").limit(3));
+        assertReadsEveryElement(g.V().order().by("nick").limit(3));
+        assertReadsEveryElement(g.V().hasLabel("person", "org").order().by("nick"));
+        assertReadsEveryElement(g.V().hasLabel("org").order().by("nick"));
+        //A composite index which answers the conditions is read alone, also by each branch of an or() which no index
+        //answers whole
+        assertReadsOnly(g.V().has("ckind", "p").order().by("name").limit(3), "byCkind");
+        assertReadsOnly(g.V().has("ckind", P.within("p", "q")).order().by("name").limit(3), "byCkind");
+        assertReadsOnly(g.V().or(__.has("ckind", "p"), __.has("uid", 8)).order().by("name").limit(3), "byCkind",
+            "byUid");
+        //while a branch which no index answers reads every element, as do two or() steps, one query
+        final List<Map<String, Object>> branches = graphCentricQueries(
+            g.V().or(__.has("tag", P.gt("t5")), __.has("ckind", "q")).order().by("name").limit(4));
+        assertEquals(2, branches.size());
+        assertEquals("true", branches.get(0).get(QueryProfiler.FULLSCAN_ANNOTATION));
+        assertEquals("byCkind", branches.get(1).get(QueryProfiler.INDEX_ANNOTATION));
+        assertReadsEveryElement(g.V().or(__.has("ckind", "p"), __.has("tag", "t4"))
+            .or(__.has("age", P.gt(20)), __.has("nick", "n0")).order().by("name").limit(3));
+        tx.rollback();
+
+        //A transaction adds vertices with and without the keys, a person and an organization with a nick, gives a
+        //vertex a name and takes another one's, changes a name and a nick, takes a nick and removes a vertex, and
+        //adds an edge, removes one, changes a weight, takes one and gives one
+        newTx();
+        onBoth(reference, s -> s.addV("person").property("uid", 10).property("name", "aa").property("age", 15)
+            .property("nick", "n6").property("tag", "t9"));
+        onBoth(reference, s -> s.addV().property("uid", 11).property("age", 50).property("tag", "t0"));
+        onBoth(reference, s -> s.addV("org").property("uid", 12).property("name", "h").property("nick", "m"));
+        onBoth(reference, s -> s.V().has("uid", 3).property("name", "ab"));
+        onBoth(reference, s -> s.V().has("uid", 1).properties("name").drop());
+        onBoth(reference, s -> s.V().has("uid", 9).property("name", "0"));
+        onBoth(reference, s -> s.V().has("uid", 7).property("nick", "n"));
+        onBoth(reference, s -> s.V().has("uid", 3).properties("nick").drop());
+        onBoth(reference, s -> s.V().has("uid", 5).drop());
+        onBoth(reference, s -> s.V().has("uid", 2).addE("link").to(__.V().has("uid", 9)).property("uid", 108)
+            .property("weight", 0));
+        onBoth(reference, s -> s.E().has("uid", 103).drop());
+        onBoth(reference, s -> s.E().has("uid", 104).property("weight", 6));
+        onBoth(reference, s -> s.E().has("uid", 107).properties("weight").drop());
+        onBoth(reference, s -> s.E().has("uid", 102).property("weight", 7));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                "in a transaction: " + traversal.apply(reference));
+        }
+        tx.rollback();
+    }
+
+    /**
+     * With query.force-index, a traversal ordered by the keys of a mixed index which answers it is no longer refused
+     * as one which reads every element, while one which still reads every element is
+     */
+    @Test
+    public void testForceIndexAllowsAnOrderWhichAMixedIndexOfItsKeysAnswers() {
+        final GraphTraversalSource reference = loadElementsOrderedByMixedIndexKeys();
+        clopen(option(FORCE_INDEX_USAGE), true);
+        final GraphTraversalSource g = tx.traversal();
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> answered = Arrays.asList(
+            s -> s.V().order().by("name").limit(3),
+            s -> s.V().order().by("age", desc).by("name"),
+            s -> s.V().order().by("name").count(),
+            s -> s.V().hasLabel("person").order().by("nick").limit(3),
+            s -> s.V().has("ckind", "p").order().by("name"),
+            s -> s.E().order().by("weight").limit(3));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : answered) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(g)),
+                traversal.apply(reference).toString());
+        }
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> scans = Arrays.asList(
+            s -> s.V().order().by("tag").limit(3),
+            s -> s.V().order().by("nick").limit(3),
+            s -> s.V().hasLabel("org").order().by("nick"),
+            s -> s.V().has("tag").order().by("name"));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : scans) {
+            final JanusGraphException e = assertThrows(JanusGraphException.class,
+                () -> traversal.apply(g).toList(), traversal.apply(reference).toString());
+            assertTrue(e.getMessage().startsWith("Could not find a suitable index to answer graph query"),
+                e.getMessage());
+        }
+    }
+
+    /**
+     * Where no index answers a traversal's conditions, an order reads a mixed index of its keys only where the index's
+     * backend sorts by each of them as JanusGraph orders their values (IndexSerializer.supportsOrdering), and every
+     * element otherwise, rather than an index which would sort the elements otherwise or fail the query, also after a
+     * key which it sorts by. No backend sorts by a string which the index maps as a TEXT, as it maps a string by
+     * default; Lucene doesn't sort by a UUID, which Elasticsearch and Solr sort by its string form, as JanusGraph
+     * orders UUIDs; and Elasticsearch doesn't sort by a STRING key with a string analyzer, which Lucene and Solr sort
+     * by its whole strings. Every backend sorts by a STRING key, and by a TEXTSTRING one by its whole strings rather
+     * than their words or their lower case. An order by a key added to the index which isn't ENABLED yet, of which the
+     * index lacks the values of the elements it held before, reads every element, also where a second index holds that
+     * key and has the other one added in the same way, so that the two together answer the order: a query of several
+     * indexes would read all but the first whole, and the first would sort the elements by a key which it lacks for
+     * them. The results are those of a TinkerGraph which holds the same elements, of which the order of the texts by
+     * their least words, as Solr sorts them, isn't; but the UUIDs come in the order of their string forms, where
+     * TinkerPop compares them as UUID.compareTo does.
+     */
+    @Test
+    public void testOrderReadsAMixedIndexOfItsKeysOnlyWhereItsBackendSortsByThem() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey text = makeKey("text", String.class);
+        final PropertyKey words = makeKey("words", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        final PropertyKey analyzed = makeKey("analyzed", String.class);
+        final PropertyKey code = makeKey("code", UUID.class);
+        final PropertyKey rank = makeKey("rank", Integer.class);
+        makeKey("uid", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(text)
+            .addKey(words, Mapping.TEXT.asParameter()).addKey(title, Mapping.TEXTSTRING.asParameter())
+            .addKey(analyzed, Mapping.STRING.asParameter(),
+                ParameterType.STRING_ANALYZER.getParameter(getStandardAnalyzerName()))
+            .addKey(code).buildMixedIndex(INDEX);
+        mgmt.buildIndex("vertices", Vertex.class).addKey(rank).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        final String[] keys = {"uid", "name", "text", "words", "title", "analyzed", "code", "rank"};
+        //The values of the keys, null where the vertex has none; the codes' first digit of either half from 8 up, or
+        //below it, so that their string forms come in another order than UUID.compareTo's
+        final Object[][] vertices = {
+            {1, "d", "x a", "y z", "x a", "x a", "80000000-0000-0000-0000-000000000000", 2},
+            {2, "c", "apple", null, "apple", "apple", "12345678-0000-0000-8000-000000000000", 4},
+            {3, "b", null, "Mango", "Mango", "Banana", "12345678-0000-0000-7fff-ffffffffffff", 1},
+            {4, "a", "Banana", "c b", null, null, null, 3}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                GraphTraversal<Vertex, Vertex> added = g.addV();
+                for (int i = 0; i < keys.length; i++) {
+                    if (vertex[i] != null) {
+                        added = added.property(keys[i],
+                            keys[i].equals("code") ? UUID.fromString((String) vertex[i]) : vertex[i]);
+                    }
+                }
+                return added;
+            });
+        }
+        tx.commit();
+        mgmt.addIndexKey(mgmt.getGraphIndex("mixed"), mgmt.getPropertyKey("rank"));
+        mgmt.addIndexKey(mgmt.getGraphIndex("vertices"), mgmt.getPropertyKey("name"), getStringMapping());
+        finishSchema();
+        newTx();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = Arrays.asList(
+            g -> g.V().order().by("text"),
+            g -> g.V().order().by("text", desc).limit(2),
+            g -> g.V().order().by("words").limit(2),
+            g -> g.V().order().by("name").by("text"),
+            g -> g.V().order().by("rank").by("name"),
+            g -> g.V().order().by("name").by("rank"));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+            assertReadsEveryElement(traversal.apply(tx.traversal()));
+        }
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(results(reference.V().order().by("name", desc).limit(2)),
+            results(g.V().order().by("name", desc).limit(2)));
+        assertReadsMixedIndex(g.V().order().by("name", desc).limit(2), "[(name <> null)][DESC(name)]:mixed");
+        assertEquals(results(reference.V().order().by("title")), results(g.V().order().by("title")));
+        assertReadsMixedIndex(g.V().order().by("title"), "[(title <> null)][ASC(title)]:mixed");
+        assertEquals(results(reference.V().order().by("title", desc).limit(2)),
+            results(g.V().order().by("title", desc).limit(2)));
+        assertReadsMixedIndex(g.V().order().by("title", desc).limit(2), "[(title <> null)][DESC(title)]:mixed");
+        //As the backend sorts by a key or not
+        assertEquals(results(reference.V().order().by("analyzed")), results(g.V().order().by("analyzed")));
+        assertReadsMixedIndexWhereItSorts(indexSortsBy("mixed", "analyzed"), g.V().order().by("analyzed"),
+            "[(analyzed <> null)][ASC(analyzed)]:mixed");
+        assertEquals(Arrays.asList(3, 2, 1), results(g.V().order().by("code")));
+        assertEquals(Arrays.asList(1, 2), results(g.V().order().by("code", desc).limit(2)));
+        assertReadsMixedIndexWhereItSorts(indexSortsBy("mixed", "code"), g.V().order().by("code"),
+            "[(code <> null)][ASC(code)]:mixed");
+        assertReadsMixedIndexWhereItSorts(indexSortsBy("mixed", "code"), g.V().order().by("code", desc).limit(2),
+            "[(code <> null)][DESC(code)]:mixed");
+        tx.rollback();
+    }
+
+    //Whether the backend of the mixed index sorts by the key as JanusGraph orders its values
+    private boolean indexSortsBy(String indexName, String keyName) {
+        final MixedIndexType index = (MixedIndexType) ((ManagementSystem) mgmt)
+            .getSchemaVertex(mgmt.getGraphIndex(indexName)).asIndexType();
+        for (final ParameterIndexField field : index.getFieldKeys()) {
+            if (field.getFieldKey().name().equals(keyName)) {
+                return graph.getIndexSerializer().supportsOrdering(index, field);
+            }
+        }
+        throw new IllegalArgumentException(indexName + " doesn't hold " + keyName);
+    }
+
+    //Asserts that the traversal reads a single mixed index with the given query, fitted and sorted by the index, where
+    //the index sorts by the order keys, and every element otherwise
+    private static void assertReadsMixedIndexWhereItSorts(boolean sorts, GraphTraversal<?, ?> traversal,
+                                                          String indexQuery) {
+        if (sorts) {
+            assertReadsMixedIndex(traversal, indexQuery);
+        } else {
+            assertReadsEveryElement(traversal);
+        }
+    }
+
+    /**
+     * Where two mixed indexes of every vertex hold the key of an order, one as a TEXT, which no index backend sorts by
+     * as JanusGraph compares strings, and the other one as a STRING, which every one does, the order reads the second
+     * one, sorted by it. The brute-force choice of the default index selection strategy weighs the two alike where they
+     * answer the presence of the key, and would take either, by the order in which it meets them, that of new
+     * candidates in a hash set, which differs from one query to the next. The TEXT index is built first and named so
+     * that it sorts first, so that a strategy which took the first of the two by either order would take it every
+     * time. The results are those of a TinkerGraph which holds the same elements.
+     */
+    @Test
+    public void testOrderByAKeyOfTwoMixedIndexesReadsTheOneWhichSortsByIt() {
+        final GraphTraversalSource reference = loadNamesOfTwoMixedIndexes();
+        //Each run builds the query anew
+        for (int i = 0; i < 20; i++) {
+            final GraphTraversalSource g = tx.traversal();
+            assertEquals(results(reference.V().order().by("name").limit(3)),
+                results(g.V().order().by("name").limit(3)));
+            assertReadsMixedIndex(g.V().order().by("name").limit(3), "[(name <> null)][ASC(name)]:vertices");
+        }
+        tx.rollback();
+    }
+
+    /**
+     * An index selection strategy may take an index which it wasn't given as a candidate, as one which collects indexes
+     * of its own might: an order then reads every element rather than that index, which may hold an order key which
+     * its backend doesn't sort by as JanusGraph orders its values, as the TEXT index which the strategy takes here
+     * does. The results are those of a TinkerGraph which holds the same elements.
+     */
+    @Test
+    public void testOrderReadsEveryElementWhereTheStrategyTakesAnIndexOutsideItsCandidates() {
+        clopen(option(INDEX_SELECT_STRATEGY), CandidateIgnoringIndexSelectionStrategy.class.getName());
+        final GraphTraversalSource reference = loadNamesOfTwoMixedIndexes();
+        assertEquals(results(reference.V().order().by("name").limit(3)),
+            results(tx.traversal().V().order().by("name").limit(3)));
+        assertReadsEveryElement(tx.traversal().V().order().by("name").limit(3));
+        tx.rollback();
+    }
+
+    /*
+     * Vertices, one of them without a name, written into the graph and into the TinkerGraph which this returns, of
+     * which two mixed indexes hold the name: "mixed" as a TEXT, built first, and "vertices" as a STRING.
+     */
+    private GraphTraversalSource loadNamesOfTwoMixedIndexes() {
+        final PropertyKey name = makeKey("name", String.class);
+        makeKey("uid", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, Mapping.TEXT.asParameter()).buildMixedIndex(INDEX);
+        mgmt.buildIndex("vertices", Vertex.class).addKey(name, Mapping.STRING.asParameter()).buildMixedIndex(INDEX);
+        finishSchema();
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        final String[] names = {"x a", "apple", null, "Banana", "m"};
+        for (int i = 0; i < names.length; i++) {
+            final int uid = i + 1;
+            final String value = names[i];
+            onBoth(reference, g -> value == null ? g.addV().property("uid", uid)
+                : g.addV().property("uid", uid).property("name", value));
+        }
+        tx.commit();
+        newTx();
+        return reference;
+    }
+
+    /*
+     * The elements of the tests of orders by the keys of a mixed index, written into the graph and into the
+     * TinkerGraph which this returns: persons, organizations and other vertices, most of them without some of the keys
+     * name, age, nick, tag and ckind, and edges between them, some without a weight. The mixed index "mixed" holds the
+     * names, ages and ckinds of every vertex, "vertices" the nicks of the persons only, and "edges" the weights;
+     * composite indexes hold the uid and the ckind of the vertices, which a query of a ckind reads rather than "mixed",
+     * and no index the tag.
+     */
+    private GraphTraversalSource loadElementsOrderedByMixedIndexKeys() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        final PropertyKey nick = makeKey("nick", String.class);
+        final PropertyKey ckind = makeKey("ckind", String.class);
+        final PropertyKey weight = makeKey("weight", Integer.class);
+        final PropertyKey uid = makeKey("uid", Integer.class);
+        makeKey("tag", String.class);
+        final VertexLabel person = mgmt.makeVertexLabel("person").make();
+        mgmt.makeVertexLabel("org").make();
+        mgmt.makeEdgeLabel("link").make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(age)
+            .addKey(ckind, getStringMapping()).buildMixedIndex(INDEX);
+        mgmt.buildIndex("vertices", Vertex.class).addKey(nick, getStringMapping()).indexOnly(person)
+            .buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(weight).buildMixedIndex(INDEX);
+        mgmt.buildIndex("byCkind", Vertex.class).addKey(ckind).buildCompositeIndex();
+        mgmt.buildIndex("byUid", Vertex.class).addKey(uid).buildCompositeIndex();
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        final String[] keys = {"uid", "name", "age", "nick", "tag", "ckind"};
+        //The label, and the values of the keys, null where the vertex has none
+        final Object[][] vertices = {
+            {"person", 1, "c", 30, "n3", "t5", "p"},
+            {"person", 2, "a", 20, null, null, "p"},
+            {"person", 3, null, 25, "n1", "t7", "q"},
+            {"org", 4, "e", null, "n2", "t8", "p"},
+            {"org", 5, "b", 40, null, "t1", "q"},
+            {"vertex", 6, "d", 10, "n0", "t4", null},
+            {"person", 7, "f", 20, "n5", null, "p"},
+            {"vertex", 8, null, null, null, "t3", "q"},
+            {"person", 9, "g", 35, "n4", "t6", null}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                GraphTraversal<Vertex, Vertex> added = g.addV((String) vertex[0]);
+                for (int i = 0; i < keys.length; i++) {
+                    if (vertex[i + 1] != null) {
+                        added = added.property(keys[i], vertex[i + 1]);
+                    }
+                }
+                return added;
+            });
+        }
+        //The uid, the uids of the vertices which the edge links, and the weight, null where it has none
+        final Integer[][] edges = {{101, 1, 2, 5}, {102, 1, 3, null}, {103, 2, 3, 1}, {104, 3, 4, 3},
+            {105, 4, 5, null}, {106, 5, 6, 2}, {107, 6, 1, 4}};
+        for (final Integer[] edge : edges) {
+            onBoth(reference, g -> {
+                final GraphTraversal<Vertex, Edge> added = g.V().has("uid", edge[1]).addE("link")
+                    .to(__.V().has("uid", edge[2])).property("uid", edge[0]);
+                return edge[3] == null ? added : added.property("weight", edge[3]);
+            });
+        }
+        tx.commit();
+        return reference;
+    }
+
+    //Asserts that the traversal runs a single query, which reads a single mixed index with the given query, fitted and
+    //sorted by the index
+    private static void assertReadsMixedIndex(GraphTraversal<?, ?> traversal, String indexQuery) {
+        final String message = traversal.toString();
+        final List<Map<String, Object>> queries = graphCentricQueries(traversal);
+        assertEquals(1, queries.size(), message);
+        final Map<String, Object> query = queries.get(0);
+        assertEquals(indexQuery, query.get(QueryProfiler.QUERY_ANNOTATION), message);
+        assertEquals("true", query.get(QueryProfiler.FITTED_ANNOTATION), message);
+        assertEquals("true", query.get(QueryProfiler.ORDERED_ANNOTATION), message);
+        assertNull(query.get(QueryProfiler.FULLSCAN_ANNOTATION), message);
+    }
+
+    //Asserts that the traversal runs a single query, which reads every element, as no index answers it
+    protected static void assertReadsEveryElement(GraphTraversal<?, ?> traversal) {
+        final String message = traversal.toString();
+        final List<Map<String, Object>> queries = graphCentricQueries(traversal);
+        assertEquals(1, queries.size(), message);
+        assertEquals("true", queries.get(0).get(QueryProfiler.FULLSCAN_ANNOTATION), message);
+    }
+
+    //Asserts that the traversal runs a query for each of the given indexes, which reads that index alone, and which
+    //the index doesn't sort
+    private static void assertReadsOnly(GraphTraversal<?, ?> traversal, String... indexes) {
+        final String message = traversal.toString();
+        final List<Map<String, Object>> queries = graphCentricQueries(traversal);
+        assertEquals(indexes.length, queries.size(), message);
+        for (int i = 0; i < indexes.length; i++) {
+            assertEquals(indexes[i], queries.get(i).get(QueryProfiler.INDEX_ANNOTATION), message);
+            assertEquals("false", queries.get(i).get(QueryProfiler.ORDERED_ANNOTATION), message);
+        }
+    }
+
+    //The annotations of each graph-centric query which the traversal runs, as its profile shows them, with the field
+    //names of its index query without the suffix of a dynamic field, which Solr's carry, and without its limit, which
+    //the assertions leave aside; and the annotation fullscan of the scan of every element which the query runs where
+    //it reads no index
+    private static List<Map<String, Object>> graphCentricQueries(GraphTraversal<?, ?> traversal) {
+        final List<Map<String, Object>> queries = new ArrayList<>();
+        for (final Metrics metrics : traversal.profile().next().getMetrics()) {
+            collectGraphCentricQueries(metrics, queries);
+        }
+        return queries;
+    }
+
+    private static void collectGraphCentricQueries(Metrics metrics, List<Map<String, Object>> queries) {
+        if (QueryProfiler.GRAPH_CENTRIC_QUERY.equals(metrics.getName())) {
+            final Map<String, Object> annotations = new HashMap<>(metrics.getAnnotations());
+            annotations.computeIfPresent(QueryProfiler.QUERY_ANNOTATION,
+                (key, query) -> String.valueOf(query).replaceAll("\\b([a-z]+)_[a-z]+\\b", "$1")
+                    .replaceAll("\\(\\d+\\):", ":"));
+            for (final Metrics nested : metrics.getNested()) {
+                if (nested.getAnnotations().containsKey(QueryProfiler.FULLSCAN_ANNOTATION)) {
+                    annotations.put(QueryProfiler.FULLSCAN_ANNOTATION,
+                        nested.getAnnotation(QueryProfiler.FULLSCAN_ANNOTATION));
+                }
+            }
+            queries.add(annotations);
+        }
+        for (final Metrics nested : metrics.getNested()) {
+            collectGraphCentricQueries(nested, queries);
         }
     }
 
@@ -5174,22 +7271,37 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         final GraphTraversalSource g = tx.traversal();
         org.apache.tinkerpop.gremlin.process.traversal.Order ORDER_DESC = org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 
-        // ordering without using index on SINGLE cardinality property
-        Supplier<GraphTraversal<?, Vertex>> tFullscanSingle = () -> g.V().order().by("name1");
+        // ordering by a SINGLE cardinality property without a condition reads the index which holds the property, as
+        // ordering after has() of the property does
+        Supplier<GraphTraversal<?, Vertex>> tSingleWithoutCondition = () -> g.V().order().by("name1");
         assertTraversalAndIndexUsage(
             Arrays.asList(
-                "query=[]",
-                "_fullscan=true"
+                "_condition=(name1 <> null)",
+                "_query=[(name1 <> null)][ASC(name1)]:listPropertyOrdering"
             ),
-            tFullscanSingle, v1, v2, v3, v4, v5, v6
+            tSingleWithoutCondition, v1, v2, v3, v4, v5, v6
         );
 
-        // ordering without using index on LIST cardinality property with multiple values
-        // throws IllegalStateException with message "Multiple properties exist for the provided key, use Vertex.properties(name2)"
-        Exception exception = assertThrows(IllegalStateException.class, () -> {
-            g.V().order().by("name2").toList();
-        });
-        assertTrue(exception.getMessage().contains("Multiple properties exist for the provided key, use Vertex.properties(name2)"));
+        // ordering by a LIST cardinality property with multiple values without a condition: where every mixed index
+        // backend can sort by such a key, JanusGraph folds the order into its query, which the index answers, sorting
+        // the vertices by the least of their values for an ascending order and the greatest for a descending one;
+        // otherwise TinkerPop sorts them, and fails on a vertex with several values
+        if (supportsOrderingListProperty) {
+            assertTraversalAndIndexUsage(
+                Arrays.asList(
+                    "_condition=(name2 <> null)",
+                    "_query=[(name2 <> null)][ASC(name2)]:listPropertyOrdering"
+                ),
+                () -> g.V().order().by("name2"), v1, v2, v3, v4, v5, v6
+            );
+            assertEquals(Arrays.asList(v3, v4, v6, v5, v2, v1), g.V().order().by("name2", ORDER_DESC).toList());
+        } else {
+            Exception exception = assertThrows(IllegalStateException.class, () -> {
+                g.V().order().by("name2").toList();
+            });
+            assertTrue(exception.getMessage()
+                .contains("Multiple properties exist for the provided key, use Vertex.properties(name2)"));
+        }
 
         ///////////////////////////////////////////////////
         // ordering SINGLE cardinality properties
@@ -5321,5 +7433,1320 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
                 tListDateFilter, v6, v4, v2
             );
         }
+    }
+
+    //The indexes hold what the vertices held before the transaction: a query in the transaction finds a vertex which a
+    //change made match, whatever the order of its conditions and whichever index holds the changed key, and not under
+    //its old values
+    @Test
+    public void testTransactionFindsVerticesWhichItsChangesMadeMatch() {
+        makeKey("uid", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("byUid", Vertex.class).addKey(mgmt.getPropertyKey("uid")).buildCompositeIndex();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(age).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object changed = tx.addVertex("uid", "u1", "name", "a", "age", 20).id();
+        final Object other = tx.addVertex("uid", "u2", "name", "c", "age", 40).id();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(changed).property("name", "b").property("age", 30).iterate();
+        assertEquals(Collections.singletonList(changed), g.V().has("uid", "u1").has("name", "b").id().toList());
+        assertEquals(Collections.singletonList(changed), g.V().has("name", "b").has("uid", "u1").id().toList());
+        assertEquals(Collections.singletonList(changed), g.V().has("age", P.between(25, 35)).id().toList());
+        //Not counted: a count which the mixed index answers on its own counts what the index holds
+        assertFalse(g.V().has("name", "a").hasNext());
+        assertFalse(g.V().has("uid", "u1").has("name", "a").hasNext());
+        //The index returns the changed vertex too, under its old age: it comes once
+        assertEquals(Arrays.asList(changed, other), g.V().has("age", P.gt(10)).order().by("age").id().toList());
+        tx.rollback();
+    }
+
+    //An index which sorts what it returns sorts the vertices by what they held before the transaction: a query in the
+    //transaction orders the vertices whose order key it changed by what they hold now
+    @Test
+    public void testTransactionOrdersVerticesByWhatItChanged() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(age).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object raised = tx.addVertex("kind", "x", "age", 1).id();
+        final Object kept = tx.addVertex("kind", "x", "age", 30).id();
+        final Object lowered = tx.addVertex("kind", "x", "age", 50).id();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(raised).property("age", 100).iterate();
+        g.V(lowered).property("age", 5).iterate();
+        assertEquals(Collections.singletonList(raised),
+            g.V().has("kind", "x").order().by("age", desc).limit(1).id().toList());
+        assertEquals(Arrays.asList(raised, kept, lowered),
+            g.V().has("kind", "x").order().by("age", desc).id().toList());
+        assertEquals(Arrays.asList(lowered, kept, raised),
+            g.V().has("kind", "x").order().by("age", asc).id().toList());
+        tx.rollback();
+    }
+
+    //An index which sorts by a key of several values places a vertex by the values which it held before the
+    //transaction: the least of them for an ascending order, the greatest for a descending one. The vertices whose
+    //values of the key the transaction changed come where the values they hold now place them, which JanusGraph
+    //compares in the same way, also where the transaction changed another order key of the query
+    @Test
+    public void testTransactionOrdersVerticesByTheValuesOfAKeyOfSeveralValuesWhichTheyHoldNow() {
+        if (!supportsOrderingListProperty) {
+            return;
+        }
+        final PropertyKey gender = makeKey("gender", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        final PropertyKey names = mgmt.makePropertyKey("names").dataType(String.class).cardinality(Cardinality.LIST)
+            .make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(gender, getStringMapping()).addKey(age)
+            .addKey(names, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex two = tx.addVertex("gender", "female", "age", 20);
+        two.property(VertexProperty.Cardinality.list, "names", "a");
+        two.property(VertexProperty.Cardinality.list, "names", "b");
+        final JanusGraphVertex one = tx.addVertex("gender", "female", "age", 30);
+        one.property(VertexProperty.Cardinality.list, "names", "c");
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        //The index has two, of a and b, after one, of c, descending, and before it ascending
+        g.V(two.id()).property(VertexProperty.Cardinality.list, "names", "z").iterate();
+        g.V(one.id()).property(VertexProperty.Cardinality.list, "names", "0").iterate();
+        assertEquals(Arrays.asList(two.id(), one.id()),
+            g.V().has("gender", "female").order().by("names", desc).id().toList());
+        assertEquals(Arrays.asList(one.id(), two.id()),
+            g.V().has("gender", "female").order().by("names", asc).id().toList());
+        //An order key of one value which the transaction changed on a vertex with several values of the first
+        g.V(two.id()).property("age", 40).iterate();
+        assertEquals(Arrays.asList(two.id(), one.id()),
+            g.V().has("gender", "female").order().by("names", desc).by("age").id().toList());
+        tx.rollback();
+    }
+
+    /**
+     * An order by a key of several values compares an element by the least of its values in an ascending order and by
+     * the greatest in a descending one, as Elasticsearch, OpenSearch and Solr sort such a key. JanusGraph compares the
+     * elements in the same way where it sorts them itself: the results of a composite index, or of a mixed index which
+     * can't sort by such a key, as Lucene's can't, and the vertices which a transaction added or changed, which it
+     * merges with those of the index, as it merges the results of the branches of an or(). An element without a value
+     * of the key comes last in a query of the API, and a traversal's order leaves it out, as TinkerPop does.
+     */
+    @Test
+    public void testOrderByAKeyOfSeveralValuesComparesItsLeastOrGreatestValue() {
+        final PropertyKey gender = makeKey("gender", String.class);
+        final PropertyKey uid = makeKey("uid", String.class);
+        final PropertyKey names = mgmt.makePropertyKey("names").dataType(String.class).cardinality(Cardinality.LIST)
+            .make();
+        final PropertyKey scores = mgmt.makePropertyKey("scores").dataType(Integer.class).cardinality(Cardinality.SET)
+            .make();
+        mgmt.buildIndex("byUid", Vertex.class).addKey(uid).buildCompositeIndex();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(gender, getStringMapping()).addKey(names, getStringMapping())
+            .addKey(scores).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex two = tx.addVertex("gender", "female", "uid", "u2");
+        two.property(VertexProperty.Cardinality.list, "names", "b");
+        two.property(VertexProperty.Cardinality.list, "names", "d");
+        two.property(VertexProperty.Cardinality.set, "scores", 5);
+        two.property(VertexProperty.Cardinality.set, "scores", 1);
+        final JanusGraphVertex one = tx.addVertex("gender", "female", "uid", "u1");
+        one.property(VertexProperty.Cardinality.list, "names", "c");
+        one.property(VertexProperty.Cardinality.set, "scores", 3);
+        final JanusGraphVertex none = tx.addVertex("gender", "female", "uid", "u3");
+        final JanusGraphVertex other = tx.addVertex("gender", "male", "uid", "u4");
+        other.property(VertexProperty.Cardinality.list, "names", "a");
+        other.property(VertexProperty.Cardinality.list, "names", "z");
+        tx.commit();
+        newTx();
+
+        //two comes before one in either direction: by b before c, and by d before c; by 1 before 3, and by 5 before 3
+        final List<Object> expected = Arrays.asList(two.id(), one.id(), none.id());
+        final List<Object> withValues = expected.subList(0, 2);
+        for (final org.apache.tinkerpop.gremlin.process.traversal.Order order : Arrays.asList(asc, desc)) {
+            final String message = order.toString();
+            assertEquals(expected, vertexIds(tx.query().has("gender", "female").orderBy("names", order)), message);
+            assertEquals(expected, vertexIds(tx.query().has("gender", "female").orderBy("scores", order)), message);
+            assertEquals(expected, vertexIds(tx.query().has("uid", Contain.IN, Arrays.asList("u1", "u2", "u3"))
+                .orderBy("names", order)), message);
+            if (supportsOrderingListProperty) {
+                assertEquals(withValues,
+                    tx.traversal().V().has("gender", "female").order().by("names", order).id().toList(), message);
+                assertEquals(withValues, tx.traversal().V().or(__.has("uid", "u1"), __.has("uid", "u2"),
+                    __.has("uid", "u3")).order().by("names", order).id().toList(), message);
+            }
+        }
+
+        //The transaction makes other, of a and z, match the query, and gives one, of c, the value e
+        tx.traversal().V(other.id()).property("gender", "female").iterate();
+        tx.traversal().V(one.id()).property(VertexProperty.Cardinality.list, "names", "e").iterate();
+        final List<Object> ascending = Arrays.asList(other.id(), two.id(), one.id(), none.id());
+        final List<Object> descending = Arrays.asList(other.id(), one.id(), two.id(), none.id());
+        assertEquals(ascending, vertexIds(tx.query().has("gender", "female").orderBy("names", asc)));
+        assertEquals(descending, vertexIds(tx.query().has("gender", "female").orderBy("names", desc)));
+        assertEquals(descending.subList(0, 2),
+            vertexIds(tx.query().has("gender", "female").orderBy("names", desc).limit(2)));
+        assertEquals(ascending, vertexIds(tx.query().has("uid", Contain.IN, Arrays.asList("u1", "u2", "u3", "u4"))
+            .orderBy("names", asc)));
+        if (supportsOrderingListProperty) {
+            final GraphTraversalSource g = tx.traversal();
+            assertEquals(ascending.subList(0, 3), g.V().has("gender", "female").order().by("names", asc).id().toList());
+            assertEquals(descending.subList(0, 3),
+                g.V().has("gender", "female").order().by("names", desc).id().toList());
+            assertEquals(descending.subList(0, 2),
+                g.V().has("gender", "female").order().by("names", desc).limit(2).id().toList());
+        }
+        tx.rollback();
+    }
+
+    /**
+     * A mixed index isn't given an order by a key which its backend can't sort by, and JanusGraph sorts the results
+     * itself: none of JanusGraph's index backends sorts by a string key of TEXT mapping, which DEFAULT is for strings,
+     * as it holds the words of the strings rather than the strings. That holds for an order by such a key and by one
+     * which the index can sort by, either way round, too. An order by a TEXTSTRING key is still sorted by the index, by
+     * its whole strings. The traversals return what a TinkerGraph which holds the same vertices returns, also next to a
+     * text predicate which the index answers, and in a transaction which changes the vertices.
+     */
+    @Test
+    public void testOrderByATextKeyIsSortedByJanusGraph() {
+        if (!indexFeatures.supportsStringMapping(Mapping.TEXT)) {
+            return;
+        }
+        final boolean textString = indexFeatures.supportsStringMapping(Mapping.TEXTSTRING);
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        final PropertyKey note = makeKey("note", String.class);
+        final PropertyKey heading = makeKey("heading", String.class);
+        makeKey("uid", Integer.class);
+        //A title of TEXT mapping, a note of the DEFAULT one, and a heading, which holds the title, of TEXTSTRING
+        final JanusGraphManagement.IndexBuilder mixed = mgmt.buildIndex("mixed", Vertex.class)
+            .addKey(kind, getStringMapping()).addKey(title, Mapping.TEXT.asParameter()).addKey(note);
+        if (textString) {
+            mixed.addKey(heading, Mapping.TEXTSTRING.asParameter());
+        }
+        mixed.buildMixedIndex(INDEX);
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        //uid, kind, title and note: in mixed case, so that the order of the strings is none of the orders of their
+        //words, which the index holds
+        final Object[][] vertices = {{1, "p", "word of mouth", "some notes"}, {2, "p", "Zebra word", "More notes"},
+            {3, "p", "a word apart", null}, {4, "p", null, "notes again"}, {5, "p", "big deal", "Notes on notes"},
+            {6, "q", "another word", "extra notes"}, {7, "p", "word", "last notes"}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                GraphTraversal<Vertex, Vertex> added = g.addV().property("uid", vertex[0]).property("kind", vertex[1]);
+                if (vertex[2] != null) {
+                    added = added.property("title", vertex[2]).property("heading", vertex[2]);
+                }
+                return vertex[3] == null ? added : added.property("note", vertex[3]);
+            });
+        }
+        tx.commit();
+        newTx();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = new ArrayList<>(Arrays.asList(
+            g -> g.V().has("kind", "p").order().by("title"),
+            g -> g.V().has("kind", "p").order().by("title", desc),
+            g -> g.V().has("kind", "p").order().by("title").limit(2),
+            g -> g.V().has("kind", "p").order().by("title", desc).limit(2),
+            g -> g.V().has("kind", "p").order().by("note").limit(3),
+            g -> g.V().has("kind", "p").order().by("note", desc).range(1, 3),
+            g -> g.V().has("kind", "p").order().by("title").by("note"),
+            //by a key which the index can sort by and one which it can't, either way round
+            g -> g.V().has("title", Text.textContains("word")).order().by("kind", desc).by("title"),
+            g -> g.V().has("kind", "p").order().by("title", desc).by("kind").limit(3),
+            g -> g.V().has("kind", "p").order().by("title").count(),
+            g -> g.V().has("title", Text.textContains("word")).order().by("title"),
+            g -> g.V().has("title", Text.textContains("word")).order().by("title", desc).limit(2),
+            g -> g.V().has("note", Text.textContains("notes")).order().by("note", desc).limit(3)));
+        if (textString) {
+            traversals.addAll(Arrays.asList(
+                g -> g.V().has("kind", "p").order().by("heading"),
+                g -> g.V().has("kind", "p").order().by("heading", desc).limit(2),
+                g -> g.V().has("heading", Text.textContains("word")).order().by("heading").limit(3)));
+        }
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+        }
+        //The index sorts only the order by the TEXTSTRING key, as a new transaction's profile shows
+        tx.rollback();
+        newTx();
+        final GraphTraversalSource g = tx.traversal();
+        assertFalse(indexSortsBy(g.V().has("kind", "p").order().by("title").limit(2), "title"));
+        assertFalse(indexSortsBy(g.V().has("kind", "p").order().by("note", desc), "note"));
+        assertFalse(indexSortsBy(g.V().has("title", Text.textContains("word")).order().by("title"), "title"));
+        assertFalse(indexSortsBy(g.V().has("title", Text.textContains("word")).order().by("kind", desc).by("title"),
+            "kind"));
+        if (textString) {
+            assertTrue(indexSortsBy(g.V().has("kind", "p").order().by("heading").limit(2), "heading"));
+        }
+        tx.rollback();
+
+        //A transaction adds a vertex, gives one a title and takes another one's, and changes a title and a note
+        newTx();
+        onBoth(reference, g2 -> g2.addV().property("uid", 8).property("kind", "p").property("title", "Alpha word")
+            .property("heading", "Alpha word").property("note", "new notes"));
+        onBoth(reference, g2 -> g2.V().has("uid", 4).property("title", "word play").property("heading", "word play"));
+        onBoth(reference, g2 -> g2.V().has("uid", 7).properties("title", "heading").drop());
+        onBoth(reference, g2 -> g2.V().has("uid", 2).property("title", "zebra crossing")
+            .property("heading", "zebra crossing"));
+        onBoth(reference, g2 -> g2.V().has("uid", 5).property("note", "a note"));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                "in a transaction: " + traversal.apply(reference));
+        }
+        tx.rollback();
+    }
+
+    //Whether a mixed index sorts the traversal's results by the key, as the order of its query in the profile shows
+    protected static boolean indexSortsBy(GraphTraversal<?, ?> traversal, String key) {
+        final List<String> queries = new ArrayList<>();
+        for (final Metrics metrics : traversal.profile().next().getMetrics()) {
+            collectBackendQueries(metrics, queries);
+        }
+        //Solr's field names may carry the suffix of a dynamic field
+        final String pattern = "(?s).*\\b(ASC|DESC)\\(" + key + "(_[a-z]+)?\\).*";
+        return queries.stream().anyMatch(query -> query.matches(pattern));
+    }
+
+    /**
+     * An index selection strategy may hold an index to sort the results by a key which the index's backend can't sort
+     * by, which the index then isn't given: a key of several values, as Lucene can't sort by one, or a string key of
+     * TEXT mapping, as no backend can, as one which decides by the deprecated
+     * IndexSelectionUtil.indexCoversOrder(MixedIndexType, OrderList) does. JanusGraph sorts the results itself.
+     */
+    @Test
+    public void testResultsWhichAStrategyHoldsSortedByAnIndexWithoutTheOrderAreSortedInMemory() {
+        clopen(option(INDEX_SELECT_STRATEGY), DeprecatedOrderCoverageIndexSelectionStrategy.class.getName());
+        final PropertyKey gender = makeKey("gender", String.class);
+        makeKey("uid", String.class);
+        final PropertyKey names = mgmt.makePropertyKey("names").dataType(String.class).cardinality(Cardinality.LIST)
+            .make();
+        final PropertyKey title = makeKey("title", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(gender, getStringMapping()).addKey(names, getStringMapping())
+            .addKey(title, getTextMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+        tx.addVertex("gender", "female", "uid", "d");
+        tx.addVertex("gender", "female", "uid", "c", "title", "a word")
+            .property(VertexProperty.Cardinality.list, "names", "n");
+        final JanusGraphVertex b = tx.addVertex("gender", "female", "uid", "b", "title", "about it");
+        b.property(VertexProperty.Cardinality.list, "names", "b");
+        b.property(VertexProperty.Cardinality.list, "names", "z");
+        final JanusGraphVertex a = tx.addVertex("gender", "female", "uid", "a", "title", "Hello world");
+        a.property(VertexProperty.Cardinality.list, "names", "m");
+        a.property(VertexProperty.Cardinality.list, "names", "a");
+        tx.commit();
+        newTx();
+
+        for (final org.apache.tinkerpop.gremlin.process.traversal.Order order : Arrays.asList(asc, desc)) {
+            final List<Object> uids = new ArrayList<>();
+            tx.query().has("gender", "female").orderBy("names", order).vertices()
+                .forEach(v -> uids.add(v.value("uid")));
+            //by a, b, n, and no name ascending; by z, n, m, and no name descending
+            assertEquals(order == asc ? Arrays.asList("a", "b", "c", "d") : Arrays.asList("b", "c", "a", "d"), uids,
+                order.toString());
+            uids.clear();
+            tx.query().has("gender", "female").orderBy("title", order).vertices()
+                .forEach(v -> uids.add(v.value("uid")));
+            //by the whole titles, and no title last
+            assertEquals(order == asc ? Arrays.asList("a", "c", "b", "d") : Arrays.asList("b", "c", "a", "d"), uids,
+                order.toString());
+        }
+    }
+
+    /**
+     * An index selection strategy may give the index which it holds to sort the results only part of the query's
+     * order, as one which gives it only the first key of the order does: the index then sorts the ties of that key in
+     * its own order. JanusGraph sorts such results itself.
+     */
+    @Test
+    public void testResultsWhichAStrategyHoldsSortedByAnIndexGivenPartOfTheOrderAreSortedInMemory() {
+        clopen(option(INDEX_SELECT_STRATEGY), PartialOrderIndexSelectionStrategy.class.getName());
+        final PropertyKey gender = makeKey("gender", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey age = makeKey("age", Integer.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(gender, getStringMapping()).addKey(name, getStringMapping())
+            .addKey(age).buildMixedIndex(INDEX);
+        finishSchema();
+        for (final int years : new int[] {3, 1, 2}) {
+            tx.addVertex("gender", "female", "name", "a", "age", years);
+        }
+        tx.addVertex("gender", "female", "name", "b", "age", 0);
+        tx.commit();
+        newTx();
+
+        //The index holds the ties of the name a in an order of its own, which can't be both that of their ages and its
+        //reverse
+        for (final org.apache.tinkerpop.gremlin.process.traversal.Order order : Arrays.asList(asc, desc)) {
+            final List<Object> ages = new ArrayList<>();
+            tx.query().has("gender", "female").orderBy("name", asc).orderBy("age", order).vertices()
+                .forEach(v -> ages.add(v.value("age")));
+            assertEquals(order == asc ? Arrays.asList(1, 2, 3, 0) : Arrays.asList(3, 2, 1, 0), ages, order.toString());
+            //also where the index answers a traversal's order without a condition, which requires the order keys
+            assertEquals(ages, tx.traversal().V().order().by("name", asc).by("age", order).values("age").toList(),
+                order.toString());
+        }
+    }
+
+    /**
+     * An edge holds one value of a key at most, also of one declared to hold several, so an order of edges by such a
+     * key is folded into the query on every index backend, and sorted by JanusGraph where the index backend can't sort
+     * by a key of several values, as Lucene's can't. Without a condition, the order reads the index where its backend
+     * sorts by such a key, and every edge otherwise.
+     */
+    @Test
+    public void testOrderOfEdgesByAKeyDeclaredToHoldSeveralValues() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey weights = mgmt.makePropertyKey("weights").dataType(Integer.class)
+            .cardinality(Cardinality.LIST).make();
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).addKey(weights).buildMixedIndex(INDEX);
+        finishSchema();
+        final Vertex from = tx.addVertex();
+        final Vertex to = tx.addVertex();
+        for (final int weight : new int[] {3, 1, 2}) {
+            from.addEdge("road", to, "kind", "paved", "weights", weight);
+        }
+        from.addEdge("road", to, "kind", "paved");
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        assertEquals(Arrays.asList(1, 2, 3),
+            g.E().has("kind", "paved").order().by("weights", asc).values("weights").toList());
+        assertEquals(Arrays.asList(3, 2, 1),
+            g.E().has("kind", "paved").order().by("weights", desc).values("weights").toList());
+        assertEquals(Arrays.asList(1, 2, 3), g.E().order().by("weights", asc).values("weights").toList());
+        assertEquals(Arrays.asList(3, 2, 1), g.E().order().by("weights", desc).values("weights").toList());
+        assertReadsMixedIndexWhereItSorts(supportsOrderingListProperty, g.E().order().by("weights", asc),
+            "[(weights <> null)][ASC(weights)]:edges");
+        final List<Object> weightsOfEdges = new ArrayList<>();
+        tx.query().has("kind", "paved").orderBy("weights", asc).edges()
+            .forEach(edge -> weightsOfEdges.add(edge.valueOrNull(weights)));
+        assertEquals(Arrays.asList(1, 2, 3, null), weightsOfEdges);
+        weightsOfEdges.clear();
+        tx.query().has("kind", "paved").orderBy("weights", desc).edges()
+            .forEach(edge -> weightsOfEdges.add(edge.valueOrNull(weights)));
+        assertEquals(Arrays.asList(3, 2, 1, null), weightsOfEdges);
+    }
+
+    private static List<Object> vertexIds(JanusGraphQuery<?> query) {
+        final List<Object> ids = new ArrayList<>();
+        query.vertices().forEach(vertex -> ids.add(vertex.id()));
+        return ids;
+    }
+
+    //A disjunction, which an index that takes any condition is given whole, finds the vertices which the transaction's
+    //changes made match too
+    @Test
+    public void testTransactionFindsVerticesOfADisjunctionWhichItsChangesMadeMatch() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey tag = makeKey("tag", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, getStringMapping()).addKey(tag, getStringMapping())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object bob = tx.addVertex("name", "bob").id();
+        final Object renamed = tx.addVertex("name", "alice").id();
+        tx.addVertex("name", "carol");
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(renamed).property("name", "bob").property("tag", "t2").iterate();
+        final Object added = g.addV().property("tag", "t").next().id();
+        assertEquals(new HashSet<>(Arrays.asList(bob, renamed, added)),
+            new HashSet<>(g.V().or(__.has("name", "bob"), __.has("tag", "t")).id().toList()));
+        assertEquals(new HashSet<>(Arrays.asList(renamed, added)),
+            new HashSet<>(g.V().or(__.has("name", "bob").has("tag", "t2"), __.has("tag", "t")).id().toList()));
+        tx.rollback();
+    }
+
+    //An index may answer a not-equal by leaving out the elements which hold the value, as the vertex did before the
+    //transaction: a query in the transaction finds a vertex once the transaction removed the value
+    @Test
+    public void testTransactionFindsAVertexWhichARemovalMadeMatch() {
+        if (!indexFeatures.supportsCardinality(Cardinality.SET)) {
+            return;
+        }
+        final PropertyKey tags = mgmt.makePropertyKey("tags").dataType(String.class).cardinality(Cardinality.SET)
+            .make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(tags, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex vertex = tx.addVertex();
+        vertex.property(VertexProperty.Cardinality.set, "tags", "red");
+        vertex.property(VertexProperty.Cardinality.set, "tags", "blue");
+        final Object id = vertex.id();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(id).properties("tags").hasValue("red").drop().iterate();
+        assertEquals(Collections.singletonList(id), g.V().has("tags", P.neq("red")).id().toList());
+        tx.rollback();
+    }
+
+    //Where the new elements of an ordered query in the transaction fill its limit, the index is read only for the
+    //elements whose value of the first order key doesn't come after that of the last of them within the limit, as no
+    //other element can come within it. Ties at that value are read, as a later order key decides between them. A query
+    //whose new elements don't fill the limit reads the index whole, as does one whose last new element within the limit
+    //has a string value which the indexes may compare otherwise than memory. A traversal leaves out the elements
+    //without a value, which a query of the transaction keeps, last
+    @Test
+    public void testTransactionReadsTheIndexOnlyUpToItsLastNewValueWithinTheLimit() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey age = makeKey("age", Long.class);
+        final PropertyKey name = makeKey("name", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(age)
+            .addKey(name, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final List<Object> ids = new ArrayList<>();
+        for (long i = 1; i <= 18; i++) {
+            ids.add(tx.addVertex("kind", "x", "age", i, "name", "n" + i).id());
+        }
+        tx.addVertex("kind", "x", "name", "none");
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(ids.get(0)).property("age", 30L).iterate();
+        g.V(ids.get(1)).property("age", 18L).iterate();
+        g.V(ids.get(2)).property("age", 18L).iterate();
+        //The three changed vertices fill the limit, the last of them at 18, as is a vertex which the index holds
+        final Supplier<GraphTraversal<Vertex, Vertex>> byAgeDesc = () -> g.V().has("kind", "x").order().by("age", desc);
+        assertTrue(readsIndexWith(byAgeDesc.get().limit(3), "age >= 18"));
+        assertEquals(Arrays.asList(30L, 18L, 18L), values(byAgeDesc.get().limit(3), "age"));
+        //A later order key decides between the ties: the index's vertex of 18 comes before the changed ones
+        assertTrue(readsIndexWith(byAgeDesc.get().by("name", asc).limit(2), "age >= 18"));
+        assertEquals(Arrays.asList("n1", "n18"), values(byAgeDesc.get().by("name", asc).limit(2), "name"));
+        //An ascending order reads the elements up to the value
+        assertTrue(readsIndexWith(g.V().has("kind", "x").order().by("age", asc).limit(3), "age <= 30"));
+        assertEquals(Arrays.asList(4L, 5L, 6L), values(g.V().has("kind", "x").order().by("age", asc).limit(3), "age"));
+        //Too few new elements for the limit
+        assertFalse(readsIndexWith(byAgeDesc.get().limit(4), "age >= "));
+        assertEquals(Arrays.asList(30L, 18L, 18L, 18L), values(byAgeDesc.get().limit(4), "age"));
+        //New elements without a value, which the traversal leaves out, so that three new elements don't fill a limit of
+        //5, while a query of the transaction places them after the others
+        g.addV().property("kind", "x").iterate();
+        g.addV().property("kind", "x").iterate();
+        assertEquals(Arrays.asList(30L, 18L, 18L), values(byAgeDesc.get().limit(3), "age"));
+        assertFalse(readsIndexWith(byAgeDesc.get().limit(5), "age >= "));
+        assertEquals(Arrays.asList(30L, 18L, 18L, 18L, 17L), values(byAgeDesc.get().limit(5), "age"));
+        final List<Object> ages = new ArrayList<>();
+        tx.query().has("kind", "x").orderBy("age", desc).limit(21).vertices()
+            .forEach(vertex -> ages.add(valueOf(vertex, "age")));
+        assertEquals(Arrays.asList(30L, 18L, 18L, 18L, 17L), ages.subList(0, 5));
+        assertEquals(Arrays.asList(4L, null, null, null), ages.subList(17, 21));
+        //A string value, and one which memory compares otherwise than an index may
+        g.V(ids.get(3)).property("name", "zz").iterate();
+        g.V(ids.get(4)).property("name", "zy").iterate();
+        final Supplier<GraphTraversal<Vertex, Vertex>> byNameDesc =
+            () -> g.V().has("kind", "x").order().by("name", desc);
+        assertTrue(readsIndexWith(byNameDesc.get().limit(2), "name >= zy"));
+        assertEquals(Arrays.asList("zz", "zy"), values(byNameDesc.get().limit(2), "name"));
+        g.V(ids.get(5)).property("name", "\uD800").iterate();
+        assertFalse(readsIndexWith(byNameDesc.get().limit(1), "name >= "));
+        assertEquals(Collections.singletonList("\uD800"), values(byNameDesc.get().limit(1), "name"));
+        //A string from U+10000, an emoji, which memory places before a surrogate out of its pair of a lower unit: its
+        //descending range starts at U+FFFD
+        g.V(ids.get(6)).property("name", "\uD83D\uDE00").iterate();
+        assertTrue(readsIndexWith(byNameDesc.get().limit(1), "name >= \uFFFD"));
+        assertEquals(Collections.singletonList("\uD83D\uDE00"), values(byNameDesc.get().limit(1), "name"));
+        tx.rollback();
+
+        //A transaction whose queries the metrics of a group observe reads the index the same way
+        final JanusGraphTransaction observed = graph.buildTransaction().groupName("bounded").start();
+        try {
+            final GraphTraversalSource og = observed.traversal();
+            og.V(ids.get(0)).property("age", 30L).iterate();
+            og.V(ids.get(1)).property("age", 18L).iterate();
+            og.V(ids.get(2)).property("age", 18L).iterate();
+            assertTrue(readsIndexWith(og.V().has("kind", "x").order().by("age", desc).limit(3), "age >= 18"));
+            assertEquals(Arrays.asList(30L, 18L, 18L),
+                values(og.V().has("kind", "x").order().by("age", desc).limit(3), "age"));
+        } finally {
+            observed.rollback();
+        }
+    }
+
+    //The same for a query of edges, whose new ones fill its limit
+    @Test
+    public void testTransactionReadsTheEdgeIndexOnlyUpToItsLastNewValueWithinTheLimit() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey weight = makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("link").make();
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).addKey(weight)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex from = tx.addVertex();
+        final JanusGraphVertex to = tx.addVertex();
+        for (long i = 1; i <= 10; i++) {
+            from.addEdge("link", to, "kind", "x", "weight", i);
+        }
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        final Vertex newFrom = g.V(from.id()).next();
+        final Vertex newTo = g.V(to.id()).next();
+        for (long i = 20; i <= 24; i++) {
+            newFrom.addEdge("link", newTo, "kind", "x", "weight", i);
+        }
+        //A changed edge comes once, where its new weight goes
+        g.E().has("kind", "x").has("weight", 10L).property("weight", 22L).iterate();
+        assertTrue(readsIndexWith(g.E().has("kind", "x").order().by("weight", desc).limit(4), "weight >= 22"));
+        assertEquals(Arrays.asList(24L, 23L, 22L, 22L),
+            values(g.E().has("kind", "x").order().by("weight", desc).limit(4), "weight"));
+        assertEquals(Arrays.asList(24L, 23L, 22L, 22L, 21L, 20L, 9L),
+            values(g.E().has("kind", "x").order().by("weight", desc).limit(7), "weight"));
+        tx.rollback();
+    }
+
+    //An unordered query in the transaction takes the new elements which match it first: where they fill the limit, the
+    //index isn't read at all; otherwise the rest comes from the index, which leaves out the elements that the new ones
+    //stand for
+    @Test
+    public void testTransactionTakesItsMatchingElementsBeforeTheIndex() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey age = makeKey("age", Long.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(age).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final List<Object> ids = new ArrayList<>();
+        for (long i = 1; i <= 10; i++) {
+            ids.add(tx.addVertex("kind", "x", "age", i).id());
+        }
+        final Object stored = tx.addVertex("kind", "x", "age", 45L).id();
+        final Object restored = tx.addVertex("kind", "x", "age", 46L).id();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        final Set<Object> matching = new HashSet<>();
+        for (int i = 0; i < 5; i++) {
+            g.V(ids.get(i)).property("age", 50L + i).iterate();
+            matching.add(ids.get(i));
+        }
+        //The index still returns this one, under its old age
+        g.V(restored).property("age", 70L).iterate();
+        matching.add(restored);
+        matching.add(g.addV().property("kind", "x").property("age", 60L).next().id());
+        final Supplier<GraphTraversal<Vertex, Vertex>> older = () -> g.V().has("kind", "x").has("age", P.gt(40L));
+        assertNoBackendHit(older.get().limit(3).profile().next());
+        final List<Object> three = older.get().limit(3).id().toList();
+        assertEquals(3, three.size());
+        assertTrue(matching.containsAll(three));
+        matching.add(stored);
+        assertBackendHit(older.get().limit(10).profile().next());
+        final List<Object> all = older.get().limit(10).id().toList();
+        assertEquals(matching.size(), all.size());
+        assertEquals(matching, new HashSet<>(all));
+        tx.rollback();
+    }
+
+    //The index is read whole, without a range on the first order key, where a range may leave out elements which
+    //memory orders before the bound: in a descending order of decimals, which puts NaN first, where no range holds it,
+    //and from a string with a surrogate out of its pair, which no index holds as it is, while memory places it after
+    //U+FFFF. An ascending order of decimals takes the range
+    @Test
+    public void testTransactionReadsTheIndexWholeWhereItMayCompareOtherwise() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey score = makeKey("score", Double.class);
+        final PropertyKey name = makeKey("name", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(score)
+            .addKey(name, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        for (int i = 1; i <= 10; i++) {
+            tx.addVertex("kind", "x", "score", (double) i, "name", "n" + i);
+        }
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.addV().property("kind", "x").property("score", 20.0).iterate();
+        g.addV().property("kind", "x").property("score", 30.0).iterate();
+        assertFalse(readsIndexWith(g.V().has("kind", "x").order().by("score", desc).limit(2), "score >= "));
+        assertEquals(Arrays.asList(30.0, 20.0),
+            values(g.V().has("kind", "x").order().by("score", desc).limit(2), "score"));
+        g.addV().property("kind", "x").property("score", -5.0).iterate();
+        g.addV().property("kind", "x").property("score", -6.0).iterate();
+        assertTrue(readsIndexWith(g.V().has("kind", "x").order().by("score", asc).limit(2), "score <= -5.0"));
+        assertEquals(Arrays.asList(-6.0, -5.0),
+            values(g.V().has("kind", "x").order().by("score", asc).limit(2), "score"));
+        g.addV().property("kind", "x").property("name", "\uD800").iterate();
+        assertFalse(readsIndexWith(g.V().has("kind", "x").order().by("name", desc).limit(1), "name >= "));
+        assertEquals(Collections.singletonList("\uD800"),
+            values(g.V().has("kind", "x").order().by("name", desc).limit(1), "name"));
+        assertFalse(readsIndexWith(g.V().has("kind", "x").order().by("name", asc).limit(1), "name <= "));
+        assertEquals(Collections.singletonList("n1"),
+            values(g.V().has("kind", "x").order().by("name", asc).limit(1), "name"));
+        tx.rollback();
+    }
+
+    //Strings from U+E000 and from U+10000, surrogate pairs which UTF-16 units put below U+E000, are ranged in the
+    //order of their code points, in which memory and the indexes compare them: the ascending range of an emoji holds
+    //U+FFFF, and the descending range of U+E000 holds an emoji. The descending range of a string with a character from
+    //U+FFFD up starts at U+FFFD in place of the first of them
+    @Test
+    public void testTransactionReadsTheIndexUpToAStringBeyondTheSurrogatesInCodePointOrder() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(name, getStringMapping())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        tx.addVertex("kind", "x", "name", "\uFFFF");
+        tx.addVertex("kind", "x", "name", "\uD83D\uDE01");
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.addV().property("kind", "x").property("name", "\uE000").iterate();
+        g.addV().property("kind", "x").property("name", "\uD83D\uDE00").iterate();
+        final Supplier<GraphTraversal<Vertex, Vertex>> byNameAsc = () -> g.V().has("kind", "x").order().by("name", asc);
+        final Supplier<GraphTraversal<Vertex, Vertex>> byNameDesc =
+            () -> g.V().has("kind", "x").order().by("name", desc);
+        assertTrue(readsIndexWith(byNameAsc.get().limit(2), "name <= \uD83D\uDE00"));
+        assertEquals(Arrays.asList("\uE000", "\uFFFF"), values(byNameAsc.get().limit(2), "name"));
+        assertTrue(readsIndexWith(byNameDesc.get().limit(2), "name >= \uE000"));
+        assertEquals(Arrays.asList("\uD83D\uDE01", "\uD83D\uDE00"), values(byNameDesc.get().limit(2), "name"));
+        assertTrue(readsIndexWith(byNameDesc.get().limit(1), "name >= \uFFFD"));
+        assertEquals(Collections.singletonList("\uD83D\uDE01"), values(byNameDesc.get().limit(1), "name"));
+        tx.rollback();
+    }
+
+    //A string with a surrogate out of its pair isn't valid UTF-16, and no index holds such a surrogate as it is, while
+    //memory places it after U+FFFF, by its unit among the characters from U+10000. Lucene and Solr hold it as U+FFFD,
+    //below U+FFFE, U+FFFF and the characters from U+10000, so the descending range of a string with a character from
+    //U+FFFD up starts at U+FFFD in place of the first of them: limit(1), which takes that range, returns what the query
+    //without a limit returns first. There, memory places the stored string of U+DC00 before the new U+FFFE, and before
+    //the new U+1F600, whose first unit comes below the surrogates of the stored strings. Elasticsearch 9.5 holds such
+    //a surrogate as a question mark, below the letters, where the stored strings of the surrogates come after the rest
+    @Test
+    public void testTransactionRangeKeepsTheResultsOfADescendingOrderWithAStoredUnpairedSurrogate() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(name, getStringMapping())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        tx.addVertex("kind", "x", "name", "a");
+        tx.addVertex("kind", "x", "name", "\uDBFF");
+        tx.addVertex("kind", "x", "name", "\uDC00b");
+        tx.commit();
+
+        for (final String added : Arrays.asList("\uFFFE", "\uD83D\uDE00")) {
+            newTx();
+            final GraphTraversalSource g = tx.traversal();
+            g.addV().property("kind", "x").property("name", added).iterate();
+            final Supplier<GraphTraversal<Vertex, Vertex>> byNameDesc =
+                () -> g.V().has("kind", "x").order().by("name", desc);
+            assertTrue(readsIndexWith(byNameDesc.get().limit(1), "name >= \uFFFD"), codeUnits(added));
+            final List<Object> all = values(byNameDesc.get(), "name");
+            assertEquals(4, all.size(), codeUnits(all));
+            assertEquals(codeUnits(all.subList(0, 1)), codeUnits(values(byNameDesc.get().limit(1), "name")));
+            tx.rollback();
+        }
+    }
+
+    //JanusGraph's Lucene backend, OpenSearch 2 and Elasticsearch 6 to 8 can't build a range from a lower bound of more
+    //than 1,000 UTF-8 bytes up to the greatest string, and Solr takes a query in a URL of at most 8 KB. A range from a
+    //last new value of 1,000 bytes takes it whole. The descending range from a longer one starts at its longest prefix
+    //of whole characters within 1,000 bytes, and no ascending range is taken from it. Either way, the query returns
+    //what it returns without a limit first
+    @Test
+    public void testTransactionRangesFromALastNewValueOfMoreThanAThousandBytes() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        final boolean textString = indexFeatures.supportsStringMapping(Mapping.TEXTSTRING);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(name, getStringMapping())
+            .addKey(title, textString ? Mapping.TEXTSTRING.asParameter() : getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final String stored = "w".repeat(1000) + "x";
+        tx.addVertex("kind", "x", "name", stored, "title", stored);
+        tx.addVertex("kind", "x", "name", "a", "title", "a");
+        tx.commit();
+
+        //1,000 bytes and more: ASCII, and characters of three bytes below and above the surrogates, 333 of which make
+        //999 bytes
+        for (final String added : Arrays.asList("w".repeat(1000), "w".repeat(1001), "\u4E2D".repeat(400),
+                "\uE000".repeat(400))) {
+            final boolean whole = added.length() == 1000;
+            final String prefix = whole ? added : added.substring(0, added.charAt(0) == 'w' ? 1000 : 333);
+            for (final String key : Arrays.asList("name", "title")) {
+                newTx();
+                final GraphTraversalSource g = tx.traversal();
+                g.addV().property("kind", "x").property(key, added).iterate();
+                final Supplier<GraphTraversal<Vertex, Vertex>> byKeyDesc =
+                    () -> g.V().has("kind", "x").order().by(key, desc);
+                final Supplier<GraphTraversal<Vertex, Vertex>> byKeyAsc =
+                    () -> g.V().has("kind", "x").order().by(key, asc);
+                final String message = key + ", " + added.length() + " of " + codeUnits(added.substring(0, 1));
+                assertTrue(readsIndexWith(byKeyDesc.get().limit(1), key + " >= " + prefix), message);
+                assertEquals(values(byKeyDesc.get(), key).subList(0, 1), values(byKeyDesc.get().limit(1), key),
+                    message);
+                assertEquals(whole, readsIndexWith(byKeyAsc.get().limit(1), key + " <= "), message);
+                assertEquals(values(byKeyAsc.get(), key).subList(0, 1), values(byKeyAsc.get().limit(1), key),
+                    message);
+                tx.rollback();
+            }
+        }
+    }
+
+    //A key mapped as TEXTSTRING is ranged by the field of its whole strings, which the index sorts it by, rather than
+    //by its text field, which holds its words in lower case: a range of words would find no stored title up to Long
+    //Zed, and leave out ~Tilde Title, whose words come below zz top, from the range down to it
+    @Test
+    public void testTransactionReadsTheIndexOfADualMappedKeyOnlyUpToItsLastNewValueWithinTheLimit() {
+        if (!indexFeatures.supportsStringMapping(Mapping.TEXTSTRING)) {
+            return;
+        }
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping())
+            .addKey(title, Mapping.TEXTSTRING.asParameter()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        for (final String stored : Arrays.asList("Long John Don", "Long Little Lewis", "Middle Sister Mabel",
+                "big brother bob", "Zed", "~Tilde Title")) {
+            tx.addVertex("kind", "x", "title", stored);
+        }
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        for (final String added : Arrays.asList("Long Yan", "Long Zed", "zz top", "zz top 2")) {
+            g.addV().property("kind", "x").property("title", added).iterate();
+        }
+        final Supplier<GraphTraversal<Vertex, Vertex>> byTitleAsc =
+            () -> g.V().has("kind", "x").order().by("title", asc);
+        final Supplier<GraphTraversal<Vertex, Vertex>> byTitleDesc =
+            () -> g.V().has("kind", "x").order().by("title", desc);
+        assertTrue(readsIndexWith(byTitleAsc.get().limit(2), "title <= Long Zed"));
+        assertEquals(Arrays.asList("Long John Don", "Long Little Lewis"), values(byTitleAsc.get().limit(2), "title"));
+        assertTrue(readsIndexWith(byTitleAsc.get().limit(4), "title <= zz top 2"));
+        assertEquals(Arrays.asList("Long John Don", "Long Little Lewis", "Long Yan", "Long Zed"),
+            values(byTitleAsc.get().limit(4), "title"));
+        assertTrue(readsIndexWith(byTitleDesc.get().limit(2), "title >= zz top"));
+        assertEquals(Arrays.asList("~Tilde Title", "zz top 2"), values(byTitleDesc.get().limit(2), "title"));
+        tx.rollback();
+    }
+
+    //An unordered query checks the transaction's new elements only once it reaches them, by which time the caller may
+    //have changed the transaction: the edges it had when the query started come once each, however many it added
+    //meanwhile, changing the queried key of the vertices the query is still to reach doesn't disturb it, and the
+    //vertices it removed meanwhile aren't returned, other than one which the query had fetched ahead
+    @Test
+    public void testTransactionChangesWhileAnUnorderedQueryRuns() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey age = makeKey("age", Long.class);
+        mgmt.makeEdgeLabel("link").make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(age).buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(kind, getStringMapping()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final Object hub = tx.addVertex().id();
+        final List<Object> ids = new ArrayList<>();
+        for (long i = 1; i <= 6; i++) {
+            ids.add(tx.addVertex("kind", "x", "age", i).id());
+        }
+        tx.commit();
+        newTx();
+
+        //The edges in the transaction bound to the thread, whose container of added relations isn't copied when read
+        final Vertex from = graph.traversal().V(hub).next();
+        final Set<Object> edges = new HashSet<>();
+        for (int i = 0; i < 5; i++) {
+            edges.add(from.addEdge("link", from, "kind", "x").id());
+        }
+        final List<Object> returnedEdges = new ArrayList<>();
+        for (final JanusGraphEdge edge : graph.query().has("kind", "x").edges()) {
+            //A few edges, then enough for the container to grow
+            final int added = returnedEdges.isEmpty() ? 3 : returnedEdges.size() == 1 ? 2000 : 0;
+            for (int i = 0; i < added; i++) {
+                from.addEdge("link", from, "kind", "x");
+            }
+            returnedEdges.add(edge.id());
+        }
+        assertEquals(edges.size(), returnedEdges.size());
+        assertEquals(edges, new HashSet<>(returnedEdges));
+        //There, changing the queried key of the vertices which the query is still to reach doesn't disturb it either
+        final GraphTraversalSource bound = graph.traversal();
+        for (int i = 0; i < ids.size(); i++) {
+            bound.V(ids.get(i)).property("age", 60L + i).iterate();
+        }
+        final List<Object> changedMeanwhile = new ArrayList<>();
+        for (final JanusGraphVertex vertex
+                : graph.query().has("kind", "x").has("age", Cmp.GREATER_THAN, 55L).vertices()) {
+            for (int i = 0; i < ids.size(); i++) {
+                bound.V(ids.get(i)).property("age", 100L * (changedMeanwhile.size() + 1) + i).iterate();
+            }
+            changedMeanwhile.add(vertex.id());
+        }
+        assertEquals(ids.size(), changedMeanwhile.size());
+        assertEquals(new HashSet<>(ids), new HashSet<>(changedMeanwhile));
+        //Nor does removing the vertices which the query is still to reach, whose properties of the queried value go
+        final List<Object> returnedThere = removedMeanwhile(graph.traversal(), graph.query(), ids);
+        assertTrue(returnedThere.size() <= 2, returnedThere::toString);
+        graph.tx().rollback();
+
+        final List<Object> returnedVertices = removedMeanwhile(tx.traversal(), tx.query(), ids);
+        assertTrue(returnedVertices.size() <= 2, returnedVertices::toString);
+        tx.rollback();
+    }
+
+    //Sets age 50 on the vertices, then runs a query for them whose first result drops the others: returns what the
+    //query returned, which the caller checks for the one it read ahead at most
+    private static List<Object> removedMeanwhile(GraphTraversalSource g, JanusGraphQuery<?> query, List<Object> ids) {
+        for (final Object id : ids) {
+            g.V(id).property("age", 50L).iterate();
+        }
+        final List<Object> returned = new ArrayList<>();
+        for (final JanusGraphVertex vertex : query.has("kind", "x").has("age", 50L).vertices()) {
+            if (returned.isEmpty()) {
+                for (final Object id : ids) {
+                    if (!id.equals(vertex.id())) {
+                        g.V(id).drop().iterate();
+                    }
+                }
+            }
+            returned.add(vertex.id());
+        }
+        return returned;
+    }
+
+    //Ordered and unordered queries in transactions with random changes return what a scan of every element which the
+    //transaction sees finds: new and removed vertices, values raised, lowered, tied or removed, vertices which stop or
+    //start matching, and new and changed edges; with one or two order keys, which leave out the elements without a
+    //value of them, limits and offsets
+    @Test
+    public void testTransactionQueriesAgreeWithAScanOfTheirElements() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey num = makeKey("num", Long.class);
+        final PropertyKey str = makeKey("str", String.class);
+        final PropertyKey dbl = makeKey("dbl", Double.class);
+        //Strings from both sides of the surrogates, of a STRING key and of a TEXTSTRING key of words in mixed case, in
+        //the order of their code points
+        final PropertyKey txt = makeKey("txt", String.class);
+        final PropertyKey ekind = makeKey("ekind", String.class);
+        final PropertyKey weight = makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("link").make();
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, getStringMapping()).addKey(num)
+            .addKey(str, getStringMapping()).addKey(dbl)
+            .addKey(txt, indexFeatures.supportsStringMapping(Mapping.TEXTSTRING) ? Mapping.TEXTSTRING.asParameter()
+                : getStringMapping())
+            .buildMixedIndex(INDEX);
+        mgmt.buildIndex("edges", Edge.class).addKey(ekind, getStringMapping()).addKey(weight)
+            .buildMixedIndex(INDEX);
+        finishSchema();
+
+        for (int seed = 1; seed <= 20; seed++) {
+            new RandomTransactionCheck(seed).run();
+        }
+    }
+
+    //The values of the key of the elements which the traversal returns, null where an element has none
+    private static List<Object> values(GraphTraversal<?, ? extends Element> traversal, String key) {
+        final List<Object> values = new ArrayList<>();
+        traversal.forEachRemaining(element -> values.add(valueOf(element, key)));
+        return values;
+    }
+
+    //The UTF-16 units of the values' string form, brackets and commas included, which a surrogate out of its pair
+    //doesn't garble when printed
+    private static String codeUnits(Object values) {
+        return String.valueOf(values).chars().mapToObj(Integer::toHexString).collect(Collectors.joining(" "));
+    }
+
+    //The element's value of the key, null where it has none
+    private static Object valueOf(Element element, String key) {
+        final Iterator<? extends Property<Object>> properties = element.properties(key);
+        return properties.hasNext() ? properties.next().value() : null;
+    }
+
+    //Whether the traversal read its mixed index with the given condition, which its profile shows; a query which the
+    //transaction ran before may come from its cache instead, so this profiles a query's first run
+    private static boolean readsIndexWith(GraphTraversal<?, ?> traversal, String condition) {
+        final List<String> queries = new ArrayList<>();
+        for (final Metrics metrics : traversal.profile().next().getMetrics()) {
+            collectBackendQueries(metrics, queries);
+        }
+        //Solr's field names may carry the suffix of a dynamic field
+        final String[] parts = condition.split(" ", 2);
+        final String pattern = "(?s).*\\b" + parts[0] + "(_[a-z]+)? " + java.util.regex.Pattern.quote(parts[1]) + ".*";
+        return queries.stream().anyMatch(query -> query.matches(pattern));
+    }
+
+    private static void collectBackendQueries(Metrics metrics, List<String> queries) {
+        if (QueryProfiler.BACKEND_QUERY.equals(metrics.getName())) {
+            queries.add(String.valueOf(metrics.getAnnotation(QueryProfiler.QUERY_ANNOTATION)));
+        }
+        for (final Metrics nested : metrics.getNested()) {
+            collectBackendQueries(nested, queries);
+        }
+    }
+
+    /*
+     * One round of testTransactionQueriesAgreeWithAScanOfTheirElements: vertices of a kind of the round's own, edges
+     * between a few vertices of another, stored; a transaction which runs random queries, changes the elements at
+     * random and runs them again, each compared with the elements which a scan of every element the transaction sees
+     * finds, in the order which the query asks for, without those which have no value of an order key
+     */
+    private final class RandomTransactionCheck {
+        private final Random random;
+        private final int seed;
+        private final String kind;
+        private final List<Object> ids = new ArrayList<>();
+        private final List<Object> hubIds = new ArrayList<>();
+        private final long range;
+        private final int vertices;
+
+        private RandomTransactionCheck(int seed) {
+            this.seed = seed;
+            this.random = new Random(seed);
+            this.kind = "k" + seed;
+            this.vertices = 5 + random.nextInt(random.nextInt(4) == 0 ? 100 : 40);
+            this.range = random.nextBoolean() ? Math.max(3, vertices / 5) : vertices * 20L;
+        }
+
+        private void run() {
+            for (int i = 0; i < vertices + vertices / 4 + 1; i++) {
+                final JanusGraphVertex vertex = tx.addVertex();
+                vertex.property("kind", i < vertices ? kind : kind + "n");
+                setOrRemove(vertex, "num", randomNum());
+                setOrRemove(vertex, "str", randomStr());
+                setOrRemove(vertex, "dbl", randomDbl());
+                setOrRemove(vertex, "txt", randomTxt());
+                ids.add(vertex.id());
+            }
+            final List<JanusGraphVertex> hubs = new ArrayList<>();
+            for (int i = 0; i < 4; i++) {
+                hubs.add(tx.addVertex("kind", kind + "h"));
+                hubIds.add(hubs.get(i).id());
+            }
+            for (int i = 0; i < vertices / 2; i++) {
+                addEdge(hubs.get(random.nextInt(hubs.size())), hubs.get(random.nextInt(hubs.size())), false);
+            }
+            tx.commit();
+            newTx();
+
+            final List<Spec> specs = new ArrayList<>();
+            for (int i = 0; i < 10; i++) {
+                specs.add(new Spec());
+            }
+            for (final Spec spec : specs) {
+                check(spec, "before the changes");
+            }
+            final int[] counts = {0, 1, 3, 10, vertices / 2, vertices, 2 * vertices};
+            final int changes = counts[random.nextInt(counts.length)];
+            for (int i = 0; i < changes; i++) {
+                change();
+            }
+            for (final Spec spec : specs) {
+                check(spec, "after " + changes + " changes");
+            }
+            tx.rollback();
+            newTx();
+        }
+
+        private Long randomNum() {
+            return random.nextInt(10) == 0 ? null : (long) random.nextInt((int) range);
+        }
+
+        //Characters from U+E000 to U+FFFF come below those from U+10000, surrogate pairs, by code point, and above them
+        //by UTF-16 unit
+        private String randomStr() {
+            final String[] strings = {"a", "b", "c", "d", "aa", "ab", "ba", "bb", "abc", "cab", "dd", "z", "\uE000",
+                "a\uE000", "\uFFFC", "\uFFFD", "\uFFFF", "\uFFFFa", "\uD83D\uDE00", "a\uD83D\uDE00",
+                "\uD83D\uDE00a", "\uD83D\uDE01", "\uD800\uDC00", "\uDBFF\uDFFF"};
+            return random.nextInt(10) == 0 ? null : strings[random.nextInt(strings.length)];
+        }
+
+        //Whole strings of words in mixed case, which a TEXTSTRING key also holds as words in lower case
+        private String randomTxt() {
+            final String[] strings = {"Long John", "long john", "Long Zed", "big Brother", "Zed", "zed b", "~Tilde",
+                "Ab", "aB", "a\uE000 b", "\uFFFF x", "\uD83D\uDE00 Party"};
+            return random.nextInt(10) == 0 ? null : strings[random.nextInt(strings.length)];
+        }
+
+        private Double randomDbl() {
+            final double[] doubles = {-0.0, 0.0, 1.5, -1.5, 2.25, 100.0, -100.0};
+            return random.nextInt(10) == 0 ? null : doubles[random.nextInt(doubles.length)];
+        }
+
+        //A value above, below or among the stored ones, or none
+        private Object changedValue(String key) {
+            final int how = random.nextInt(4);
+            switch (key) {
+                case "num":
+                case "weight":
+                    return how == 0 ? (Object) (range + random.nextInt((int) range + 1))
+                        : how == 1 ? (Object) (-1L - random.nextInt((int) range + 1)) : how == 2 ? randomNum() : null;
+                case "str":
+                    return how == 0 ? (Object) ("\uDBFF\uDFFF" + random.nextInt(3))
+                        : how == 1 ? (Object) ("0" + random.nextInt(3)) : how == 2 ? randomStr() : null;
+                case "txt":
+                    return how == 0 ? (Object) ("\uDBFF\uDFFF Top " + random.nextInt(3))
+                        : how == 1 ? (Object) ("0 Low " + random.nextInt(3)) : how == 2 ? randomTxt() : null;
+                default:
+                    return how == 0 ? (Object) (1e6 + random.nextInt(100))
+                        : how == 1 ? (Object) (-1e6 - random.nextInt(100)) : how == 2 ? randomDbl() : null;
+            }
+        }
+
+        private void addEdge(Vertex from, Vertex to, boolean changed) {
+            final Object weight = changed && random.nextBoolean() ? changedValue("weight") : randomNum();
+            final String edgeKind = random.nextInt(8) == 0 ? kind + "n" : kind;
+            if (weight == null) {
+                from.addEdge("link", to, "ekind", edgeKind);
+            } else {
+                from.addEdge("link", to, "ekind", edgeKind, "weight", weight);
+            }
+        }
+
+        private void change() {
+            final GraphTraversalSource g = tx.traversal();
+            final int op = random.nextInt(100);
+            final Vertex vertex = g.V(ids.get(random.nextInt(vertices))).tryNext().orElse(null);
+            if (op < 18) {
+                final JanusGraphVertex added = tx.addVertex("kind", random.nextInt(5) == 0 ? kind + "n" : kind);
+                for (final String key : Arrays.asList("num", "str", "dbl", "txt")) {
+                    setOrRemove(added, key, random.nextBoolean() ? changedValue(key) : null);
+                }
+                ids.add(added.id());
+            } else if (op < 55) {
+                if (vertex == null) return;
+                final String key = Arrays.asList("num", "str", "dbl", "txt").get(random.nextInt(4));
+                final Object old = valueOf(vertex, key);
+                setOrRemove(vertex, key, changedValue(key));
+                if (random.nextInt(8) == 0) setOrRemove(vertex, key, old);
+            } else if (op < 63) {
+                if (vertex == null) return;
+                vertex.property("kind", kind + "x");
+                if (random.nextInt(6) == 0) vertex.property("kind", kind);
+            } else if (op < 69) {
+                final Object otherId = ids.get(vertices + random.nextInt(ids.size() - vertices));
+                final Vertex other = g.V(otherId).tryNext().orElse(null);
+                if (other != null) other.property("kind", kind);
+            } else if (op < 75) {
+                if (vertex != null) vertex.remove();
+            } else if (op < 88) {
+                final Vertex from = g.V(hubIds.get(random.nextInt(hubIds.size()))).next();
+                addEdge(from, g.V(hubIds.get(random.nextInt(hubIds.size()))).next(), true);
+            } else {
+                final List<Edge> edges = g.V(hubIds.get(random.nextInt(hubIds.size()))).outE("link").toList();
+                if (edges.isEmpty()) return;
+                final Edge edge = edges.get(random.nextInt(edges.size()));
+                if (random.nextInt(4) == 0) edge.property("ekind", random.nextBoolean() ? kind + "x" : kind);
+                else setOrRemove(edge, "weight", changedValue("weight"));
+            }
+        }
+
+        private void check(Spec spec, String when) {
+            final List<Element> expected = scan(spec);
+            final List<List<Object>> expectedValues = spec.values(
+                expected.subList(Math.min(spec.low, expected.size()), Math.min(spec.high, expected.size())));
+            final List<Element> actual = spec.run(tx.traversal());
+            final String message = "seed " + seed + ", " + when + ": " + spec;
+            assertEquals(expectedValues, spec.values(actual), message);
+            assertEquals(actual.size(), new HashSet<>(actual).size(), message);
+            for (final Element element : actual) {
+                assertTrue(spec.matches(element) && spec.hasOrderValues(element), message + ": " + element);
+            }
+        }
+
+        //Every element of the round which the transaction sees and which matches the spec, in its order
+        private List<Element> scan(Spec spec) {
+            final GraphTraversalSource g = tx.traversal();
+            final List<Element> elements = new ArrayList<>();
+            if (spec.edges) {
+                for (final Object hub : hubIds) {
+                    elements.addAll(g.V(hub).outE("link").toList());
+                }
+            } else {
+                for (final Object id : ids) {
+                    g.V(id).tryNext().ifPresent(elements::add);
+                }
+            }
+            elements.removeIf(element -> !spec.matches(element) || !spec.hasOrderValues(element));
+            elements.sort(spec.order());
+            return elements;
+        }
+
+        private final class Spec {
+            private final boolean edges = random.nextInt(4) == 0;
+            private final String[] keys;
+            private final boolean[] descending;
+            private final int condition = random.nextInt(4);
+            private final long numBound = random.nextInt((int) range + 1);
+            private final double dblBound = random.nextInt(3) - 0.5;
+            private final int high;
+            private final int low;
+
+            private Spec() {
+                final int[] limits = {1, 1, 2, 3, 5, 10, 10, 20, 50, 1000};
+                high = limits[random.nextInt(limits.length)];
+                low = random.nextInt(5) == 0 ? random.nextInt(high + 1) : 0;
+                final List<String> orderKeys = new ArrayList<>(edges
+                    ? Collections.singletonList("weight") : Arrays.asList("num", "str", "dbl", "txt"));
+                Collections.shuffle(orderKeys, random);
+                final int size = edges ? 1 : random.nextInt(4) == 0 ? 0 : random.nextInt(3) == 0 ? 2 : 1;
+                keys = orderKeys.subList(0, size).toArray(new String[0]);
+                descending = new boolean[size];
+                for (int i = 0; i < size; i++) {
+                    descending[i] = random.nextBoolean();
+                }
+            }
+
+            private List<Element> run(GraphTraversalSource g) {
+                GraphTraversal<? extends Element, ? extends Element> traversal;
+                if (edges) {
+                    GraphTraversal<Edge, Edge> query = g.E().has("ekind", kind);
+                    if (condition % 2 == 1) query = query.has("weight", P.gt(numBound));
+                    traversal = order(query);
+                } else {
+                    final GraphTraversal<Vertex, Vertex> query;
+                    switch (condition) {
+                        case 0:
+                            query = g.V().has("kind", kind);
+                            break;
+                        case 1:
+                            query = g.V().has("kind", kind).has("dbl", P.gt(dblBound));
+                            break;
+                        case 2:
+                            query = g.V().has("kind", kind).has("num", P.neq(numBound));
+                            break;
+                        default:
+                            query = g.V().or(__.has("kind", kind).has("num", P.lt(numBound)),
+                                __.has("kind", kind).has("dbl", P.gt(dblBound)));
+                    }
+                    traversal = order(query);
+                }
+                return new ArrayList<>(low > 0 ? traversal.range(low, high).toList() : traversal.limit(high).toList());
+            }
+
+            private <E extends Element> GraphTraversal<E, E> order(GraphTraversal<E, E> query) {
+                if (keys.length == 0) {
+                    return query;
+                }
+                GraphTraversal<E, E> ordered = query.order();
+                for (int i = 0; i < keys.length; i++) {
+                    ordered = ordered.by(keys[i], descending[i] ? desc : asc);
+                }
+                return ordered;
+            }
+
+            private boolean matches(Element element) {
+                if (edges) {
+                    final Long w = (Long) valueOf(element, "weight");
+                    return kind.equals(valueOf(element, "ekind")) && (condition % 2 == 0 || w != null && w > numBound);
+                }
+                if (!kind.equals(valueOf(element, "kind"))) return false;
+                final Long n = (Long) valueOf(element, "num");
+                final Double d = (Double) valueOf(element, "dbl");
+                switch (condition) {
+                    case 0:
+                        return true;
+                    case 1:
+                        return d != null && Double.compare(d, dblBound) > 0;
+                    case 2:
+                        return n != null && n != numBound;
+                    default:
+                        return n != null && n < numBound || d != null && Double.compare(d, dblBound) > 0;
+                }
+            }
+
+            //Whether the element has a value of each order key, as an order().by(key) of TinkerPop leaves it out
+            //otherwise
+            private boolean hasOrderValues(Element element) {
+                for (final String key : keys) {
+                    if (valueOf(element, key) == null) return false;
+                }
+                return true;
+            }
+
+            @SuppressWarnings("unchecked")
+            private Comparator<Element> order() {
+                return (first, second) -> {
+                    for (int i = 0; i < keys.length; i++) {
+                        final Comparable<Object> a = (Comparable<Object>) valueOf(first, keys[i]);
+                        final Comparable<Object> b = (Comparable<Object>) valueOf(second, keys[i]);
+                        final int cmp = a == null || b == null ? (a == null ? (b == null ? 0 : 1) : -1)
+                            : descending[i] ? compareValues(b, a) : compareValues(a, b);
+                        if (cmp != 0) return cmp;
+                    }
+                    return 0;
+                };
+            }
+
+            //Strings by their code points, as the indexes order them, and other values by their natural order
+            @SuppressWarnings("unchecked")
+            private int compareValues(Object a, Object b) {
+                if (!(a instanceof String) || !(b instanceof String)) {
+                    return ((Comparable<Object>) a).compareTo(b);
+                }
+                final String first = (String) a;
+                final String second = (String) b;
+                //Equal code points take as many units in both strings, so one index walks both
+                int i = 0;
+                while (i < first.length() && i < second.length()) {
+                    final int c1 = first.codePointAt(i);
+                    final int c2 = second.codePointAt(i);
+                    if (c1 != c2) {
+                        return Integer.compare(c1, c2);
+                    }
+                    i += Character.charCount(c1);
+                }
+                return Integer.compare(first.length(), second.length());
+            }
+
+            //The values of the order keys of each element, which are all that a result of ties may differ in
+            private List<List<Object>> values(List<Element> elements) {
+                final List<List<Object>> values = new ArrayList<>();
+                for (final Element element : elements) {
+                    final List<Object> row = new ArrayList<>();
+                    for (final String key : keys) {
+                        row.add(valueOf(element, key));
+                    }
+                    values.add(row);
+                }
+                return values;
+            }
+
+            @Override
+            public String toString() {
+                final StringBuilder order = new StringBuilder();
+                for (int i = 0; i < keys.length; i++) {
+                    order.append(keys[i]).append(descending[i] ? " desc " : " asc ");
+                }
+                return (edges ? "edges" : "vertices") + ", condition " + condition + " (" + numBound + ", " + dblBound
+                    + "), order " + order + "range " + low + ".." + high;
+            }
+        }
+
+        private void setOrRemove(Element element, String key, Object value) {
+            if (value == null) {
+                element.properties(key).forEachRemaining(Property::remove);
+            } else {
+                element.property(key, value);
+            }
+        }
+
     }
 }

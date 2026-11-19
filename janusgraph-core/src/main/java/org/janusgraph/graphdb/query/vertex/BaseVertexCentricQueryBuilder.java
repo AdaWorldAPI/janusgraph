@@ -24,10 +24,12 @@ import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.RelationType;
 import org.janusgraph.core.attribute.Cmp;
+import org.janusgraph.core.attribute.Contain;
 import org.janusgraph.core.schema.SchemaInspector;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.internal.OrderList;
 import org.janusgraph.graphdb.internal.RelationCategory;
+import org.janusgraph.graphdb.predicate.ConnectiveJanusPredicate;
 import org.janusgraph.graphdb.query.JanusGraphPredicate;
 import org.janusgraph.graphdb.query.Query;
 import org.janusgraph.graphdb.query.condition.PredicateCondition;
@@ -38,6 +40,7 @@ import org.janusgraph.graphdb.types.system.SystemRelationType;
 import org.janusgraph.util.IDUtils;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
@@ -60,6 +63,9 @@ public abstract class BaseVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q>
      * The relation types (labels or keys) to query for. None by default which means query for any relation type.
      */
     protected String[] types = NO_TYPES;
+    //The type of a query of one type, once resolved, and the name it was resolved for
+    private String singleTypeName;
+    private RelationType singleType;
     /**
      * The constraints added to this query. None by default.
      */
@@ -111,15 +117,45 @@ public abstract class BaseVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q>
             IDUtils.checkId(vertexId);
             return adjacent(getVertex(vertexId));
         } else if (type.equals(ImplicitKey.ID.name())) {
-            RelationIdentifier rid = ElementUtils.getEdgeId(value);
-            Preconditions.checkNotNull(rid, "Expected valid relation id: %s", value);
-            return addConstraint(ImplicitKey.JANUSGRAPHID.name(), rel, rid.getRelationId());
+            return addConstraint(ImplicitKey.JANUSGRAPHID.name(), rel, toRelationIds(rel, value));
         } else {
             Preconditions.checkArgument(rel.isValidCondition(value), "Invalid condition provided: %s", value);
         }
         if (constraints == NO_CONSTRAINTS) constraints = new ArrayList<>(5);
         constraints.add(new PredicateCondition<>(type, rel, value));
         return getThis();
+    }
+
+    //The relation ids which a condition on the ids of relations compares: each id of the collection of a Contain
+    //predicate, the values of the predicates of a connective one in turn, else the one id
+    private static Object toRelationIds(JanusGraphPredicate predicate, Object value) {
+        if (predicate instanceof Contain) {
+            Preconditions.checkArgument(value instanceof Collection, "Invalid condition provided: %s", value);
+            final Collection<?> ids = (Collection<?>) value;
+            final List<Long> relationIds = new ArrayList<>(ids.size());
+            for (Object id : ids) {
+                relationIds.add(getRelationId(id));
+            }
+            return relationIds;
+        }
+        if (predicate instanceof ConnectiveJanusPredicate) {
+            final ConnectiveJanusPredicate connective = (ConnectiveJanusPredicate) predicate;
+            Preconditions.checkArgument(value instanceof List && ((List<?>) value).size() == connective.size(),
+                "Invalid condition provided: %s", value);
+            final List<?> values = (List<?>) value;
+            final List<Object> relationIds = new ArrayList<>(values.size());
+            for (int i = 0; i < values.size(); i++) {
+                relationIds.add(toRelationIds(connective.get(i), values.get(i)));
+            }
+            return relationIds;
+        }
+        return getRelationId(value);
+    }
+
+    private static long getRelationId(Object id) {
+        final RelationIdentifier rid = ElementUtils.getEdgeId(id);
+        Preconditions.checkArgument(rid != null, "Expected valid relation id: %s", id);
+        return rid.getRelationId();
     }
 
     @Override
@@ -226,13 +262,29 @@ public abstract class BaseVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q>
         return types.length > 0;
     }
 
+    /**
+     * The type of a query of exactly one type, or null without one or for an unknown type. Resolving a type by its name
+     * costs a few lookups, and a query asks for its type several times, so the type is kept once resolved, until the
+     * query is given another name.
+     */
+    protected final RelationType singleType() {
+        if (types.length != 1 || types[0] == null) {
+            return null;
+        }
+        if (singleType == null || !types[0].equals(singleTypeName)) {
+            singleTypeName = types[0];
+            singleType = schemaInspector.getRelationType(singleTypeName);
+        }
+        return singleType;
+    }
+
     protected final boolean hasSingleType() {
-        return types.length == 1 && schemaInspector.getRelationType(types[0]) != null;
+        return singleType() != null;
     }
 
     protected final RelationType getSingleType() {
         Preconditions.checkArgument(hasSingleType());
-        return schemaInspector.getRelationType(types[0]);
+        return singleType();
     }
 
     /**
@@ -245,9 +297,7 @@ public abstract class BaseVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q>
      * @return
      */
     protected final boolean isImplicitKeyQuery(RelationCategory returnType) {
-        if (types.length != 1) return false;
-        if (types[0] == null) return false;
-        return returnType != RelationCategory.EDGE && constraints.isEmpty() && schemaInspector.getRelationType(types[0]) instanceof ImplicitKey;
+        return returnType != RelationCategory.EDGE && constraints.isEmpty() && singleType() instanceof ImplicitKey;
     }
 
 

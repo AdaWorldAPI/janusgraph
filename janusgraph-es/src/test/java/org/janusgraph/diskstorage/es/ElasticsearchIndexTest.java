@@ -18,6 +18,7 @@ import com.google.common.base.Throwables;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.RandomStringUtils;
@@ -53,6 +54,7 @@ import org.janusgraph.diskstorage.configuration.BasicConfiguration;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.backend.CommonsConfiguration;
+import org.janusgraph.diskstorage.es.rest.RestElasticSearchClient;
 import org.janusgraph.diskstorage.indexing.IndexEntry;
 import org.janusgraph.diskstorage.indexing.IndexProvider;
 import org.janusgraph.diskstorage.indexing.IndexProviderTest;
@@ -79,6 +81,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -90,14 +94,18 @@ import java.net.InetAddress;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -114,6 +122,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Testcontainers
 public class ElasticsearchIndexTest extends IndexProviderTest {
+
+    private static Boolean canPageWithPointInTime;
+
+    //The paging mode of the index a test opens: the option's default, unless the test chooses another before it
+    //(re)opens the index
+    private ElasticSearchPagingMode pagingMode = ElasticSearchPagingMode.SCROLL;
+
+    //The largest page of a limited result of the index a test opens: the option's default where null
+    private Integer limitedResultMaxPageSize;
+
+    //The shards of the indexes which the index a test opens creates: the container's default of 1 where null
+    private Integer numberOfShards;
+
+    //Whether the index a test opens uses the results of the shards which answered where others failed
+    private boolean allowPartialResults;
 
     @Container
     public static JanusGraphElasticsearchContainer esr = new JanusGraphElasticsearchContainer();
@@ -173,6 +196,14 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         final String index = "es";
         final CommonsConfiguration cc = new CommonsConfiguration(ConfigurationUtil.createBaseConfiguration());
         cc.set("index." + index + ".elasticsearch.ingest-pipeline.ingestvertex", "pipeline_1");
+        cc.set("index." + index + ".elasticsearch.paging-mode", pagingMode.getConfigName());
+        if (limitedResultMaxPageSize != null) {
+            cc.set("index." + index + ".elasticsearch.limited-result-max-page-size", limitedResultMaxPageSize);
+        }
+        if (numberOfShards != null) {
+            cc.set("index." + index + ".elasticsearch.create.ext.number_of_shards", numberOfShards);
+        }
+        cc.set("index." + index + ".elasticsearch.allow-partial-results", allowPartialResults);
         return makeESTestConfig(index, cc);
     }
 
@@ -233,6 +264,26 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         assertTrue(index.supports(of(Geoshape.class, Cardinality.SINGLE, Mapping.BKD.asParameter()), Geo.INTERSECT));
         assertTrue(index.supports(of(Geoshape.class, Cardinality.SINGLE, Mapping.BKD.asParameter()), Geo.CONTAINS));
         assertTrue(index.supports(of(Geoshape.class, Cardinality.SINGLE, Mapping.BKD.asParameter()), Geo.DISJOINT));
+    }
+
+    //Elasticsearch sorts by a keyword, which a STRING key and the dual field of a TEXTSTRING key are without a custom
+    //string analyzer, and by numbers, dates, booleans and UUIDs, and not by a text field
+    @Test
+    public void testOrderingSupport() {
+        assertTrue(index.supportsOrdering(allKeys.get(NAME)));
+        assertTrue(index.supportsOrdering(allKeys.get(TEXT_STRING)));
+        assertTrue(index.supportsOrdering(of(String.class, Cardinality.SINGLE, Mapping.TEXTSTRING.asParameter(),
+            new Parameter<>(ParameterType.TEXT_ANALYZER.getName(), getEnglishAnalyzerName()))));
+        assertFalse(index.supportsOrdering(allKeys.get(STRING)));
+        assertFalse(index.supportsOrdering(allKeys.get(FULL_TEXT)));
+        assertFalse(index.supportsOrdering(allKeys.get(TEXT)));
+        assertFalse(index.supportsOrdering(allKeys.get(KEYWORD)));
+        assertFalse(index.supportsOrdering(of(String.class, Cardinality.SINGLE)));
+        for (final Class<?> dataType : Arrays.asList(Byte.class, Short.class, Integer.class, Long.class, Float.class,
+                Double.class, Date.class, Instant.class, Boolean.class, UUID.class)) {
+            assertTrue(index.supportsOrdering(of(dataType, Cardinality.SINGLE)), dataType.toString());
+        }
+        assertFalse(index.supportsOrdering(of(Geoshape.class, Cardinality.SINGLE)));
     }
 
     @Test
@@ -365,6 +416,33 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         final Object error = failure.getFailedItems().get(0);
         assertTrue(error instanceof Map, String.valueOf(error));
         assertEquals("index_not_found_exception", ((Map<?, ?>) error).get("type"), String.valueOf(error));
+    }
+
+    //A bulk response carries only the fields which the client reads, and every item keeps its status, so the items
+    //still line up with the requests they answer: the documents reported are those whose items failed, whatever
+    //succeeded around them
+    @Test
+    public void testTheFailedItemsOfABulkResponseAreReportedForTheirOwnDocuments() throws Exception {
+        final String indexName = INDEX_NAME.getDefaultValue() + "_bulk_items";
+        final List<ElasticSearchMutation> requests = new ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            //Even ones create their document. Odd ones update a document which isn't there, without an upsert, which
+            //Elasticsearch answers with a 404 document_missing_exception
+            requests.add(i % 2 == 0
+                ? ElasticSearchMutation.createIndexRequest(indexName, "store", "doc" + i, ImmutableMap.of("field", i))
+                : ElasticSearchMutation.createUpdateRequest(indexName, "store", "doc" + i,
+                    ImmutableMap.builder().put("doc", ImmutableMap.of("field", i)), null));
+        }
+        try (ElasticSearchClient client = ElasticSearchSetup.REST_CLIENT.connect(getESTestConfig()).getClient()) {
+            final ElasticSearchBulkFailureException failure = assertThrows(ElasticSearchBulkFailureException.class,
+                () -> client.bulkRequest(requests, null));
+            assertEquals(Collections.singletonMap("store", ImmutableSet.of("doc1", "doc3", "doc5")),
+                failure.getFailedDocumentsByStore());
+            assertEquals(Collections.singleton(HttpStatus.SC_NOT_FOUND), failure.getFailedItemStatusCodes());
+            assertEquals(3, failure.getFailedItems().size(), failure.getFailedItems().toString());
+        } finally {
+            IOUtils.closeQuietly(httpClient.execute(host, new HttpDelete(indexName)));
+        }
     }
 
     //A read failure whose status is listed in retry-error-codes is classified transient, the way a write failure is,
@@ -1044,7 +1122,8 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
 
     /* ---------------------------------------------------------------
      * Search contexts. The page size of this configuration is 3 (max-result-set-size), so a result of 10
-     * documents is several pages, and these tests watch the cluster's own accounting of its search contexts
+     * documents is several pages, read through a scroll, or through a point in time where the paging mode says so and
+     * the cluster has them, and these tests watch the cluster's own accounting of its search contexts
      * ---------------------------------------------------------------
      */
 
@@ -1075,7 +1154,7 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
     }
 
     @Test
-    public void shouldNotOpenAScrollContextForALimitedQueryLargerThanAPage() throws Exception {
+    public void shouldNotOpenAContextForALimitedQueryLargerThanAPage() throws Exception {
         final String store = "vertex";
         indexDocuments(store);
         final SearchStats before = settledSearchStats();
@@ -1085,11 +1164,11 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         assertEquals(INDEXED_DOCUMENTS, tx.queryStream(allDocuments(store, 5_000)).count());
         assertEquals(7, tx.queryStream(rawAllDocuments(store).setLimit(7)).count());
 
-        assertEquals(before.scrollTotal, awaitSearchContextsBackAt(before).scrollTotal, "scroll contexts opened");
+        assertNoPages(before, awaitSearchContextsBackAt(before));
     }
 
     @Test
-    public void shouldNotOpenAScrollContextForAnUnlimitedQueryWhichFitsIntoAPage() throws Exception {
+    public void shouldNotOpenAContextForAnUnlimitedQueryWhichFitsIntoAPage() throws Exception {
         final String store = "vertex";
         indexDocuments(store);
         final SearchStats before = settledSearchStats();
@@ -1099,39 +1178,97 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         //Fits into a page after its offset, which the first request applies
         assertEquals(2, tx.queryStream(rawAllDocuments(store).setOffset(INDEXED_DOCUMENTS - 2)).count());
 
-        assertEquals(before.scrollTotal, awaitSearchContextsBackAt(before).scrollTotal, "scroll contexts opened");
+        assertNoPages(before, awaitSearchContextsBackAt(before));
     }
 
-    @Test
-    public void shouldReleaseTheScrollContextOfAnUnlimitedQueryLargerThanAPage() throws Exception {
+    @ParameterizedTest
+    @EnumSource(ElasticSearchPagingMode.class)
+    public void shouldReleaseTheContextOfAnUnlimitedQueryLargerThanAPage(ElasticSearchPagingMode mode)
+            throws Exception {
+        pagingMode = mode;
         final String store = "vertex";
         indexDocuments(store);
-        final SearchStats before = settledSearchStats();
-
-        assertEquals(INDEXED_DOCUMENTS, tx.queryStream(allDocuments(store)).count());
+        //A direct index query finds every document as well, by relevance, before the graph query is read
         assertEquals(INDEXED_DOCUMENTS, tx.queryStream(rawAllDocuments(store)).count());
+        final SearchStats before = settledSearchStats();
 
-        final SearchStats after = awaitSearchContextsBackAt(before);
-        assertTrue(after.scrollTotal > before.scrollTotal, "these results are read through a scroll");
+        final SearchStats whileReading;
+        final List<String> read = new ArrayList<>();
+        try (Stream<String> hits = tx.queryStream(allDocuments(store))) {
+            final Iterator<String> iterator = hits.iterator();
+            read.add(iterator.next());
+            whileReading = searchStats();
+            iterator.forEachRemaining(read::add);
+        }
+        //Every document once, across the pages: as many hits as documents, and each of them
+        final Set<String> indexed = new HashSet<>();
+        for (int i = 0; i < INDEXED_DOCUMENTS; i++) {
+            indexed.add("doc" + i);
+        }
+        assertEquals(INDEXED_DOCUMENTS, read.size(), "hits read: " + read);
+        assertEquals(indexed, new HashSet<>(read));
+
+        assertReadInPages(before, whileReading, awaitSearchContextsBackAt(before), mode);
     }
 
-    @Test
-    public void shouldReleaseTheScrollContextWhenTheConsumerStopsBeforeTheEnd() throws Exception {
+    @ParameterizedTest
+    @EnumSource(ElasticSearchPagingMode.class)
+    public void shouldReleaseTheContextWhenTheConsumerStopsBeforeTheEnd(ElasticSearchPagingMode mode) throws Exception {
+        pagingMode = mode;
         final String store = "vertex";
         indexDocuments(store);
         final SearchStats before = settledSearchStats();
 
+        final SearchStats whileReading;
         try (Stream<String> firstOnly = tx.queryStream(allDocuments(store))) {
             assertNotNull(firstOnly.iterator().next());
+            whileReading = searchStats();
         }
 
-        final SearchStats after = awaitSearchContextsBackAt(before);
-        assertTrue(after.scrollTotal > before.scrollTotal, "this result is read through a scroll");
+        assertReadInPages(before, whileReading, awaitSearchContextsBackAt(before), mode);
     }
 
-    //The offset of a limited raw query is applied by Elasticsearch, that of an unlimited one on the client
+    //On this index of one shard, read in pages of 3, the adaptive mode reads a graph query without a limit and without
+    //an order through a point in time, and a direct index query, whose hits come by relevance, through a scroll
     @Test
-    public void shouldApplyOffsetsBeyondAPage() throws Exception {
+    public void shouldReadOnlyAResultInTheOrderOfTheIndexThroughAPointInTimeInAdaptiveMode() throws Exception {
+        pagingMode = ElasticSearchPagingMode.ADAPTIVE_POINT_IN_TIME;
+        final String store = "vertex";
+        indexDocuments(store);
+
+        final SearchStats before = settledSearchStats();
+        assertEquals(INDEXED_DOCUMENTS, tx.queryStream(allDocuments(store)).count());
+        final SearchStats afterGraphQuery = awaitSearchContextsBackAt(before);
+        if (clusterCanPageWithPointInTime()) {
+            assertEquals(before.scrollTotal, afterGraphQuery.scrollTotal, "the graph query scrolled");
+        } else {
+            assertTrue(afterGraphQuery.scrollTotal > before.scrollTotal, "the graph query is read through a scroll");
+        }
+
+        assertEquals(INDEXED_DOCUMENTS, tx.queryStream(rawAllDocuments(store)).count());
+        assertTrue(awaitSearchContextsBackAt(afterGraphQuery).scrollTotal > afterGraphQuery.scrollTotal,
+            "the direct index query is read through a scroll");
+    }
+
+    //A count which a limit of 0 bounds is 0, the totals of a raw query and the COUNT aggregation of an index query
+    //alike; the same counts without the limit find every document
+    @Test
+    public void shouldCountZeroForALimitOfZero() throws Exception {
+        final String store = "vertex";
+        indexDocuments(store);
+
+        assertEquals(INDEXED_DOCUMENTS, (long) tx.totals(rawAllDocuments(store)));
+        assertEquals(0L, (long) tx.totals(rawAllDocuments(store).setLimit(0)));
+        assertEquals(INDEXED_DOCUMENTS, tx.queryAggregation(allDocuments(store), Aggregation.COUNT).longValue());
+        assertEquals(0L, tx.queryAggregation(allDocuments(store, 0), Aggregation.COUNT).longValue());
+    }
+
+    //The offset of a limited raw query is applied by Elasticsearch, that of an unlimited one on the client, in every
+    //paging mode; the adaptive mode scrolls a direct index query, which wants its hits by relevance
+    @ParameterizedTest
+    @EnumSource(ElasticSearchPagingMode.class)
+    public void shouldApplyOffsetsBeyondAPage(ElasticSearchPagingMode mode) throws Exception {
+        pagingMode = mode;
         final String store = "vertex";
         indexDocuments(store);
 
@@ -1140,36 +1277,208 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         assertEquals(0, tx.queryStream(rawAllDocuments(store).setOffset(INDEXED_DOCUMENTS).setLimit(5)).count());
         assertEquals(5, tx.queryStream(rawAllDocuments(store).setOffset(5)).count());
         assertEquals(0, tx.queryStream(rawAllDocuments(store).setOffset(INDEXED_DOCUMENTS + 2)).count());
+        //A limit beyond the first 10,000 hits is read in pages too, which skip the offset on the client
+        final int beyondOneRequest = ElasticSearchSearcher.MAX_SEARCH_SIZE;
+        assertEquals(5, tx.queryStream(rawAllDocuments(store).setOffset(5).setLimit(beyondOneRequest)).count());
+        assertEquals(0,
+            tx.queryStream(rawAllDocuments(store).setOffset(INDEXED_DOCUMENTS + 2).setLimit(beyondOneRequest)).count());
         final List<String> ordered = tx.queryStream(new RawQuery(store, "text:\"Hello world\"",
             ImmutableList.of(new IndexQuery.OrderEntry(TIME, Order.ASC, Long.class)), new Parameter[0]).setOffset(4))
             .map(RawQuery.Result::getResult).collect(Collectors.toList());
         assertEquals(Arrays.asList("doc4", "doc5", "doc6", "doc7", "doc8", "doc9"), ordered);
     }
 
-    private static final class SearchStats {
-        final long openContexts;
-        final long scrollTotal;
+    //A limited query whose limit reaches beyond the first 10,000 hits is read after its first request in as few pages
+    //as its largest page allows, never smaller than a page of 3, in every paging mode; a result without a limit is
+    //read in pages of 3 whatever that largest page. Each request of the index of one shard is one query the index
+    //counts, the first request and every page, of a scroll or of a point in time, alike. The 10 documents take one
+    //page of 244 by default, three pages of 4, or four pages of 3, the size of a page of an unlimited result
+    @ParameterizedTest
+    @CsvSource({"SCROLL,,2", "POINT_IN_TIME,,2", "ADAPTIVE_POINT_IN_TIME,,2", "SCROLL,4,4", "POINT_IN_TIME,4,4",
+        "SCROLL,1,5", "POINT_IN_TIME,1,5"})
+    public void shouldReadALimitedResultBeyondOneRequestInAsFewPagesAsItsLargestPageAllows(
+            ElasticSearchPagingMode mode, Integer largestPage, int queries) throws Exception {
+        pagingMode = mode;
+        limitedResultMaxPageSize = largestPage;
+        final String store = "vertex";
+        indexDocuments(store);
+        final SearchStats before = settledSearchStats();
 
-        SearchStats(long openContexts, long scrollTotal) {
-            this.openContexts = openContexts;
-            this.scrollTotal = scrollTotal;
+        assertEquals(INDEXED_DOCUMENTS,
+            tx.queryStream(allDocuments(store, ElasticSearchSearcher.MAX_SEARCH_SIZE + 1)).count());
+        final SearchStats afterLimited = awaitSearchContextsBackAt(before);
+        assertEquals(queries, afterLimited.queryTotal - before.queryTotal, "queries of the limited result");
+
+        assertEquals(INDEXED_DOCUMENTS, tx.queryStream(allDocuments(store)).count());
+        assertEquals(5, awaitSearchContextsBackAt(afterLimited).queryTotal - afterLimited.queryTotal,
+            "queries of the result without a limit");
+    }
+
+    /* ---------------------------------------------------------------
+     * Shards which fail. Of the 10 documents in an index of two shards, read in the order of time, a script field
+     * throws for doc7, which fails the fetch of its shard wherever doc7 is among the hits: in a single request of 8
+     * hits, and on the third page of a result read in pages of 3, after a first request of 4 hits which doesn't reach
+     * it
+     * ---------------------------------------------------------------
+     */
+
+    private static final String SHARD_FAILURE = "doc7 fails its shard";
+
+    private void indexDocumentsInTwoShards(String store) throws BackendException {
+        numberOfShards = 2;
+        //The index which creates the store's index has to know the shards
+        clopen();
+        indexDocuments(store);
+    }
+
+    private static RawQuery failingForDoc7(String store) {
+        final Map<String, Object> script = ImmutableMap.of("source",
+            "if (doc['" + TIME + "'].value == 7) { throw new IllegalArgumentException('" + SHARD_FAILURE + "'); } "
+                + "return 0;");
+        return new RawQuery(store, "text:\"Hello world\"",
+            ImmutableList.of(new IndexQuery.OrderEntry(TIME, Order.ASC, Long.class)),
+            new Parameter[]{new Parameter<>("script_fields",
+                ImmutableMap.of("failing", ImmutableMap.of("script", script)))});
+    }
+
+    //Elasticsearch 7 and later, told not to allow partial results, fail the single request and a page of a point in
+    //time themselves; JanusGraph fails a page of a scroll, and every answer of Elasticsearch 6, which isn't told
+    @ParameterizedTest
+    @EnumSource(ElasticSearchPagingMode.class)
+    public void shouldFailAResultWhichSomeShardsLeftOut(ElasticSearchPagingMode mode) throws Exception {
+        pagingMode = mode;
+        final String store = "vertex";
+        indexDocumentsInTwoShards(store);
+
+        assertFailedForTheShard(assertThrows(BackendException.class,
+            () -> tx.queryStream(failingForDoc7(store).setLimit(8)).count()));
+        try (Stream<RawQuery.Result<String>> hits = tx.queryStream(failingForDoc7(store))) {
+            assertFailedForTheShard(assertThrows(RuntimeException.class, hits::count));
         }
     }
 
-    //The cluster's accounting of its search contexts, summed over its nodes. scroll_total counts the scroll
-    //contexts a node has closed, so it grows only for a result read through a scroll
+    //Where partial results are allowed, the third page comes back with the hits of the other shard, fewer than a page,
+    //which ends the result, as it always did before
+    @ParameterizedTest
+    @EnumSource(ElasticSearchPagingMode.class)
+    public void shouldEndAResultEarlyWherePartialResultsAreAllowed(ElasticSearchPagingMode mode) throws Exception {
+        pagingMode = mode;
+        allowPartialResults = true;
+        final String store = "vertex";
+        indexDocumentsInTwoShards(store);
+
+        final List<String> read = tx.queryStream(failingForDoc7(store)).map(RawQuery.Result::getResult)
+            .collect(Collectors.toList());
+        assertEquals(Arrays.asList("doc0", "doc1", "doc2", "doc3", "doc4", "doc5"), read.subList(0, 6),
+            "hits read: " + read);
+        assertFalse(read.contains("doc7"), "hits read: " + read);
+        assertFalse(read.contains("doc9"), "hits read: " + read);
+    }
+
+    //A count of the same documents whose post_filter throws for doc7: a count fetches no hits, so the shard fails
+    //where it filters them
+    private static RawQuery countFailingForDoc7(String store) {
+        final Map<String, Object> script = ImmutableMap.of("source",
+            "if (doc['" + TIME + "'].value == 7) { throw new IllegalArgumentException('" + SHARD_FAILURE + "'); } "
+                + "return true;");
+        return new RawQuery(store, "text:\"Hello world\"", new Parameter[]{new Parameter<>("post_filter",
+            ImmutableMap.of("script", ImmutableMap.of("script", script)))});
+    }
+
+    //A count is a search for no hits which counts them all, which Elasticsearch 7 and later, told not to allow partial
+    //results, fail themselves; JanusGraph fails the count of Elasticsearch 6
+    @Test
+    public void shouldFailACountWhichSomeShardsLeftOut() throws Exception {
+        final String store = "vertex";
+        indexDocumentsInTwoShards(store);
+
+        assertFailedForTheShard(assertThrows(BackendException.class, () -> tx.totals(countFailingForDoc7(store))));
+    }
+
+    @Test
+    public void shouldCountWhatTheShardsWhichAnsweredFoundWherePartialResultsAreAllowed() throws Exception {
+        allowPartialResults = true;
+        final String store = "vertex";
+        indexDocumentsInTwoShards(store);
+
+        final long count = tx.totals(countFailingForDoc7(store));
+        assertTrue(count < INDEXED_DOCUMENTS, "count: " + count);
+    }
+
+    private static void assertFailedForTheShard(Throwable failure) {
+        assertTrue(Throwables.getCausalChain(failure).stream()
+                .anyMatch(cause -> String.valueOf(cause.getMessage()).contains(SHARD_FAILURE)),
+            () -> Throwables.getStackTraceAsString(failure));
+    }
+
+    private static final class SearchStats {
+        final long openContexts;
+        final long scrollTotal;
+        final long queryTotal;
+
+        SearchStats(long openContexts, long scrollTotal, long queryTotal) {
+            this.openContexts = openContexts;
+            this.scrollTotal = scrollTotal;
+            this.queryTotal = queryTotal;
+        }
+    }
+
+    //The cluster's accounting of its search contexts, summed over its nodes: open_contexts counts the contexts
+    //open right now, a point in time among them, and scroll_total the scroll contexts a node has closed, so it grows
+    //only for a result read through a scroll. query_total counts the queries the shards of the test's indexes ran,
+    //one for each request of an index of one shard, and none of the cluster's own
     private SearchStats searchStats() throws IOException {
+        long openContexts = 0;
+        long scrollTotal = 0;
         try (CloseableHttpResponse response = httpClient.execute(host, new HttpGet("_nodes/stats/indices/search"))) {
             final JsonNode nodes = objectMapper.readTree(EntityUtils.toString(response.getEntity())).get("nodes");
-            long openContexts = 0;
-            long scrollTotal = 0;
             for (JsonNode node : nodes) {
                 final JsonNode search = node.get("indices").get("search");
                 openContexts += search.get("open_contexts").asLong();
                 scrollTotal += search.get("scroll_total").asLong();
             }
-            return new SearchStats(openContexts, scrollTotal);
         }
+        try (CloseableHttpResponse response = httpClient.execute(host, new HttpGet("janusgraph*/_stats/search"))) {
+            final JsonNode all = objectMapper.readTree(EntityUtils.toString(response.getEntity())).get("_all");
+            final long queryTotal = all.get("total").get("search").get("query_total").asLong();
+            return new SearchStats(openContexts, scrollTotal, queryTotal);
+        }
+    }
+
+    //Whether the cluster can page with a point in time, by the version it reports, as the client decides it; asked
+    //once for the class, whose container is the one cluster of the run
+    private boolean clusterCanPageWithPointInTime() throws IOException {
+        synchronized (ElasticsearchIndexTest.class) {
+            if (canPageWithPointInTime == null) {
+                try (CloseableHttpResponse response = httpClient.execute(host, new HttpGet("/"))) {
+                    final JsonNode version = objectMapper.readTree(EntityUtils.toString(response.getEntity())).get("version");
+                    @SuppressWarnings("unchecked")
+                    final Map<String, Object> versionMap = objectMapper.convertValue(version, Map.class);
+                    canPageWithPointInTime = RestElasticSearchClient.clusterSupportsPointInTime(versionMap);
+                }
+            }
+            return canPageWithPointInTime;
+        }
+    }
+
+    //A result of a graph query read in pages holds a context while it is read, which the cluster counts among its
+    //open ones: a point in time on a cluster which has them, unless the mode scrolls, which the cluster counts as it
+    //closes no scroll, and a scroll context otherwise. On this index of one shard, read in pages of 3, the adaptive
+    //mode reads a graph query without a limit and without an order through a point in time
+    private void assertReadInPages(SearchStats before, SearchStats whileReading, SearchStats after,
+                                   ElasticSearchPagingMode mode) throws IOException {
+        assertTrue(whileReading.openContexts > before.openContexts, "no context was open while the pages were read");
+        if (mode != ElasticSearchPagingMode.SCROLL && clusterCanPageWithPointInTime()) {
+            assertEquals(before.scrollTotal, after.scrollTotal, "scroll contexts opened in mode " + mode);
+        } else {
+            assertTrue(after.scrollTotal > before.scrollTotal, "this result is read through a scroll");
+        }
+    }
+
+    //No scroll context was held; a point in time leaves no count behind once closed, so the caller's check that the
+    //open contexts are back at the baseline is what covers it
+    private static void assertNoPages(SearchStats before, SearchStats after) {
+        assertEquals(before.scrollTotal, after.scrollTotal, "scroll contexts opened");
     }
 
     //A context left behind by an earlier test expires after the scroll keep-alive (60 s), and the cluster reaps
@@ -1194,11 +1503,22 @@ public class ElasticsearchIndexTest extends IndexProviderTest {
         return stats;
     }
 
+    //When a node frees a scroll context it updates scroll_total and open_contexts one after the other, and it reports
+    //them one after the other, so the first reading which finds the contexts released may lack the scroll just freed.
+    //The next one, a round trip later, has it: two readings in a row within the bound are taken, the second returned
     private SearchStats awaitOpenSearchContexts(long atMostOpen, Duration atMost) throws Exception {
         final long deadline = System.currentTimeMillis() + atMost.toMillis();
+        boolean releasedBefore = false;
         SearchStats stats = searchStats();
-        while (stats.openContexts > atMostOpen && System.currentTimeMillis() < deadline) {
-            Thread.sleep(100);
+        while (!releasedBefore || stats.openContexts > atMostOpen) {
+            final boolean released = stats.openContexts <= atMostOpen;
+            if (!released) {
+                if (System.currentTimeMillis() >= deadline) {
+                    return stats;
+                }
+                Thread.sleep(100);
+            }
+            releasedBefore = released;
             stats = searchStats();
         }
         return stats;

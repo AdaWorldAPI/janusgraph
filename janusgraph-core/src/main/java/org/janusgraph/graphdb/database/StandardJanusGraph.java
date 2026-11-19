@@ -73,6 +73,7 @@ import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphLocalQueryOp
 import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphUnusedMultiQueryRemovalStrategy;
 import org.janusgraph.graphdb.util.MultiSliceQueriesGroupingUtil;
 import org.janusgraph.util.IDUtils;
+import org.janusgraph.util.stats.MetricManager;
 import org.janusgraph.graphdb.database.index.IndexInfoRetriever;
 import org.janusgraph.graphdb.database.index.IndexUpdate;
 import org.janusgraph.graphdb.database.util.IndexAppliesToFunction;
@@ -87,8 +88,11 @@ import org.janusgraph.graphdb.internal.InternalRelation;
 import org.janusgraph.graphdb.internal.InternalRelationType;
 import org.janusgraph.graphdb.internal.InternalVertex;
 import org.janusgraph.graphdb.internal.InternalVertexLabel;
+import org.janusgraph.graphdb.olap.computer.FulgoraGraphComputer;
 import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.index.IndexSelectionStrategy;
+import org.janusgraph.graphdb.query.vertex.BasicVertexCentricQueryUtil;
+import org.janusgraph.graphdb.query.vertex.MultiVertexCentricQueryBuilder;
 import org.janusgraph.graphdb.relations.EdgeDirection;
 import org.janusgraph.graphdb.tinkerpop.JanusGraphBlueprintsGraph;
 import org.janusgraph.graphdb.tinkerpop.JanusGraphFeatures;
@@ -107,6 +111,7 @@ import org.janusgraph.graphdb.transaction.TransactionConfiguration;
 import org.janusgraph.graphdb.types.CompositeIndexType;
 import org.janusgraph.graphdb.types.IndexType;
 import org.janusgraph.graphdb.types.MixedIndexType;
+import org.janusgraph.graphdb.types.indextype.IndexReferenceType;
 import org.janusgraph.graphdb.types.system.BaseKey;
 import org.janusgraph.graphdb.types.system.BaseLabel;
 import org.janusgraph.graphdb.types.system.BaseRelationType;
@@ -133,7 +138,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -142,6 +149,7 @@ import javax.script.ScriptException;
 
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_ACK_TIMEOUT;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_AUTO_CLOSE_STALE_INSTANCES;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_TX_CLOSE_WAIT_TIME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REGISTRATION_TIME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REPLACE_INSTANCE_IF_EXISTS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCRIPT_EVAL_ENABLED;
@@ -225,6 +233,11 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
 
     //Log
     private final ManagementLogger managementLogger;
+    //Runs the jobs of the graph's computers, created idle with the graph
+    private final ThreadPoolExecutor computerJobs;
+
+    //The graph's claims on the Metrics reporters which its configuration asks for
+    private final Map<MetricManager.GraphReporter, Object> metricsReporterClaims;
 
     //Shutdown hook
     private volatile ShutdownThread shutdownHook;
@@ -236,6 +249,12 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
     private final GremlinScriptEngine scriptEngine;
 
     private volatile boolean isOpen;
+    /**
+     * Whether the graph's close, through {@link #close()} or the shutdown hook, has begun. The graph is closed to the
+     * outside from then on: no transaction begins to open while it tears down, so a job or a repair which starts
+     * meanwhile fails at once instead of racing the backend's close.
+     */
+    private volatile boolean closing;
     private final AtomicLong txCounter;
 
     private final Set<StandardJanusGraphTx> openTransactions;
@@ -302,6 +321,13 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
         txCounter = new AtomicLong(0);
         openTransactions = Collections.newSetFromMap(new ConcurrentHashMap<>(100, 0.75f, 1));
 
+        //Before the instance registers, so that an invalid option fails the open without leaving the instance among the
+        //open ones; the executor starts without threads
+        computerJobs = FulgoraGraphComputer.newJobExecutor(configuration.getConfiguration());
+        Duration ackTimeout = configuration.getConfiguration().get(MANAGEMENT_ACK_TIMEOUT);
+        boolean autoCloseStaleInstances = configuration.getConfiguration().get(MANAGEMENT_AUTO_CLOSE_STALE_INSTANCES);
+        Duration txCloseWaitTime = configuration.getConfiguration().get(MANAGEMENT_TX_CLOSE_WAIT_TIME);
+
         //Register instance and ensure uniqueness
         String uniqueInstanceId = configuration.getUniqueGraphId();
         ModifiableConfiguration globalConfig = getGlobalSystemConfig(backend);
@@ -315,13 +341,21 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
         globalConfig.set(REGISTRATION_TIME, times.getTime(), uniqueInstanceId);
 
         Log managementLog = backend.getSystemMgmtLog();
-        Duration ackTimeout = configuration.getConfiguration().get(MANAGEMENT_ACK_TIMEOUT);
-        boolean autoCloseStaleInstances = configuration.getConfiguration().get(MANAGEMENT_AUTO_CLOSE_STALE_INSTANCES);
-        managementLogger = new ManagementLogger(this, managementLog, schemaCache, this.times, ackTimeout, autoCloseStaleInstances);
+        managementLogger = new ManagementLogger(this, managementLog, schemaCache, this.times, ackTimeout, autoCloseStaleInstances,
+            txCloseWaitTime);
         managementLog.registerReader(ReadMarker.fromNow(), managementLogger);
 
-        shutdownHook = new ShutdownThread(this);
-        Runtime.getRuntime().addShutdownHook(shutdownHook);
+        //Last, so that a graph which fails to open holds no claim; one which opens gives them back when it closes.
+        //A failure from here on, a reporter which can't start or a shutdown hook refused by a JVM which is shutting
+        //down, closes what the graph has opened, as no one else can
+        try {
+            metricsReporterClaims = configuration.startMetricsReporters();
+            shutdownHook = new ShutdownThread(this);
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+        } catch (RuntimeException | Error e) {
+            closeInternal();
+            throw e;
+        }
         log.debug("Installed shutdown hook {}", shutdownHook, new Throwable("Hook creation trace"));
     }
 
@@ -362,7 +396,7 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
 
     @Override
     public boolean isOpen() {
-        return isOpen;
+        return isOpen && !closing;
     }
 
     @Override
@@ -372,6 +406,7 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
 
     @Override
     public synchronized void close() throws JanusGraphException {
+        closing = true;
         try {
             closeInternal();
         } finally {
@@ -400,14 +435,21 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
             } catch (Exception e) {
                 log.warn("Unable to remove graph instance uniqueid {}", uniqueId, e);
             }
+            //The other instances stop waiting for this one's acknowledgements once it has left the open instances, so
+            //those which wait for the transactions closed below are dropped
+            try {
+                managementLogger.close();
+            } catch (Exception e) {
+                log.warn("Unable to close the management logger", e);
+            }
 
-            /* Assuming a couple of properties about openTransactions:
-             * 1. no concurrent modifications during graph shutdown
-             * 2. all contained txs are open
+            /* Other threads may close the open transactions meanwhile, such as the reader of the management log, which
+             * opens and closes transactions of its own until the backend closes the log below: only the rollback of a
+             * transaction which closes before this rolls it back is skipped, as its close does nothing to a closed one.
              */
             for (StandardJanusGraphTx otx : openTransactions) {
                 try {
-                    otx.rollback();
+                    otx.rollbackIfOpen();
                     otx.close();
                 } catch (RuntimeException e) {
                     // Catch and store these exceptions, but proceed wit the loop
@@ -419,6 +461,9 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
 
             super.close();
 
+            //Jobs which run or wait go on until they find the graph closed, jobs submitted from now on fail, and the
+            //threads end once idle
+            computerJobs.shutdown();
             IOUtils.closeQuietly(idAssigner);
             IOUtils.closeQuietly(backend);
             IOUtils.closeQuietly(queryCache);
@@ -428,6 +473,10 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
             }
         } finally {
             isOpen = false;
+            //null for a graph whose reporters failed to start, which released them itself
+            if (metricsReporterClaims != null) {
+                MetricManager.INSTANCE.releaseGraphReporters(metricsReporterClaims);
+            }
         }
 
         // Throw an exception if at least one transaction failed to close
@@ -472,6 +521,13 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
 
     public IndexSelectionStrategy getIndexSelector() {
         return indexSelector;
+    }
+
+    /**
+     * @return the executor which runs the jobs of the graph's computers
+     */
+    public Executor getComputerJobExecutor() {
+        return computerJobs;
     }
 
     public Backend getBackend() {
@@ -530,7 +586,7 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
     }
 
     public StandardJanusGraphTx newTransaction(final TransactionConfiguration configuration) {
-        if (!isOpen) ExceptionFactory.graphShutdown();
+        if (!isOpen()) ExceptionFactory.graphShutdown();
         try {
             StandardJanusGraphTx tx = new StandardJanusGraphTx(this, configuration);
             tx.setBackendTransaction(openBackendTransaction(tx));
@@ -958,9 +1014,64 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
     private void prepareCommitVertexIndexUpdates(final ListMultimap<InternalVertex, InternalRelation> mutatedProperties,
                                                  final StandardJanusGraphTx tx,
                                                  final List<IndexUpdate> indexUpdates) {
+        //The transaction's multi-query setting decides, as it does for a composite index lookup of several values,
+        //whether the labels are read together; a store without multi-key queries reads them one key at a time anyway
+        if (tx.getConfiguration().useMultiQuery() && backend.getStoreFeatures().hasMultiQuery()) {
+            loadLabelsCheckedByIndexes(mutatedProperties, tx, config.maxKeysPerRead());
+        }
         indexUpdates.addAll(mutatedProperties.keySet().parallelStream()
             .flatMap(v -> indexSerializer.getIndexUpdates(v, mutatedProperties.get(v), commitIndexAppliesToFilter, tx))
             .collect(Collectors.toList()));
+    }
+
+    /**
+     * Loads the labels which the index updates of the changed vertices check, with multi-queries of up to
+     * {@code query.batch.max-keys-per-read} vertices each. An index restricted to a vertex label applies to a vertex
+     * only if it has that label, and the check reads the label of an existing vertex which the transaction hasn't
+     * loaded - as one which changes vertices it looked up by id hasn't - with a query of its own. New vertices hold
+     * their labels, and removed ones are left to the check as before; a single vertex reads its label with a query of
+     * its own either way.
+     */
+    private static void loadLabelsCheckedByIndexes(
+        final ListMultimap<InternalVertex, InternalRelation> mutatedProperties, final StandardJanusGraphTx tx,
+        final int maxKeysPerRead) {
+        List<JanusGraphVertex> vertices = null;
+        for (InternalVertex vertex : mutatedProperties.keySet()) {
+            if (!vertex.isNew() && !vertex.isRemoved() && checksLabel(vertex, mutatedProperties.get(vertex))) {
+                if (vertices == null) {
+                    vertices = new ArrayList<>();
+                }
+                vertices.add(vertex);
+            }
+        }
+        if (vertices == null || vertices.size() < 2) {
+            return;
+        }
+        for (int from = 0; from < vertices.size(); from += maxKeysPerRead) {
+            final List<JanusGraphVertex> chunk =
+                vertices.subList(from, Math.min(vertices.size(), from + maxKeysPerRead));
+            //The query vertexLabel() makes, which then finds the label in the vertex's cache. A vertex whose label is
+            //loaded already is not read again
+            final MultiVertexCentricQueryBuilder labels = new MultiVertexCentricQueryBuilder(tx, chunk.size());
+            labels.addAllVertices(chunk);
+            BasicVertexCentricQueryUtil.withLabelVertices(labels).vertices();
+        }
+    }
+
+    //Whether an index of a changed property is one the vertex's label decides on: an index of vertices restricted to a
+    //label, which the index updates ask the vertex's label about
+    private static boolean checksLabel(final InternalVertex vertex, final List<InternalRelation> changedProperties) {
+        for (InternalRelation property : changedProperties) {
+            final InternalRelationType key = (InternalRelationType) property.getType();
+            for (IndexReferenceType indexRef : key.getKeyIndexesReferences()) {
+                final IndexType index = indexRef.getIndexType();
+                if (index.hasSchemaTypeConstraint()
+                    && IndexRecordUtil.indexAppliesToWithoutConstraints(index, vertex)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -1165,6 +1276,13 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
                 } catch (Throwable e) {
                     //[FAILURE] Primary persistence failed => abort and escalate exception, nothing should have been persisted
                     log.error("Could not commit transaction ["+transactionId+"] due to storage exception in system-commit",e);
+                    //The failed commit, which may have failed on the expected value of a lock, still holds the locks of
+                    //the schema transaction: in this JVM's lock mediator until they expire, and in the lock store
+                    try {
+                        schemaMutator.rollback();
+                    } catch (Throwable e2) {
+                        log.error("Could not roll-back the system-commit of transaction ["+transactionId+"]",e2);
+                    }
                     throw e;
                 }
             }
@@ -1363,6 +1481,7 @@ public class StandardJanusGraph extends JanusGraphBlueprintsGraph {
         public void start() {
             log.debug("Shutting down graph {} using shutdown hook {}", graph, this);
 
+            graph.closing = true;
             graph.closeInternal();
             graph.shutdownHook = null;
         }

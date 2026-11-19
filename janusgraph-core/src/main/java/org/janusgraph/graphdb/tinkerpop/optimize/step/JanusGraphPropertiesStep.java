@@ -123,7 +123,12 @@ public class JanusGraphPropertiesStep<E> extends PropertiesStep<E> implements Ha
         for (final HasContainer condition : hasContainers) {
             query.has(condition.getKey(), JanusGraphPredicateUtils.convert(condition.getBiPredicate()), condition.getValue());
         }
-        for (final OrderEntry order : orders) query.orderBy(order.key, order.order);
+        for (final OrderEntry order : orders) {
+            //TinkerPop's order().by(key) leaves out the elements which have no value of the key. The query takes this
+            //has(key) as a range without ends, which another condition on the key narrows
+            query.has(order.key);
+            query.orderBy(order.key, order.order);
+        }
         if (limit != BaseQuery.NO_LIMIT) query.limit(limit);
         return query;
     }
@@ -225,19 +230,9 @@ public class JanusGraphPropertiesStep<E> extends PropertiesStep<E> implements Ha
     }
 
     @Override
-    public void localOrderBy(TraversalParent parent, List<HasContainer> hasContainers, String key, Order order) {
-        throw new UnsupportedOperationException("LocalOrderBy is not supported for properties step.");
-    }
-
-    @Override
     public void setLimit(int low, int high) {
         Preconditions.checkArgument(low == 0, "Offset is not supported for properties step.");
         this.limit = high;
-    }
-
-    @Override
-    public void setLocalLimit(TraversalParent parent, List<HasContainer> hasContainers, int low, int high) {
-        throw new UnsupportedOperationException("LocalLimit is not supported for properties step.");
     }
 
     @Override
@@ -246,18 +241,8 @@ public class JanusGraphPropertiesStep<E> extends PropertiesStep<E> implements Ha
     }
 
     @Override
-    public int getLocalLowLimit(TraversalParent parent, List<HasContainer> hasContainers) {
-        throw new UnsupportedOperationException("getLocalLowLimit is not supported for properties step.");
-    }
-
-    @Override
     public int getHighLimit() {
         return this.limit;
-    }
-
-    @Override
-    public int getLocalHighLimit(TraversalParent parent, List<HasContainer> hasContainers) {
-        throw new UnsupportedOperationException("getLocalHighLimit is not supported for properties step.");
     }
 
     @Override

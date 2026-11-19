@@ -19,6 +19,7 @@ import org.apache.tinkerpop.shaded.jackson.annotation.JsonProperty;
 import org.janusgraph.diskstorage.es.ElasticSearchResponse;
 import org.janusgraph.diskstorage.indexing.RawQuery;
 
+import java.util.List;
 import java.util.stream.Stream;
 
 @JsonIgnoreProperties(ignoreUnknown=true)
@@ -31,6 +32,11 @@ public class RestSearchResponse extends ElasticSearchResponse {
 
     @JsonProperty("_scroll_id")
     private String scrollId;
+
+    private RestShardStatistics shards;
+
+    @JsonProperty("timed_out")
+    private boolean timedOut;
 
     @Override
     public long getTook() {
@@ -77,5 +83,38 @@ public class RestSearchResponse extends ElasticSearchResponse {
     @Override
     public void setScrollId(String scrollId) {
         this.scrollId = scrollId;
+    }
+
+    /**
+     * Whether a shard ran out of the search's time, and answered with the hits it found until then.
+     */
+    public boolean isTimedOut() {
+        return timedOut;
+    }
+
+    /**
+     * The shards the search ran on and which of them answered; null where the response doesn't tell.
+     */
+    public RestShardStatistics getShards() {
+        return shards;
+    }
+
+    @JsonProperty("_shards")
+    public void setShards(RestShardStatistics shards) {
+        this.shards = shards;
+        setTotalShards(shards == null ? 0 : shards.getTotal());
+    }
+
+    //The point in time is the parent's field; the annotation names it in the response
+    @Override
+    @JsonProperty("pit_id")
+    public void setPitId(String pitId) {
+        super.setPitId(pitId);
+    }
+
+    @Override
+    public List<Object> getLastSort() {
+        final List<RestSearchHit> hitList = hits.getHits();
+        return hitList.isEmpty() ? null : hitList.get(hitList.size() - 1).getSort();
     }
 }

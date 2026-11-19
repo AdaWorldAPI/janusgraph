@@ -151,8 +151,9 @@ mgmt.commit()
 ```
 
 !!! note
-    To enforce uniqueness against an eventually consistent storage
-    backend, the [consistency](../../advanced-topics/eventual-consistency.md) of the index must be
+    To enforce uniqueness against concurrent transactions, on an eventually
+    consistent storage backend or on BerkeleyDB, the
+    [consistency](../../advanced-topics/eventual-consistency.md) of the index must be
     explicitly set to enabling locking.
 
 ### Mixed Index
@@ -286,15 +287,96 @@ When using `order().by()` it is important to note that:
     For large result sets, this can be very expensive.
 
 -   Mixed indexes support ordering property keys with **SINGLE** cardinality
-    natively and efficiently. However,
+    natively and efficiently, by the keys which their backends can sort
+    by, as the next point describes. However,
     the property key used in the order().by() method must have been
     previously added to the mixed indexed for native result ordering
     support. This is important in cases where the the order().by() key
     is different from the query keys. If the property key is not part of
     the index, then sorting requires loading all results into memory.
 
+-   A mixed index sorts the results only by a key which its backend
+    can sort by. None of JanusGraph's index backends sorts by a string
+    key of **TEXT** mapping, which is the default for strings, as the
+    index holds the words of each string rather than the string.
+    Elasticsearch and OpenSearch don't sort by a key of **STRING** or
+    **TEXTSTRING** mapping with a custom `string-analyzer`, which
+    makes its whole strings a text field, and Lucene doesn't sort by a
+    UUID key. JanusGraph sorts the results of an order by such a key
+    itself, which requires loading all results into memory. To have
+    the index sort by a string key, map it as **STRING**, or as
+    **TEXTSTRING** to search its words too.
+
 -   Only Elasticsearch and Solr mixed index backends support ordering
     property keys with **LIST** cardinality natively and efficiently.
+    They order an element with several values of a key of **LIST** or
+    **SET** cardinality by the least of them in an ascending order and
+    by the greatest in a descending one. JanusGraph orders such
+    elements in the same way where it sorts the results of
+    `graph.query()` itself, as it does those of a composite index, or
+    of a Lucene index, which can't sort by such a key. A traversal's
+    `order().by()` of vertices by such a key is folded into
+    JanusGraph's query only where the graph has mixed index backends
+    and every one of them can sort by it; otherwise TinkerPop sorts the
+    vertices, and fails on one with several values of the key. An order
+    of edges, each of which holds one value of a key at most, is folded
+    in whatever the cardinality of the key.
+
+-   An element which has no value of a key the results are ordered by
+    is left out of them, as TinkerPop leaves out an element for which a
+    `by()` modulator has no value. A mixed index which answers the query
+    and holds the key skips such elements itself, and so does the slice
+    of a vertex-centric index which sorts the edges or properties of a
+    vertex by it. To keep them, order by a traversal which gives them a
+    value, such as `order().by(coalesce(values('age'), constant(0)))`,
+    which TinkerPop sorts in memory.
+
+-   A traversal ordered by a key, which has no condition that an index
+    answers, such as `g.V().order().by('age').limit(10)`, reads a mixed
+    index which holds every order key and answers every condition of the
+    traversal, as it reads it for
+    `g.V().has('age').order().by('age').limit(10)`: the index returns
+    the elements with a value of the keys, sorted by them, where
+    JanusGraph would otherwise read every element and sort them in
+    memory. A mixed index restricted to a label answers such an order of
+    the elements of that label, as in
+    `g.V().hasLabel('person').order().by('age')`. Where an index answers
+    a condition of the traversal, JanusGraph reads the indexes which
+    answer its conditions, as without the order. It reads every element
+    where no single mixed index answers the traversal whole, as for
+    `g.V().has('tag', 't').order().by('age')` with no index on `tag`, or
+    for `g.V().hasLabel('person').order().by('age')` with `age` in an
+    index which isn't restricted to persons: a single mixed index which
+    holds every order key and answers the traversal's conditions,
+    restricted to its label where it has one, answers it. JanusGraph
+    reads for such an order only an index whose backend sorts by every
+    order key as JanusGraph orders its values: none sorts by a string
+    mapped as `TEXT`, which is how mixed indexes map strings by default,
+    Elasticsearch and OpenSearch don't by a string with a
+    `string-analyzer`, and Lucene doesn't by a `UUID`, nor by a key of
+    **LIST** or **SET** cardinality. Nor does it read one which holds an
+    order key with custom parameters.
+
+-   Strings are ordered by their code points, as the mixed index
+    backends sort them, whether a mixed index or JanusGraph sorts the
+    results. The edges and properties of a vertex, which a
+    vertex-centric index sorts, are ordered by the UTF-16 code units
+    of their sort keys instead. The two orders differ only where, at
+    the first character in which two strings differ, one has a
+    character from U+10000 up, such as an emoji, and the other one
+    from U+E000 to U+FFFF.
+
+-   UUIDs are ordered by their string forms, as the Elasticsearch,
+    OpenSearch and Solr mixed index backends sort them and as the
+    storage backend holds them as sort keys, whether a mixed index or
+    JanusGraph sorts the results. An `order()` which JanusGraph
+    doesn't fold into its query, `min()` and `max()` compare them by
+    `UUID.compareTo` instead, as TinkerPop does, which differs: keyset
+    paging with such an order, such as
+    `has('uid', gt(last)).order().by('uid').by(T.id)`, can skip UUIDs,
+    so it needs an order which JanusGraph folds, such as
+    `order().by('uid')`. Lucene doesn't sort by a UUID key, so
+    JanusGraph sorts the results of such an order itself.
 
 ### Label Constraint
 

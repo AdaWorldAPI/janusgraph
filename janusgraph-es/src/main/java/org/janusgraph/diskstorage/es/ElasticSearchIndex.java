@@ -60,6 +60,7 @@ import org.janusgraph.diskstorage.util.DefaultTransaction;
 import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
 import org.janusgraph.graphdb.database.serialize.AttributeUtils;
 import org.janusgraph.graphdb.query.JanusGraphPredicate;
+import org.janusgraph.graphdb.query.Query;
 import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.condition.And;
 import org.janusgraph.graphdb.query.condition.Condition;
@@ -84,6 +85,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -104,6 +106,7 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GR
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_MAX_RESULT_SET_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NS;
+import static org.janusgraph.util.StringUtils.lowerCaseCodePoints;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -181,7 +184,86 @@ public class ElasticSearchIndex implements IndexProvider {
 
     public static final ConfigOption<Integer> ES_SCROLL_KEEP_ALIVE =
             new ConfigOption<>(ELASTICSEARCH_NS, "scroll-keep-alive",
-            "How long (in seconds) elasticsearch should keep alive the scroll context.", ConfigOption.Type.GLOBAL_OFFLINE, 60);
+            "How long (in seconds) elasticsearch should keep alive the scroll context, or the point in time, of a result " +
+                "which is read in pages.", ConfigOption.Type.GLOBAL_OFFLINE, 60);
+
+    public static final ConfigOption<String> PAGING_MODE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "paging-mode",
+            String.format("How a result larger than a page (`index.[X].max-result-set-size`) is read.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Every result is read through a scroll.<br>" +
+                "- `%s` - Every result is read through a point in time and `search_after`. A point in time isn't " +
+                "counted against `search.max_open_scroll_context`, its pages don't count the total number of hits, " +
+                "and a page which is sent again after a failure comes back the same, where a scroll may skip it. But " +
+                "it reads the pages more slowly than a scroll unless they come in the order of the index, on an " +
+                "index of one shard and in pages of up to about 500 hits; the Elasticsearch page of the " +
+                "documentation has the measurements.<br>" +
+                "- `%s` - A result is read through a point in time where that is about as fast as a scroll or " +
+                "faster: the result of a graph query without a limit and without an order, whose pages come in the " +
+                "order of the index, on an index of at most `%s` shards and with pages of at most `%s` hits. A graph " +
+                "query is limited where its traversal limits it, where `query.smart-limit` is on, and where " +
+                "`query.hard-max-limit` is lowered. Every other result is read through a scroll.<br>" +
+                "A cluster which reports an Elasticsearch version older than 7.12 scrolls in every mode, as does one " +
+                "whose version isn't asked for (`major-version` 7) or can't be, and OpenSearch, whose point in time " +
+                "lacks the tiebreaker `search_after` needs.",
+                ElasticSearchPagingMode.SCROLL.getConfigName(), ElasticSearchPagingMode.POINT_IN_TIME.getConfigName(),
+                ElasticSearchPagingMode.ADAPTIVE_POINT_IN_TIME.getConfigName(), "adaptive-point-in-time-max-shards",
+                "adaptive-point-in-time-max-page-size"),
+            ConfigOption.Type.MASKABLE, ElasticSearchPagingMode.ADAPTIVE_POINT_IN_TIME.getConfigName(),
+            mode -> ElasticSearchPagingMode.fromConfigName(mode) != null);
+
+    public static final ConfigOption<Integer> ADAPTIVE_POINT_IN_TIME_MAX_SHARDS =
+            new ConfigOption<>(ELASTICSEARCH_NS, "adaptive-point-in-time-max-shards",
+            "The most shards an index may have, as the first request of a result reports them, for `paging-mode` " +
+                "`adaptive_point_in_time` to read the result through a point in time. 1 is the recommended value: " +
+                "on Elasticsearch 9.5.4, reading the pages of an index of two or three shards through a point in " +
+                "time took 4% to 37% longer than through a scroll, even in the order of the index. Raise it only " +
+                "where a point in time keeps up with a scroll on indexes of more shards.",
+            ConfigOption.Type.MASKABLE, 1, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> ADAPTIVE_POINT_IN_TIME_MAX_PAGE_SIZE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "adaptive-point-in-time-max-page-size",
+            "The largest page size (`index.[X].max-result-set-size`) with which `paging-mode` " +
+                "`adaptive_point_in_time` reads a result through a point in time. 500 is the recommended value: on " +
+                "Elasticsearch 9.5.4, a point in time read the pages of an index of one shard in the order of the " +
+                "index about as fast as a scroll or faster with pages of up to 500 hits, and more slowly with pages " +
+                "of 1,000. Lower it where a point in time falls behind a scroll with smaller pages, raise it where " +
+                "it keeps up with larger ones.",
+            ConfigOption.Type.MASKABLE, 500, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> LIMITED_RESULT_MAX_PAGE_SIZE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "limited-result-max-page-size",
+            "The largest page of an index query with a limit which is too large for a single request, one whose " +
+                "offset and limit together go beyond 10,000 hits. Such a result is read from its first hit on in as " +
+                "few pages as this allows, all of one size, which split the hits up to the end of its limit evenly, " +
+                "but never in pages smaller than `index.[X].max-result-set-size`, the page size of a query without " +
+                "a limit. Larger pages take fewer round trips and a larger response each. `scroll-keep-alive` must " +
+                "cover consuming one page: each page renews it, and a consumer which takes longer over a page than " +
+                "the keep-alive loses the scroll context or point in time, and the next page fails, unless " +
+                "`allow-partial-results` lets it come back with the hits of the shards which kept theirs. A slower " +
+                "consumer can lower this option in its local configuration, as it is MASKABLE, or raise " +
+                "`scroll-keep-alive`, which is GLOBAL_OFFLINE. 10,000 is the practical ceiling: Elasticsearch " +
+                "accepts at most `index.max_result_window` hits in a page of a scroll or of a point in time, 10,000 " +
+                "by default, which JanusGraph lifts only on the indexes it creates; on those, the time a consumer " +
+                "has for each hit bounds it. A value no larger than `max-result-set-size` reads such results in " +
+                "pages of `max-result-set-size`, as earlier versions did.",
+            ConfigOption.Type.MASKABLE, 250, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Boolean> ALLOW_PARTIAL_RESULTS =
+            new ConfigOption<>(ELASTICSEARCH_NS, "allow-partial-results",
+            "Whether an index query, count or aggregation uses the results of the shards which answered where other " +
+                "shards of the index failed, weren't available or ran out of time: where the search context of a " +
+                "scroll expired on some nodes but not on others, for example, or where a search ran out of its " +
+                "`timeout`, set as a parameter of a direct index query or by the cluster's " +
+                "`search.default_search_timeout`. Elasticsearch answers with such partial results unless it is told " +
+                "otherwise. By default, JanusGraph tells it otherwise, with `allow_partial_search_results=false` on " +
+                "the searches and counts it sends to Elasticsearch 7 and later and to OpenSearch, and fails every " +
+                "answer which lacks the results of some shards, with their failures in the error, the later pages " +
+                "of a scroll among them, which take no such parameter. JanusGraph doesn't reattempt a search which " +
+                "ran out of time, though the Elasticsearch client still sends a request answered with 502, 503 or " +
+                "504 to its next host, and Elasticsearch 8.15.3 answers a time-out with 504. Set this to true to " +
+                "use partial results, as earlier versions did.",
+            ConfigOption.Type.MASKABLE, false);
 
     public static final ConfigNamespace ES_INGEST_PIPELINES =
             new ConfigNamespace(ELASTICSEARCH_NS, "ingest-pipeline", "Ingest pipeline applicable to a store of an index.");
@@ -398,8 +480,12 @@ public class ElasticSearchIndex implements IndexProvider {
                 "and leaving the mixed index inconsistent with the graph; a bulk request qualifies only when every " +
                 "item which failed did so with one of these codes. Resubmitting a whole mutation resends items " +
                 "which already succeeded, which duplicates the values of LIST cardinality properties - the client " +
-                "level attempts do not. Queries get the client level attempts only. Set to an empty list to " +
-                "consider every status code permanent, which disables both levels. E.g. \"429,502,503,504\"",
+                "level attempts do not. A query, count or aggregation is likewise reattempted as a whole for up " +
+                "to `storage.read-time`, but not the later pages of a result read in pages, which get the client " +
+                "level attempts only. JanusGraph doesn't reattempt a search which ran out of its time, whatever its " +
+                "status, though the Elasticsearch client still sends a request answered with 502, 503 or 504 to its " +
+                "next host. Set to an empty list to consider every status code permanent, which disables both " +
+                "levels. E.g. \"429,502,503,504\"",
             ConfigOption.Type.LOCAL, String[].class, new String[]{"429", "502", "503", "504"},
             ElasticSearchIndex::isStatusCodeList);
 
@@ -545,7 +631,14 @@ public class ElasticSearchIndex implements IndexProvider {
         checkClusterHealth(config.get(HEALTH_REQUEST_TIMEOUT));
 
         compat = ESCompatUtils.acquireCompatForVersion(client.getMajorVersion());
-        searcher = new ElasticSearchSearcher(client, compat, batchSize);
+        //The option's verification rejects any other value as the configuration is read; this names it all the same
+        final String pagingModeName = config.get(PAGING_MODE);
+        final ElasticSearchPagingMode pagingMode = ElasticSearchPagingMode.fromConfigName(pagingModeName);
+        Preconditions.checkArgument(pagingMode != null, "Unknown %s: %s", PAGING_MODE.toStringWithoutRoot(),
+            pagingModeName);
+        searcher = new ElasticSearchSearcher(client, compat, batchSize, config.get(LIMITED_RESULT_MAX_PAGE_SIZE),
+            pagingMode, config.get(ADAPTIVE_POINT_IN_TIME_MAX_SHARDS),
+            config.get(ADAPTIVE_POINT_IN_TIME_MAX_PAGE_SIZE));
 
         indexSetting = ElasticSearchSetup.getSettingsFromJanusGraphConf(config);
 
@@ -843,7 +936,7 @@ public class ElasticSearchIndex implements IndexProvider {
                 return cause;
             } else if (cause instanceof ResponseException) {
                 final int statusCode = ((ResponseException) cause).getResponse().getStatusLine().getStatusCode();
-                if (retryErrorCodes.contains(statusCode)) {
+                if (retryErrorCodes.contains(statusCode) && !TransientFailures.isSearchTimeout(cause)) {
                     return cause;
                 }
             } else if (cause instanceof ElasticSearchBulkFailureException) {
@@ -902,7 +995,7 @@ public class ElasticSearchIndex implements IndexProvider {
     }
 
     private String generateIndexStoreName(String store){
-        return indexName + INDEX_NAME_SEPARATOR + store.toLowerCase();
+        return indexName + INDEX_NAME_SEPARATOR + store.toLowerCase(Locale.ROOT);
     }
 
     private String getIndexStoreName(String store) {
@@ -1368,23 +1461,47 @@ public class ElasticSearchIndex implements IndexProvider {
         }
     }
 
+    //A decimal comparison finds what it finds in memory, as Cmp.test has it. Elasticsearch holds finite values only, as
+    //it rejects a document with an infinity or NaN, and some versions fail a query with one, or read a range up to NaN
+    //as one which reaches every value. Every finite value compares with an infinity or NaN as 0.0 does, a value of a
+    //Float key too, as Cmp compares numbers by their doubleValue and no finite value equals such a bound: a comparison
+    //with one finds every value or none
     private Map<String, Object> getRelationFromCmp(final Cmp cmp, String key, final Object value) {
+        if (value instanceof Number && !Double.isFinite(((Number) value).doubleValue())) {
+            return cmp.test(0.0, value) ? compat.exists(key) : compat.matchNone();
+        }
         switch (cmp) {
             case EQUAL:
                 return compat.term(key, value);
             case NOT_EQUAL:
                 return compat.boolMust(ImmutableList.of(compat.exists(key), compat.boolMustNot(compat.term(key, value))));
             case LESS_THAN:
-                return compat.lt(key, value);
+                return compat.lt(key, lowerZero(value));
             case LESS_THAN_EQUAL:
-                return compat.lte(key, value);
+                return compat.lte(key, upperZero(value));
             case GREATER_THAN:
-                return compat.gt(key, value);
+                return compat.gt(key, upperZero(value));
             case GREATER_THAN_EQUAL:
-                return compat.gte(key, value);
+                return compat.gte(key, lowerZero(value));
             default:
                 throw new IllegalArgumentException("Unexpected relation: " + cmp);
         }
+    }
+
+    //Elasticsearch orders -0.0 below 0.0, while a comparison, as AttributeUtils.compare, holds them equal, and only
+    //equality, as Double.equals, tells them apart. A comparison's decimal bound at either zero spans both: an inclusive
+    //bound moves to the zero on its far side and a strict one to the zero on its near side, beyond which
+    //Elasticsearch's neighbour skips both
+    private static Object lowerZero(Object bound) {
+        return isDecimalZero(bound) ? -0.0 : bound;
+    }
+
+    private static Object upperZero(Object bound) {
+        return isDecimalZero(bound) ? 0.0 : bound;
+    }
+
+    private static boolean isDecimalZero(Object value) {
+        return (value instanceof Double || value instanceof Float) && ((Number) value).doubleValue() == 0.0;
     }
 
     public Map<String,Object> getFilter(Condition<?> condition, KeyInformation.StoreRetriever information) {
@@ -1407,7 +1524,9 @@ public class ElasticSearchIndex implements IndexProvider {
                     throw new IllegalArgumentException("Text mapped string values only support CONTAINS and Compare queries and not: " + predicate);
                 if (mapping==Mapping.STRING && Text.HAS_CONTAINS.contains(predicate))
                     throw new IllegalArgumentException("String mapped string values do not support CONTAINS queries: " + predicate);
-                if (mapping==Mapping.TEXTSTRING && !(Text.HAS_CONTAINS.contains(predicate) || (predicate instanceof Cmp && predicate != Cmp.EQUAL))) {
+                //A TEXTSTRING key holds the string whole in its dual field, which it is sorted by, and its words in its
+                //text field: the predicates on words, as CONTAINS is, read the text field, and the others the string
+                if (mapping==Mapping.TEXTSTRING && !Text.HAS_CONTAINS.contains(predicate)) {
                     fieldName = getDualMappingName(key);
                 } else {
                     fieldName = key;
@@ -1425,20 +1544,20 @@ public class ElasticSearchIndex implements IndexProvider {
                         compat.boolMustNot(compat.matchPhrase(fieldName, value))));
                 } else if (predicate == Text.CONTAINS_PREFIX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.prefix(fieldName, value);
                 } else if (predicate == Text.NOT_CONTAINS_PREFIX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.boolMust(ImmutableList.of(compat.exists(fieldName),
                         compat.boolMustNot(compat.prefix(fieldName, value))));
                 } else if (predicate == Text.CONTAINS_REGEX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.regexp(fieldName, value);
                 } else if (predicate == Text.NOT_CONTAINS_REGEX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.boolMust(ImmutableList.of(compat.exists(fieldName),
                         compat.boolMustNot(compat.regexp(fieldName, value))));
                 } else if (predicate == Text.PREFIX) {
@@ -1608,15 +1727,27 @@ public class ElasticSearchIndex implements IndexProvider {
         }
     }
 
+    //The unmapped_type of a sort by a key of the data type: the type which Elasticsearch takes the field for in an
+    //index without a mapping of it, where no document holds a value of it. It is the type which pushMapping maps a
+    //sortable field of the data type to, but keyword for any string key, which pushMapping maps to text where it has a
+    //string analyzer: with no values to sort, any type which Elasticsearch can sort by will do. Elasticsearch rejects a
+    //sort whose unmapped_type is null, and from version 8 on, where the index has no mapping of the field, one whose
+    //unmapped_type is "string", which versions 6 and 7 read as keyword with a deprecation warning
     private String convertToEsDataType(Class<?> dataType, Mapping mapping) {
         if(String.class.isAssignableFrom(dataType)) {
-            return "string";
+            return "keyword";
         }
         else if (Integer.class.isAssignableFrom(dataType)) {
             return "integer";
         }
         else if (Long.class.isAssignableFrom(dataType)) {
             return "long";
+        }
+        else if (Short.class.isAssignableFrom(dataType)) {
+            return "short";
+        }
+        else if (Byte.class.isAssignableFrom(dataType)) {
+            return "byte";
         }
         else if (Float.class.isAssignableFrom(dataType)) {
             return "float";
@@ -1636,15 +1767,23 @@ public class ElasticSearchIndex implements IndexProvider {
         else if (Geoshape.class.isAssignableFrom(dataType)) {
             return mapping == Mapping.DEFAULT ? "geo_point" : "geo_shape";
         }
+        else if (UUID.class.isAssignableFrom(dataType)) {
+            //Mapped as a keyword, so sorted by its string form
+            return "keyword";
+        }
 
         return null;
     }
 
     private long runCountQuery(RawQuery query) throws BackendException{
+        if (countsNothing(query)) {
+            return 0;
+        }
         try {
             long countTotal = client.countTotal(
                 getIndexStoreName(query.getStore()),
-                compat.createRequestBody(compat.queryString(query.getQuery()), query.getParameters()));
+                compat.createRequestBody(compat.queryString(query.getQuery()), query.getParameters()),
+                countBound(query.getOffset(), query));
             return QueryUtil.applyOffsetWithQueryLimitAfterCount(countTotal, query.getOffset(), query);
         } catch (final IOException | UncheckedIOException e) {
             //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
@@ -1660,7 +1799,7 @@ public class ElasticSearchIndex implements IndexProvider {
             final Mapping mapping = Mapping.getMapping(information);
             final Class<?> datatype = orderEntry.getDatatype();
             final String key = hasDualStringMapping(information) ? getDualMappingName(orderEntry.getKey()) : orderEntry.getKey();
-            sr.addSort(key, order.toLowerCase(), convertToEsDataType(datatype, mapping));
+            sr.addSort(key, order.toLowerCase(Locale.ROOT), convertToEsDataType(datatype, mapping));
         }
     }
 
@@ -1672,6 +1811,8 @@ public class ElasticSearchIndex implements IndexProvider {
         if (!query.getOrders().isEmpty()) {
             addOrderToQuery(information, sr, query.getOrders(), query.getStore());
         }
+        //The hits of a raw query carry their scores, and come in their order
+        sr.setRelevanceOrdered(true);
         sr.setDisableSourceRetrieval(true);
         try {
             log.debug("Executing query [{}]", query.getQuery());
@@ -1692,7 +1833,7 @@ public class ElasticSearchIndex implements IndexProvider {
             final String indexName = getIndexStoreName(query.getStore());
             final Map<String,Object> requestData = compat.createRequestBody(sr, null);
             switch (aggregation.getType()) {
-                case COUNT: return QueryUtil.applyQueryLimitAfterCount(client.countTotal(indexName, requestData), query);
+                case COUNT: return countsNothing(query) ? 0L : QueryUtil.applyQueryLimitAfterCount(client.countTotal(indexName, requestData, countBound(0, query)), query);
                 case MIN: return client.min(indexName, requestData, aggregation.getFieldName(), aggregation.getDataType());
                 case MAX: return client.max(indexName, requestData, aggregation.getFieldName(), aggregation.getDataType());
                 case AVG: return client.avg(indexName, requestData, aggregation.getFieldName());
@@ -1703,6 +1844,29 @@ public class ElasticSearchIndex implements IndexProvider {
             //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
             throw convert(e);
         }
+    }
+
+    /**
+     * Whether a count of the given query is 0 before any match is counted: with a limit of 0, which the count would be
+     * clamped to, there is nothing to ask Elasticsearch.
+     */
+    @VisibleForTesting
+    static boolean countsNothing(Query query) {
+        return query.hasLimit() && query.getLimit() <= 0;
+    }
+
+    /**
+     * The most matches a count of the given query has to find: its offset and limit, which the count is clamped to
+     * afterwards, or 0, no bound, without a limit, and also where the two don't fit an int, as a bound no count
+     * reaches would only keep Elasticsearch from answering a count from its statistics.
+     */
+    @VisibleForTesting
+    static int countBound(int offset, Query query) {
+        if (!query.hasLimit()) {
+            return 0;
+        }
+        final long bound = (long) offset + query.getLimit();
+        return bound < Integer.MAX_VALUE ? (int) bound : 0;
     }
 
     @Override
@@ -1775,6 +1939,20 @@ public class ElasticSearchIndex implements IndexProvider {
             return mapping == Mapping.DEFAULT || mapping == Mapping.BKD || mapping == Mapping.PREFIX_TREE && supportsGeoShapePrefixTree;
         }
         return false;
+    }
+
+    //Elasticsearch doesn't sort by a text field, to which pushMapping maps a TEXT or DEFAULT string key, a STRING key
+    //with a custom string analyzer, and the dual field of a TEXTSTRING key with one, by which addOrderToQuery sorts it
+    @Override
+    public boolean supportsOrdering(KeyInformation information) {
+        final Class<?> dataType = information.getDataType();
+        if (AttributeUtils.isString(dataType)) {
+            final Mapping mapping = getStringMapping(information);
+            return (mapping == Mapping.STRING || mapping == Mapping.TEXTSTRING)
+                && !ParameterType.STRING_ANALYZER.hasParameter(information.getParameters());
+        }
+        return Number.class.isAssignableFrom(dataType) || dataType == Date.class || dataType == Instant.class
+            || dataType == Boolean.class || dataType == UUID.class;
     }
 
     @Override

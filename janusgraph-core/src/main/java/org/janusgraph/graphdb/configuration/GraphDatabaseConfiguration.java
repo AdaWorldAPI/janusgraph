@@ -80,6 +80,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -223,6 +224,31 @@ public class GraphDatabaseConfiguration {
             "How the graph computer should return the computed results. 'persist' for writing them into the graph, " +
                     "'localtx' for writing them into the local transaction, or 'none' (default)", ConfigOption.Type.MASKABLE, "none");
 
+    public static final ConfigOption<Integer> COMPUTER_JOB_POOL_SIZE = new ConfigOption<>(COMPUTER_NS,"job-pool-size",
+            "The number of threads which run the jobs of the graph's computers, a job on each, while further jobs wait. " +
+                "If not set, which is recommended, as many as the JVM's common pool has threads (by default the number of " +
+                "processors less one, at least one), or a thread per job where that is a single thread. Set it to run " +
+                "fewer of the graph's jobs at once, or more.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> COMPUTER_JOB_KEEP_ALIVE_TIME = new ConfigOption<>(COMPUTER_NS,"job-keep-alive-time",
+            "How long a thread which runs the jobs of the graph's computers waits for the next job before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
+
+    public static final ConfigOption<Duration> COMPUTER_TASK_PROGRESS_TIMEOUT = new ConfigOption<>(COMPUTER_NS,
+            "task-progress-timeout",
+            "How long a job waits without any of its tasks ending in the phases which run on a pool of workers " +
+                "after its scans: the execution of the vertex program on the partitioned vertices, the reduce stage " +
+                "of a map-reduce, and the writing of the computed properties into the graph. Then the job " +
+                "interrupts the running tasks, drops the others and fails, rather than wait for tasks which may " +
+                "never end. While tasks keep ending, the job waits as long as they take. A task is one vertex, key " +
+                "or batch of writes, which normally ends within seconds; the default also lets a backend retry the " +
+                "writes of a batch for several times storage.write-time. As for every duration, a value without a " +
+                "unit is in milliseconds: half an hour is '30 minutes' or 1800000. A value of about 292 years or " +
+                "more, such as 9223372036854775807, waits indefinitely.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(10), d -> d != null && d.toMillis() > 0);
+
 
     // ################ Transaction #######################
     // ################################################
@@ -263,6 +289,18 @@ public class GraphDatabaseConfiguration {
     public static final ConfigOption<Boolean> VERBOSE_TX_RECOVERY = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"verbose",
             "Whether the transaction recovery system should print recovered transactions and other activity to standard output",
             ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<Integer> TX_RECOVERY_REPAIR_POOL_SIZE = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"repair-pool-size",
+            "The number of threads which repair the transactions the recovery finds incomplete: a repair reads the " +
+                "storage backend and writes the index backends and the user log. If not set, which is recommended, as many " +
+                "as the JVM's common pool has threads (by default the number of processors less one, at least one). As the " +
+                "repairs mostly wait for I/O, more threads catch up faster with many incomplete transactions.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> TX_RECOVERY_REPAIR_KEEP_ALIVE_TIME = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"repair-keep-alive-time",
+            "How long a thread which repairs incomplete transactions waits for the next repair before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
 
     // ################ Query Processing #######################
     // ################################################
@@ -329,10 +367,13 @@ public class GraphDatabaseConfiguration {
 
     public static final ConfigOption<Boolean> USE_MULTIQUERY = new ConfigOption<>(QUERY_BATCH_NS,"enabled",
         "Whether traversal queries should be batched when executed against the storage backend. This can lead to significant " +
-            "performance improvement if there is a non-trivial latency to the backend. It also lets a composite index lookup of " +
-            "several values, such as `has(key, within(values))`, read their index rows together on a storage backend with " +
-            "multi-key queries. If `false` then all other configuration options under `" +
-            QUERY_BATCH_NS.toStringWithoutRoot()+"` namespace are ignored.",
+            "performance improvement if there is a non-trivial latency to the backend. It also lets a composite " +
+            "index lookup of several values, such as `has(key, within(values))`, read their index rows together, and " +
+            "a commit read the labels which the index updates of its vertices check together, on a storage backend " +
+            "with multi-key queries. It is the default of each transaction's own multi-query setting, which " +
+            "`TransactionBuilder.multiQuery(boolean)` can change for a transaction; where that setting is `false`, " +
+            "all other configuration options under `" + QUERY_BATCH_NS.toStringWithoutRoot() + "` namespace are " +
+            "ignored.",
         ConfigOption.Type.MASKABLE, true);
 
     public static final ConfigOption<Boolean> LIMITED_BATCH = new ConfigOption<>(QUERY_BATCH_NS,"limited",
@@ -348,6 +389,16 @@ public class GraphDatabaseConfiguration {
             "barrier step either. This option is used only when `"+LIMITED_BATCH.toStringWithoutRoot()+"` is `true`. " +
             "Notice, value `"+Integer.MAX_VALUE+"` is considered to be unlimited.",
         ConfigOption.Type.MASKABLE, 2500);
+
+    public static final ConfigOption<Integer> MAX_KEYS_PER_READ = new ConfigOption<>(QUERY_BATCH_NS,"max-keys-per-read",
+        "The most keys which one read of several keys at once asks the storage backend for, where JanusGraph splits " +
+            "such a read on its own: a composite index lookup of several values, such as `has(key, within(values))`, " +
+            "reading their index rows, and a commit reading the labels which the index updates of its vertices " +
+            "check. A read which fails temporarily is reattempted whole, and its results are held all at once, so " +
+            "a smaller value makes smaller reads, and more of them. The default is the recommended value. Used only " +
+            "where reads are batched (`" + USE_MULTIQUERY.toStringWithoutRoot() + "`, unless a transaction sets its " +
+            "own multi-query setting), on a storage backend with multi-key queries.",
+        ConfigOption.Type.MASKABLE, 1000, ConfigOption.positiveInt());
 
     public static final ConfigOption<String> REPEAT_STEP_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"repeat-step-mode",
         String.format("Batch mode for `repeat` step. Used only when "+USE_MULTIQUERY.toStringWithoutRoot()+" is `true`.<br>" +
@@ -1035,6 +1086,20 @@ public class GraphDatabaseConfiguration {
             "This helps avoid transaction commits waiting on ID reservation even if the block size is relatively small.",
             ConfigOption.Type.MASKABLE, 0.3);
 
+    public static final ConfigOption<Integer> IDS_RENEW_POOL_SIZE = new ConfigOption<>(IDS_NS,"renew-pool-size",
+            "The number of threads which reserve new ID blocks for the instance's ID pools, each pool one block at a " +
+                "time. If not set, which is recommended, as many as the instance can have pools: three for each partition " +
+                "of cluster.max-partitions (vertices, vertices of unmodifiable labels and relations), one for schema ids " +
+                "and one for partitioned vertices, so that every pool can reserve a block at once. The threads end after " +
+                "ids.renew-keep-alive-time without a reservation. Set it to bound them, at the price of reservations " +
+                "queueing when more pools need blocks at once.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> IDS_RENEW_KEEP_ALIVE_TIME = new ConfigOption<>(IDS_NS,"renew-keep-alive-time",
+            "How long a thread which reserves ID blocks waits for the next reservation before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
+
     // ################ IDAUTHORITY ###################
     // ################################################
 
@@ -1152,7 +1217,11 @@ public class GraphDatabaseConfiguration {
 
     public static final ConfigOption<Integer> INDEX_MAX_RESULT_SET_SIZE = new ConfigOption<>(INDEX_NS, "max-result-set-size",
             "Maximum number of results to return if no limit is specified. For index backends that support scrolling, it represents " +
-                    "the number of results in each batch",
+                    "the number of results in each batch, except that Elasticsearch reads a query with a limit " +
+                    "too large for a single request in batches of up to " +
+                    "`index.[X].elasticsearch.limited-result-max-page-size` results, and Solr reads every batch " +
+                    "after the first one twice as large as the one before, up to " +
+                    "`index.[X].solr.max-page-size` results, though never smaller than this",
             ConfigOption.Type.MASKABLE, 50);
 
     public static final ConfigOption<Boolean> INDEX_NAME_MAPPING = new ConfigOption<>(INDEX_NS,"map-name",
@@ -1232,6 +1301,16 @@ public class GraphDatabaseConfiguration {
             "Maximum time to wait for an instance to acknowledge a schema change before treating it as stale. " +
                 "Only effective when graph.management-auto-close-stale-instances is enabled.",
             ConfigOption.Type.MASKABLE, Duration.ofSeconds(120));
+
+    public static final ConfigOption<Duration> MANAGEMENT_TX_CLOSE_WAIT_TIME = new ConfigOption<>(GRAPH_NS,
+            "management-tx-close-wait-time",
+            "Maximum time an instance waits for the transactions which were open when a schema change reached it to " +
+                "close, before it acknowledges the change. If they are still open by then, it logs a stale transaction " +
+                "alert and doesn't acknowledge the change. The default is recommended; raise it if transactions stay open " +
+                "longer and schema changes should wait for them. With graph.management-auto-close-stale-instances, an " +
+                "instance which hasn't acknowledged a change within graph.management-ack-timeout is force-closed, whether " +
+                "it still waits or has given up, so a value above that timeout gains nothing.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofSeconds(60), d -> d != null && !d.isNegative());
 
     public static final String MANAGEMENT_LOG = "janusgraph";
     public static final String TRANSACTION_LOG = "tx";
@@ -1554,6 +1633,7 @@ public class GraphDatabaseConfiguration {
     private boolean adjustQueryLimit;
     private int hardMaxLimit;
     private Boolean useMultiQuery;
+    private int maxKeysPerRead;
     private boolean limitedBatch;
     private int limitedBatchSize;
     private MultiQueryStrategyRepeatStepMode repeatStepMode;
@@ -1578,6 +1658,9 @@ public class GraphDatabaseConfiguration {
     private IndicesActivationType schemaInitJsonIndicesActivationType;
     private boolean schemaInitJsonForceCloseOtherInstances;
     private long schemaInitJsonIndexStatusAwaitTimeout;
+
+    //The Metrics reporters which this configuration asks for, with what starts each
+    private final Map<MetricManager.GraphReporter, Runnable> metricsReporters = new EnumMap<>(MetricManager.GraphReporter.class);
 
     private StoreFeatures storeFeatures = null;
 
@@ -1636,6 +1719,30 @@ public class GraphDatabaseConfiguration {
         return metricsPrefix;
     }
 
+    /**
+     * Starts the Metrics reporters which this configuration asks for, unless reporters of their kinds run already, for
+     * a graph which opens with it. The graph gives back the claims it gets with
+     * {@link MetricManager#releaseGraphReporters(Map)} when it closes, which stops the reporters that graphs started
+     * once no graph which uses them is open.
+     *
+     * @return the graph's claims on the reporters, by their kind
+     */
+    public Map<MetricManager.GraphReporter, Object> startMetricsReporters() {
+        final Map<MetricManager.GraphReporter, Object> claims = new EnumMap<>(MetricManager.GraphReporter.class);
+        try {
+            metricsReporters.forEach((reporter, start) -> {
+                final Object claim = MetricManager.INSTANCE.addGraphReporter(reporter, start);
+                if (claim != null) {
+                    claims.put(reporter, claim);
+                }
+            });
+        } catch (RuntimeException | Error e) {
+            MetricManager.INSTANCE.releaseGraphReporters(claims);
+            throw e;
+        }
+        return claims;
+    }
+
     public DefaultSchemaMaker getDefaultSchemaMaker() {
         return defaultSchemaMaker;
     }
@@ -1678,6 +1785,10 @@ public class GraphDatabaseConfiguration {
 
     public int limitedBatchSize() {
         return limitedBatchSize;
+    }
+
+    public int maxKeysPerRead() {
+        return maxKeysPerRead;
     }
 
     public MultiQueryStrategyRepeatStepMode repeatStepMode() {
@@ -1958,6 +2069,7 @@ public class GraphDatabaseConfiguration {
         useMultiQuery = configuration.get(USE_MULTIQUERY);
         limitedBatch = configuration.get(LIMITED_BATCH);
         limitedBatchSize = configuration.get(LIMITED_BATCH_SIZE);
+        maxKeysPerRead = configuration.get(MAX_KEYS_PER_READ);
         repeatStepMode = selectExactConfig(REPEAT_STEP_BATCH_MODE, MultiQueryStrategyRepeatStepMode.values());
         hasStepStrategyMode = selectExactConfig(HAS_STEP_BATCH_MODE, MultiQueryHasStepStrategyMode.values());
         propertiesStrategyMode = selectExactConfig(PROPERTIES_BATCH_MODE, MultiQueryPropertiesStrategyMode.values());
@@ -2033,37 +2145,47 @@ public class GraphDatabaseConfiguration {
 
     private void configureMetricsConsoleReporter() {
         if (configuration.has(METRICS_CONSOLE_INTERVAL)) {
-            MetricManager.INSTANCE.addConsoleReporter(configuration.get(METRICS_CONSOLE_INTERVAL));
+            addMetricsReporter(MetricManager.GraphReporter.CONSOLE,
+                () -> MetricManager.INSTANCE.addConsoleReporter(configuration.get(METRICS_CONSOLE_INTERVAL)));
         }
     }
 
     private void configureMetricsCsvReporter() {
         if (configuration.has(METRICS_CSV_DIR)) {
-            MetricManager.INSTANCE.addCsvReporter(configuration.get(METRICS_CSV_INTERVAL), configuration.get(METRICS_CSV_DIR));
+            addMetricsReporter(MetricManager.GraphReporter.CSV,
+                () -> MetricManager.INSTANCE.addCsvReporter(configuration.get(METRICS_CSV_INTERVAL), configuration.get(METRICS_CSV_DIR)));
         }
     }
 
     private void configureMetricsJmxReporter() {
         if (configuration.get(METRICS_JMX_ENABLED)) {
-            MetricManager.INSTANCE.addJmxReporter(configuration.get(METRICS_JMX_DOMAIN), configuration.get(METRICS_JMX_AGENTID));
+            addMetricsReporter(MetricManager.GraphReporter.JMX,
+                () -> MetricManager.INSTANCE.addJmxReporter(configuration.get(METRICS_JMX_DOMAIN), configuration.get(METRICS_JMX_AGENTID)));
         }
     }
 
     private void configureMetricsSlf4jReporter() {
         if (configuration.has(METRICS_SLF4J_INTERVAL)) {
             // null loggerName is allowed -- that means Metrics will use its internal default
-            MetricManager.INSTANCE.addSlf4jReporter(configuration.get(METRICS_SLF4J_INTERVAL),
-                configuration.has(METRICS_SLF4J_LOGGER) ? configuration.get(METRICS_SLF4J_LOGGER) : null);
+            addMetricsReporter(MetricManager.GraphReporter.SLF4J,
+                () -> MetricManager.INSTANCE.addSlf4jReporter(configuration.get(METRICS_SLF4J_INTERVAL),
+                    configuration.has(METRICS_SLF4J_LOGGER) ? configuration.get(METRICS_SLF4J_LOGGER) : null));
         }
     }
 
     private void configureMetricsGraphiteReporter() {
         if (configuration.has(GRAPHITE_HOST)) {
-            MetricManager.INSTANCE.addGraphiteReporter(configuration.get(GRAPHITE_HOST),
-                configuration.get(GRAPHITE_PORT),
-                configuration.get(GRAPHITE_PREFIX),
-                configuration.get(GRAPHITE_INTERVAL));
+            addMetricsReporter(MetricManager.GraphReporter.GRAPHITE,
+                () -> MetricManager.INSTANCE.addGraphiteReporter(configuration.get(GRAPHITE_HOST),
+                    configuration.get(GRAPHITE_PORT),
+                    configuration.get(GRAPHITE_PREFIX),
+                    configuration.get(GRAPHITE_INTERVAL)));
         }
+    }
+
+    //Started by the graphs which open with this configuration, see startMetricsReporters()
+    private void addMetricsReporter(MetricManager.GraphReporter reporter, Runnable start) {
+        metricsReporters.put(reporter, start);
     }
 
 }

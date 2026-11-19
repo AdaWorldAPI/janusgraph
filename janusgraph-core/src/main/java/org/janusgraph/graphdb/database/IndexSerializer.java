@@ -19,6 +19,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.tinkerpop.gremlin.process.traversal.Order;
+import org.apache.tinkerpop.gremlin.structure.Property;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphRelation;
@@ -90,6 +91,8 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -173,6 +176,10 @@ public class IndexSerializer {
 
     public boolean supports(final MixedIndexType index, final ParameterIndexField field, final JanusGraphPredicate predicate) {
         return getMixedIndex(index).supports(getKeyInformation(field),predicate);
+    }
+
+    public boolean supportsOrdering(final MixedIndexType index, final ParameterIndexField field) {
+        return getMixedIndex(index).supportsOrdering(getKeyInformation(field));
     }
 
     public boolean supportsExistsQuery(final MixedIndexType index, final ParameterIndexField field) {
@@ -320,19 +327,52 @@ public class IndexSerializer {
     }
 
     //The complete indexed content of the element in this index, as a restore writes the document: every value of
-    //every enabled field key. Empty when the index does not apply to the element or nothing it indexes is set
+    //every enabled field key, field after field in the order of the index. Empty when the index does not apply to the
+    //element or nothing it indexes is set. A query of the index's keys reads it, see documentProperties
     public List<IndexEntry> getCompleteDocument(JanusGraphElement element, MixedIndexType index) {
         if (!indexAppliesTo(index, element))
             return Collections.emptyList();
+        final ParameterIndexField[] fields = index.getFieldKeys();
+        final Set<String> keys = new LinkedHashSet<>();
+        for (final ParameterIndexField field : fields) {
+            if (field.getStatus() != SchemaStatus.DISABLED) {
+                keys.add(field.getFieldKey().name());
+            }
+        }
+        if (keys.isEmpty())
+            return Collections.emptyList();
+        final Map<String,List<Object>> valuesByKey = new HashMap<>();
+        documentProperties(element, keys.toArray(new String[0])).forEachRemaining(property ->
+            valuesByKey.computeIfAbsent(property.key(), k -> new ArrayList<>()).add(property.value()));
         final List<IndexEntry> entries = new ArrayList<>();
-        for (final ParameterIndexField field: index.getFieldKeys()) {
-            final PropertyKey key = field.getFieldKey();
-            if (field.getStatus()==SchemaStatus.DISABLED) continue;
-            if (element.properties(key.name()).hasNext()) {
-                element.values(key.name()).forEachRemaining(value->entries.add(new IndexEntry(key2Field(field), value)));
+        for (final ParameterIndexField field : fields) {
+            //Only the enabled fields have values: a key is in one field of an index at most
+            final List<Object> values = valuesByKey.get(field.getFieldKey().name());
+            if (values != null) {
+                final String fieldName = key2Field(field);
+                for (final Object value : values) entries.add(new IndexEntry(fieldName, value));
             }
         }
         return entries;
+    }
+
+    //The properties which hold an element's document: one query of the index's keys. A relation has its properties
+    //at hand. A vertex's properties are read as by its first property access: in one slice which then answers the
+    //query, in a transaction with property prefetching (query.fast-property), and otherwise in a slice for each key,
+    //which CQL reads together. A query of property keys reads the canonical representative of a partitioned vertex,
+    //which holds its properties
+    private static Iterator<? extends Property<Object>> documentProperties(JanusGraphElement element, String[] keys) {
+        if (keys.length > 1 && element instanceof InternalVertex
+            && ((InternalVertex) element).tx().getConfiguration().hasPropertyPrefetching()) {
+            prefetchProperties(element, keys[0]);
+        }
+        return element.properties(keys);
+    }
+
+    //A query of a single property key prefetches all of the vertex's properties in one slice, see
+    //VertexCentricQueryBuilder.execute, which a query of several keys doesn't
+    private static void prefetchProperties(JanusGraphElement vertex, String key) {
+        vertex.properties(key).hasNext();
     }
 
     private Map<String,List<IndexEntry>> getDocuments(Map<String,Map<String,List<IndexEntry>>> documentsPerStore, MixedIndexType index) {
@@ -378,7 +418,8 @@ public class IndexSerializer {
             final MultiKeySliceQuery sq = query.getCompositeQuery();
             //The transaction's multi-query setting, which query.batch.enabled gives it unless it sets its own, decides for
             //composite index rows too whether reads are batched
-            final List<EntryList> rs = sq.execute(tx, standardJanusGraphTx.getConfiguration().useMultiQuery());
+            final List<EntryList> rs = sq.execute(tx, standardJanusGraphTx.getConfiguration().useMultiQuery(),
+                standardJanusGraphTx.getGraph().getConfiguration().maxKeysPerRead());
             final List<Object> results = new ArrayList<>(rs.get(0).size());
             for (final EntryList r : rs) {
                 for (final java.util.Iterator<Entry> iterator = r.reuseIterator(); iterator.hasNext(); ) {
@@ -433,7 +474,7 @@ public class IndexSerializer {
                 }
             });
         ImmutableList<IndexQuery.OrderEntry> newOrders = IndexQuery.NO_ORDER;
-        if (!orders.isEmpty() && IndexSelectionUtil.indexCoversOrder(index,orders)) {
+        if (!orders.isEmpty() && IndexSelectionUtil.indexCoversOrder(index, orders, this)) {
             final ImmutableList.Builder<IndexQuery.OrderEntry> lb = ImmutableList.builder();
             for (int i = 0; i < orders.size(); i++) {
                 lb.add(new IndexQuery.OrderEntry(key2Field(index,orders.getKey(i)), orders.getOrder(i), orders.getKey(i).dataType()));
@@ -502,7 +543,7 @@ public class IndexSerializer {
         }
         final String queryStr = qB.toString();
         if (replacements<=0) log.warn("Could not convert given {} index query: [{}]",resultType, query.getQuery());
-        log.info("Converted query string with {} replacements: [{}] => [{}]",replacements,query.getQuery(),queryStr);
+        log.debug("Converted query string with {} replacements: [{}] => [{}]",replacements,query.getQuery(),queryStr);
         return queryStr;
     }
 

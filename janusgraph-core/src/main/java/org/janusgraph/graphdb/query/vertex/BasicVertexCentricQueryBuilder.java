@@ -31,6 +31,7 @@ import org.janusgraph.diskstorage.EntryList;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.graphdb.database.EdgeSerializer;
 import org.janusgraph.graphdb.database.idhandling.IDHandler;
+import org.janusgraph.graphdb.database.serialize.AttributeUtils;
 import org.janusgraph.graphdb.internal.ElementLifeCycle;
 import org.janusgraph.graphdb.internal.InternalRelationType;
 import org.janusgraph.graphdb.internal.InternalVertex;
@@ -345,13 +346,18 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
             if (!hasAllCanonicalTypes()) {
                 InternalVertex[] representatives = tx.getAllRepresentatives(vertex,restrict2Partitions);
                 Iterable<JanusGraphRelation> merge = null;
+                //Each representative returns its relations in the order of a RelationComparator, which compares them
+                //by the query's orders first
+                final OrderList relationOrders = baseQuery.getOrders();
+                final Comparator<JanusGraphRelation> byOrders =
+                    (r1, r2) -> RelationComparator.compareOnOrders(r1, r2, relationOrders);
 
                 for (InternalVertex rep : representatives) {
                     Iterable<JanusGraphRelation> iterable = executeIndividualRelations(rep,baseQuery);
                     if (merge==null) {
                         merge = iterable;
                     } else {
-                        merge = ResultMergeSortIterator.mergeSort(merge, iterable, (Comparator) orders, false);
+                        merge = ResultMergeSortIterator.mergeSort(merge, iterable, byOrders, false);
                     }
                 }
                 return ResultSetIterator.wrap(merge,baseQuery.getLimit());
@@ -371,8 +377,10 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
         Iterable<JanusGraphRelation> merge = null;
         if (vertex instanceof CacheVertex && !isPartitionedVertex(vertex) && vertex.isLoaded()) {
             CacheVertex cacheVertex = (CacheVertex) vertex;
+            //The cached relations come in the order of the storage backend, which a query in another order sorts on the
+            //default path
             boolean hasNotCachedQueries = baseQuery.getQueries().stream()
-                .anyMatch(q -> cacheVertex.getFromCache(q.getBackendQuery()) == null || !q.isFitted());
+                .anyMatch(q -> cacheVertex.getFromCache(q.getBackendQuery()) == null || !q.isFitted() || !q.isSorted());
             if (hasNotCachedQueries) {
                 //Fall back to default path
                 return executeRelations(vertex, baseQuery);
@@ -508,6 +516,15 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
         return query;
     }
 
+    //As QueryUtil.getType, but a query of one type has resolved it already
+    private InternalRelationType resolveType(String typeName) {
+        final RelationType type = types.length == 1 ? singleType() : tx.getRelationType(typeName);
+        if (type == null && !tx.getConfiguration().getAutoSchemaMaker().ignoreUndefinedQueryTypes()) {
+            throw new IllegalArgumentException("Undefined type used in query: " + typeName);
+        }
+        return (InternalRelationType) type;
+    }
+
     protected BaseVertexCentricQuery constructQuery(RelationCategory returnType) {
         QueryProfiler optProfiler = profiler.addNested(QueryProfiler.OPTIMIZATION);
         optProfiler.startTimer();
@@ -548,8 +565,9 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
         orders.makeImmutable();
         assert orders.hasCommonOrder();
 
-        //Prepare constraints
-        And<JanusGraphRelation> conditions = QueryUtil.constraints2QNF(tx, constraints);
+        //Prepare constraints, whose conditions compare strings by UTF-16 code unit, the order in which the storage
+        //backend holds a vertex's relations by their sort keys, whose slices answer the query
+        And<JanusGraphRelation> conditions = QueryUtil.constraints2QNF(tx, constraints, false);
         if (conditions == null)
             return BaseVertexCentricQuery.emptyQuery();
 
@@ -593,7 +611,7 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
 
             for (String typeName : types) {
                 if (typeName == null) continue;
-                InternalRelationType type = QueryUtil.getType(tx, typeName);
+                InternalRelationType type = resolveType(typeName);
                 if (type==null) continue;
                 Preconditions.checkArgument(!querySystem || (type instanceof SystemRelationType),
                         "Can only query for system types: %s", type);
@@ -624,13 +642,16 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
                 }
 
 
-                if (type.isEdgeLabel() && typeDir==Direction.BOTH && intervalConstraints.isEmpty()
+                if (type.isEdgeLabel() && typeDir==Direction.BOTH
+                        && intervalConstraints.values().stream().allMatch(BasicVertexCentricQueryBuilder::isUnbounded)
                         && orders.isEmpty()) {
                     //TODO: This if-condition is a little too restrictive - we also want to include those cases where
                     //there ARE intervalConstraints or orders but those cannot be covered by any sort-keys
+                    //A has(key), a range without ends, is as before checked in memory rather than split by direction
                     SliceQuery q = serializer.getQuery(type, typeDir, null);
                     q.setLimit(sliceLimit);
-                    queries.add(new BackendQueryHolder<>(q, isIntervalFittedConditions, true));
+                    queries.add(new BackendQueryHolder<>(q, isIntervalFittedConditions && intervalConstraints.isEmpty(),
+                        true));
                 } else {
                     //Optimize for each direction independently
                     Direction[] dirs = {typeDir};
@@ -737,14 +758,16 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
         }
         //...otherwise this is it and we can construct the slicequery
 
+        EdgeSerializer serializer = tx.getEdgeSerializer();
         boolean isFitted = isIntervalFittedConditions && position==intervalConstraints.size();
         if (isFitted && position>0) {
-            //If the last interval is open ended toward the larger values, then its not fitted because we need to
-            //filter out NULL values which are serialized with -1 (largest value) byte up front.
+            //If the last interval is open ended toward the larger values, then it's only fitted where the slice leaves
+            //out the NULL values, which are serialized with -1 (largest value) byte up front (see EdgeSerializer). The
+            //interval of a range of floating point numbers from a start ends before NaN instead (see range)
             EdgeSerializer.TypedInterval lastInterval = sortKeyConstraints[position-1];
-            if (!lastInterval.interval.isPoints() && lastInterval.interval.getEnd()==null) isFitted=false;
+            if (!lastInterval.interval.isPoints() && lastInterval.interval.getEnd()==null
+                    && !serializer.leavesOutMissingValues(lastInterval.key)) isFitted=false;
         }
-        EdgeSerializer serializer = tx.getEdgeSerializer();
         SliceQuery q = serializer.getQuery(bestCandidate, direction, sortKeyConstraints);
         q.setLimit(computeLimit(intervalConstraints.size()-position, sliceLimit));
         queries.add(new BackendQueryHolder<>(q, isFitted, bestCandidateSupportsOrder));
@@ -800,6 +823,9 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
                 if (orEqual!=null) {
                     type = orEqual.getKey();
                     newInterval = new PointInterval(orEqual.getValue());
+                    //The conditions on the same key before it narrow it, as it narrows those after it
+                    Interval interval = constraintMap.get(type);
+                    if (interval!=null) newInterval = intersect(interval, newInterval);
                 }
             } else if (condition instanceof PredicateCondition) {
                 PredicateCondition<RelationType, JanusGraphRelation> atom = (PredicateCondition)condition;
@@ -830,24 +856,76 @@ public abstract class BasicVertexCentricQueryBuilder<Q extends BaseVertexQuery<Q
                     newInt = new PointInterval(value);
                     break;
                 case NOT_EQUAL:
-                    return null;
+                    //has(key), a not-equal to null, holds for every value, which a range without ends holds; that of an
+                    //implicit key, which a slice takes as points only, is checked in memory as before
+                    if (value != null || type instanceof ImplicitKey) return null;
+                    return pint != null ? pint : new RangeInterval<>();
                 case LESS_THAN:
-                    newInt = new RangeInterval().setEnd(value, false);
-                    break;
                 case LESS_THAN_EQUAL:
-                    newInt = new RangeInterval().setEnd(value, true);
-                    break;
                 case GREATER_THAN:
-                    newInt = new RangeInterval().setStart(value, false);
-                    break;
                 case GREATER_THAN_EQUAL:
-                    newInt = new RangeInterval().setStart(value, true);
+                    newInt = range((Cmp) predicate, value);
                     break;
                 default: throw new AssertionError();
             }
         } else return null;
         assert newInt!=null;
-        return pint!=null?pint.intersect(newInt):newInt;
+        return pint!=null?intersect(pint, newInt):newInt;
+    }
+
+    //The interval of the values which the range holds, in the order in which the storage backend holds them as sort
+    //keys, which puts -0.0 before +0.0 and NaN after positive infinity, whereas the comparisons of a range of floating
+    //point numbers (AttributeUtils.compare) take -0.0 and +0.0 as equal, and NaN as equal to NaN alone and comparable
+    //with no other value. So, as in LuceneIndex.numericQuery, a bound at either zero holds both zeros where it is
+    //inclusive and neither where it is strict, a bound of NaN holds NaN alone where it is inclusive and nothing where
+    //it is strict, and a range from a start ends before NaN. The intersections of the intervals of several conditions
+    //then hold what the conditions hold, and so do the slices which EdgeSerializer writes from them
+    private static Interval range(Cmp cmp, Object value) {
+        final boolean inclusive = cmp == Cmp.LESS_THAN_EQUAL || cmp == Cmp.GREATER_THAN_EQUAL;
+        final boolean fromStart = cmp == Cmp.GREATER_THAN || cmp == Cmp.GREATER_THAN_EQUAL;
+        if (!AttributeUtils.isDecimal(value.getClass())) {
+            return fromStart ? new RangeInterval<>().setStart(value, inclusive)
+                : new RangeInterval<>().setEnd(value, inclusive);
+        }
+        final double bound = ((Number) value).doubleValue();
+        if (Double.isNaN(bound)) return new RangeInterval<>().setStart(value, inclusive).setEnd(value, inclusive);
+        //A start from -0.0 or after +0.0, an end up to +0.0 or before -0.0
+        if (bound == 0) value = decimal(value, fromStart == inclusive ? -0.0 : 0.0);
+        return fromStart ? new RangeInterval<>().setStart(value, inclusive).setEnd(decimal(value, Double.NaN), false)
+            : new RangeInterval<>().setEnd(value, inclusive);
+    }
+
+    //The number as a Float or a Double, whichever the given one is
+    private static Object decimal(Object type, double number) {
+        if (type instanceof Float) return (float) number;
+        return number;
+    }
+
+    //The intersection of the intervals, or null where their values are of different types, as those of a key of any
+    //type may be: the conditions compare numbers of different types, which the intervals don't
+    private static Interval intersect(Interval interval, Interval other) {
+        if (isUnbounded(interval)) return other;
+        if (isUnbounded(other)) return interval;
+        final Class<?> type = valueType(interval);
+        return type != null && type == valueType(other) ? interval.intersect(other) : null;
+    }
+
+    //Whether the interval is a range without ends, which every value is in, as has(key) gives
+    private static boolean isUnbounded(Interval<?> interval) {
+        return interval instanceof RangeInterval && interval.getStart() == null && interval.getEnd() == null;
+    }
+
+    //The type of the values of the interval, or null where they are of several types
+    private static Class<?> valueType(Interval<?> interval) {
+        final Collection<?> values = interval instanceof PointInterval ? interval.getPoints()
+            : Arrays.asList(interval.getStart(), interval.getEnd());
+        Class<?> type = null;
+        for (Object value : values) {
+            if (value == null) continue;
+            if (type == null) type = value.getClass();
+            else if (type != value.getClass()) return null;
+        }
+        return type;
     }
 
     /**

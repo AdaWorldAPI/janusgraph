@@ -16,6 +16,7 @@ package org.janusgraph.graphdb;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
@@ -45,8 +46,11 @@ import org.apache.tinkerpop.gremlin.structure.Property;
 import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.structure.VertexProperty;
+import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 import org.janusgraph.TestCategory;
+import org.janusgraph.core.BaseVertexQuery;
 import org.janusgraph.core.Cardinality;
+import org.janusgraph.core.Connection;
 import org.janusgraph.core.EdgeLabel;
 import org.janusgraph.core.JanusGraph;
 import org.janusgraph.core.JanusGraphConfigurationException;
@@ -54,11 +58,15 @@ import org.janusgraph.core.JanusGraphEdge;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.core.JanusGraphFactory;
+import org.janusgraph.core.JanusGraphMultiVertexQuery;
+import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.JanusGraphVertexProperty;
+import org.janusgraph.core.JanusGraphVertexQuery;
 import org.janusgraph.core.Multiplicity;
 import org.janusgraph.core.PropertyKey;
+import org.janusgraph.core.ReadOnlyTransactionException;
 import org.janusgraph.core.RelationType;
 import org.janusgraph.core.SchemaViolationException;
 import org.janusgraph.core.Transaction;
@@ -95,6 +103,7 @@ import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanJobFuture;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanMetrics;
 import org.janusgraph.diskstorage.locking.PermanentLockingException;
+import org.janusgraph.diskstorage.locking.TemporaryLockingException;
 import org.janusgraph.diskstorage.log.Log;
 import org.janusgraph.diskstorage.log.Message;
 import org.janusgraph.diskstorage.log.MessageReader;
@@ -126,11 +135,14 @@ import org.janusgraph.graphdb.internal.InternalElement;
 import org.janusgraph.graphdb.internal.InternalRelationType;
 import org.janusgraph.graphdb.internal.InternalVertex;
 import org.janusgraph.graphdb.internal.Order;
+import org.janusgraph.graphdb.internal.RelationCategory;
 import org.janusgraph.graphdb.log.StandardTransactionLogProcessor;
 import org.janusgraph.graphdb.olap.job.GhostVertexRemover;
 import org.janusgraph.graphdb.olap.job.IndexRemoveJob;
 import org.janusgraph.graphdb.olap.job.IndexRepairJob;
 import org.janusgraph.graphdb.olap.job.StaleIndexEntryRemoveJob;
+import org.janusgraph.graphdb.predicate.AndJanusPredicate;
+import org.janusgraph.graphdb.query.JanusGraphPredicate;
 import org.janusgraph.graphdb.query.JanusGraphPredicateUtils;
 import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.condition.MultiCondition;
@@ -156,6 +168,7 @@ import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
 import org.janusgraph.graphdb.types.CompositeIndexType;
 import org.janusgraph.graphdb.types.StandardEdgeLabelMaker;
 import org.janusgraph.graphdb.types.StandardPropertyKeyMaker;
+import org.janusgraph.graphdb.types.TypeDefinitionCategory;
 import org.janusgraph.graphdb.types.system.BaseVertexLabel;
 import org.janusgraph.graphdb.types.system.ImplicitKey;
 import org.janusgraph.graphdb.types.vertices.JanusGraphSchemaVertex;
@@ -201,10 +214,16 @@ import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -271,6 +290,7 @@ import static org.janusgraph.testutil.JanusGraphAssert.assertContains;
 import static org.janusgraph.testutil.JanusGraphAssert.assertCount;
 import static org.janusgraph.testutil.JanusGraphAssert.assertEmpty;
 import static org.janusgraph.testutil.JanusGraphAssert.assertNotEmpty;
+import static org.janusgraph.testutil.JanusGraphAssert.assertSameChars;
 import static org.janusgraph.testutil.JanusGraphAssert.getLastStepMetrics;
 import static org.janusgraph.testutil.JanusGraphAssert.getStepMetrics;
 import static org.janusgraph.testutil.JanusGraphAssert.queryProfilerAnnotationIsPresent;
@@ -464,6 +484,102 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertFalse(graph.traversal().E().has("_e", -1).hasNext());
         assertFalse(graph.traversal().E().has("_e", -11).hasNext());
         assertTrue(graph.traversal().E().has("_e", 2).hasNext());
+    }
+
+    /**
+     * An ordered query which JanusGraph sorts itself, as its index doesn't sort it, leaves out the vertices which the
+     * transaction removed before it sorts them, as the order values of a removed vertex can't be read; the edges which
+     * it removed, whose ids turn into no element, are left out as well
+     */
+    @Test
+    public void testQueriesSortedInMemorySkipTheElementsWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("name", String.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("verticesByKind", Vertex.class).addKey(kind).buildCompositeIndex();
+        mgmt.buildIndex("edgesByKind", Edge.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex("kind", "q");
+        for (final String name : Arrays.asList("a", "b", "c", "d")) {
+            from.addEdge("road", tx.addVertex("kind", "p", "name", name), "kind", "p", "name", name);
+        }
+        newTx();
+        final GraphTraversalSource g = tx.traversal();
+        //The vertex named b, and with it its edge, and the edge named c
+        g.V().has("kind", "p").has("name", "b").drop().iterate();
+        g.E().has("kind", "p").has("name", "c").drop().iterate();
+        assertEquals(Arrays.asList("a", "c", "d"), g.V().has("kind", "p").order().by("name").values("name").toList());
+        assertEquals(Arrays.asList("d", "c"),
+            g.V().has("kind", "p").order().by("name", desc).limit(2).values("name").toList());
+        final List<Object> vertexNames = new ArrayList<>();
+        tx.query().has("kind", "p").orderBy("name", asc).vertices().forEach(v -> vertexNames.add(v.value("name")));
+        assertEquals(Arrays.asList("a", "c", "d"), vertexNames);
+        assertEquals(Arrays.asList("a", "d"), g.E().has("kind", "p").order().by("name").values("name").toList());
+        assertEquals(Collections.singletonList("d"),
+            g.E().has("kind", "p").order().by("name", desc).limit(1).values("name").toList());
+        final List<Object> edgeNames = new ArrayList<>();
+        tx.query().has("kind", "p").orderBy("name", asc).edges().forEach(e -> edgeNames.add(e.value("name")));
+        assertEquals(Arrays.asList("a", "d"), edgeNames);
+        assertEquals(Arrays.asList("a", "d"),
+            g.V(from).local(__.outE("road").order().by("name")).values("name").toList());
+        tx.rollback();
+    }
+
+    /**
+     * The elements which the transaction removes, or changes so that they no longer match, while it reads the sorted
+     * results of a query are left out as they are reached, as for an unsorted query. They are checked where the
+     * transaction had a change when a graph query began, or a change of the vertex's relations when a vertex query
+     * began.
+     */
+    @Test
+    public void testQueriesSortedInMemoryLeaveOutTheElementsRemovedWhileTheyAreRead() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("name", String.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("verticesByKind", Vertex.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex("kind", "q");
+        for (final String name : Arrays.asList("a", "b", "c", "d", "e", "f", "g", "h")) {
+            from.addEdge("road", tx.addVertex("kind", "p", "name", name), "name", name);
+        }
+        newTx();
+        tx.addVertex("name", "unrelated");
+        final List<Object> names = new ArrayList<>();
+        for (final JanusGraphVertex vertex : tx.query().has("kind", "p").orderBy("name", asc).vertices()) {
+            names.add(vertex.value("name"));
+            if (names.size() == 1) {
+                tx.traversal().V().has("kind", "p").has("name", "g").next().remove();
+            }
+        }
+        assertEquals(Arrays.asList("a", "b", "c", "d", "e", "f", "h"), names);
+        tx.rollback();
+        newTx();
+
+        //and so are those which it changes so that they no longer match
+        tx.addVertex("name", "unrelated");
+        names.clear();
+        for (final JanusGraphVertex vertex : tx.query().has("kind", "p").orderBy("name", asc).vertices()) {
+            names.add(vertex.value("name"));
+            if (names.size() == 1) {
+                tx.traversal().V().has("kind", "p").has("name", "g").property("kind", "z").iterate();
+            }
+        }
+        assertEquals(Arrays.asList("a", "b", "c", "d", "e", "f", "h"), names);
+        tx.rollback();
+        newTx();
+
+        //and so are the edges of a vertex whose relations the transaction changed
+        final JanusGraphVertex source = (JanusGraphVertex) tx.traversal().V(from).next();
+        source.property("name", "source");
+        final List<Object> edgeNames = new ArrayList<>();
+        for (final JanusGraphEdge edge : source.query().labels("road").orderBy("name", asc).edges()) {
+            edgeNames.add(edge.value("name"));
+            if (edgeNames.size() == 1) {
+                tx.traversal().V(source).outE("road").has("name", "g").next().remove();
+            }
+        }
+        assertEquals(Arrays.asList("a", "b", "c", "d", "e", "f", "h"), edgeNames);
+        tx.rollback();
     }
 
     @Test
@@ -1397,6 +1513,41 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
     }
 
+    //A string longer than 16,000 UTF-16 units is stored compressed. It keeps its unpaired surrogates, as a shorter
+    //string does, in its property and in the key of a composite index
+    @Test
+    public void testLongStringsKeepUnpairedSurrogates() {
+        makeVertexIndexedUniqueKey("text", String.class);
+        mgmt.makePropertyKey("tags").dataType(String.class).cardinality(Cardinality.SET).make();
+        finishSchema();
+        final String text = (char) 0xDC00 + "a".repeat(8000) + (char) 0xD800 + new String(Character.toChars(0x1F600))
+            + "b".repeat(8000) + (char) 0xDBFF;
+        final Object id = tx.addVertex("text", text).id();
+        newTx();
+        assertSameChars(text, getV(tx, id).value("text"));
+        assertEquals(id, tx.traversal().V().has("text", text).id().next());
+        //Earlier versions wrote each unpaired surrogate of such a string as '?', in the index key too. So the string
+        //with '?' in their place found the vertex, and a unique index took a string which differs from it only in an
+        //unpaired surrogate for a duplicate
+        final String withQuestionMarks = new String(text.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
+        assertFalse(tx.traversal().V().has("text", withQuestionMarks).hasNext());
+        final String otherSurrogate = text.substring(0, text.length() - 1) + (char) 0xDC00;
+        final Object other = tx.addVertex("text", otherSurrogate).id();
+        newTx();
+        assertEquals(other, tx.traversal().V().has("text", otherSurrogate).id().next());
+        assertEquals(id, tx.traversal().V().has("text", text).id().next());
+        //Values of a SET which differ only in an unpaired surrogate, or in a '?' in its place, were written alike, and
+        //so kept as one
+        final String base = "c".repeat(16000);
+        final List<String> tags = Arrays.asList(base + (char) 0xD800, base + (char) 0xDC00, base + "?");
+        final JanusGraphVertex tagged = tx.addVertex();
+        tags.forEach(tag -> tagged.property(VertexProperty.Cardinality.set, "tags", tag));
+        newTx();
+        final List<Object> read = tx.traversal().V(tagged.id()).values("tags").toList();
+        assertEquals(3, read.size());
+        tags.forEach(tag -> assertTrue(read.contains(tag)));
+    }
+
     /**
      * This tests a special scenario under which a schema type is defined in a (management) transaction
      * and then accessed in a concurrent transaction.
@@ -1956,6 +2107,349 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             PROPERTY, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
         tx.commit();
         finishSchema();
+    }
+
+    /**
+     * An order().by(key) of the edges or properties of a vertex, which JanusGraph folds into its query, leaves out
+     * those without the key, as TinkerPop does: whether the storage backend sorts them by the sort key of a
+     * vertex-centric index or JanusGraph sorts them, whether the traversal fetches them in batches or not, and in a
+     * transaction which changes them. The results are those of a TinkerGraph which holds the same elements. A query of
+     * the vertex keeps them.
+     */
+    @Test
+    public void testVertexCentricOrderLeavesOutTheRelationsWithoutTheKey() {
+        final PropertyKey weight = mgmt.makePropertyKey("weight").dataType(Integer.class).make();
+        mgmt.makePropertyKey("uid").dataType(Integer.class).make();
+        mgmt.makePropertyKey("at").dataType(Integer.class).make();
+        mgmt.makePropertyKey("visit").dataType(String.class).cardinality(Cardinality.LIST).make();
+        mgmt.makeEdgeLabel("plain").make();
+        final EdgeLabel sorted = mgmt.makeEdgeLabel("sorted").make();
+        mgmt.buildEdgeIndex(sorted, "byWeight", Direction.OUT, desc, weight);
+        final EdgeLabel ascending = mgmt.makeEdgeLabel("ascending").make();
+        mgmt.buildEdgeIndex(ascending, "byWeightAscending", Direction.OUT, asc, weight);
+        final PropertyKey score = mgmt.makePropertyKey("score").dataType(Double.class).make();
+        final EdgeLabel scored = mgmt.makeEdgeLabel("scored").make();
+        mgmt.buildEdgeIndex(scored, "byScore", Direction.OUT, asc, score);
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        final List<GraphTraversalSource> both = Arrays.asList(tx.traversal(), reference);
+        for (final GraphTraversalSource g : both) {
+            for (int uid = 1; uid <= 7; uid++) {
+                g.addV().property("uid", uid).iterate();
+            }
+            //Edges of either label from vertex 1 to the others, and properties of vertex 1, some without the key
+            final Integer[] weights = {3, null, 1, 2, null, 5};
+            for (int i = 0; i < weights.length; i++) {
+                for (final String label : Arrays.asList("plain", "sorted", "ascending")) {
+                    GraphTraversal<Vertex, Edge> edge = g.V().has("uid", 1).addE(label).to(__.V().has("uid", i + 2))
+                        .property("uid", (label.equals("plain") ? 10 : label.equals("sorted") ? 20 : 30) + i);
+                    if (weights[i] != null) edge = edge.property("weight", weights[i]);
+                    edge.iterate();
+                }
+            }
+            final Integer[] ats = {2, null, 4, 1};
+            for (int i = 0; i < ats.length; i++) {
+                if (ats[i] == null) {
+                    g.V().has("uid", 1).property(VertexProperty.Cardinality.list, "visit", "v" + i).iterate();
+                } else {
+                    g.V().has("uid", 1).property(VertexProperty.Cardinality.list, "visit", "v" + i, "at", ats[i])
+                        .iterate();
+                }
+            }
+        }
+        //Edges of a label which an index sorts by a floating point number, among them NaN and both zeros
+        final Double[] scores = {Double.NaN, -0.0, 0.0, 1.5, null};
+        for (int i = 0; i < scores.length; i++) {
+            final GraphTraversal<Vertex, Edge> edge = tx.traversal().V().has("uid", 1).addE("scored")
+                .to(__.V().has("uid", i + 2));
+            (scores[i] == null ? edge : edge.property("score", scores[i])).iterate();
+        }
+        tx.commit();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = new ArrayList<>();
+        for (final String label : Arrays.asList("plain", "sorted", "ascending")) {
+            traversals.add(g -> g.V().has("uid", 1).local(__.outE(label).order().by("weight")));
+            traversals.add(g -> g.V().has("uid", 1).local(__.outE(label).order().by("weight", desc)));
+            traversals.add(g -> g.V().has("uid", 1).local(__.outE(label).order().by("weight").limit(2)));
+            traversals.add(g -> g.V().has("uid", 1).local(__.outE(label).order().by("weight", desc).limit(3)));
+            //An order of two keys, which the query of a vertex's edges doesn't take, is TinkerPop's
+            traversals.add(g -> g.V().has("uid", 1).local(__.outE(label).order().by("weight", desc).by("uid")));
+        }
+        traversals.add(g -> g.V().has("uid", 1).local(__.properties("visit").order().by("at")));
+        traversals.add(g -> g.V().has("uid", 1).local(__.properties("visit").order().by("at", desc).limit(2)));
+        for (final boolean batch : new boolean[]{true, false}) {
+            final JanusGraphTransaction batchTx = graph.buildTransaction().multiQuery(batch).start();
+            for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+                assertEquals(relationResults(traversal.apply(reference)),
+                    relationResults(traversal.apply(batchTx.traversal())),
+                    (batch ? "batch: " : "") + traversal.apply(reference));
+            }
+            //A query of the vertex keeps the edges without the key, last when ascending, in a batch too
+            final JanusGraphVertex v = (JanusGraphVertex) batchTx.traversal().V().has("uid", 1).next();
+            final List<Object> weights = relationResults(
+                v.query().labels("plain").direction(OUT).orderBy("weight", asc).edges(), "weight");
+            assertEquals(Arrays.asList(1, 2, 3, 5, null, null), weights);
+            assertEquals(weights, relationResults(batchTx.multiQuery(v).labels("plain").direction(OUT)
+                .orderBy("weight", asc).edges().get(v), "weight"));
+            batchTx.rollback();
+        }
+
+        //A transaction which adds edges with and without the key, gives an edge a weight and takes another one's, and
+        //does the same to the properties, whose relations the queries merge with those of the backend
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> changes = new ArrayList<>();
+        for (final String label : Arrays.asList("plain", "sorted", "ascending")) {
+            final int uid = label.equals("plain") ? 10 : label.equals("sorted") ? 20 : 30;
+            changes.add(g -> g.V().has("uid", 1).addE(label).to(__.V().has("uid", 7)).property("uid", uid + 6)
+                .property("weight", 4));
+            changes.add(g -> g.V().has("uid", 1).addE(label).to(__.V().has("uid", 7)).property("uid", uid + 7));
+            changes.add(g -> g.E().has("uid", uid + 1).property("weight", 0));
+            changes.add(g -> g.E().has("uid", uid).properties("weight").drop());
+        }
+        changes.add(g -> g.V().has("uid", 1).property(VertexProperty.Cardinality.list, "visit", "v4", "at", 3));
+        changes.add(g -> g.V().has("uid", 1).property(VertexProperty.Cardinality.list, "visit", "v5"));
+        changes.add(g -> g.V().has("uid", 1).properties("visit").hasValue("v1").property("at", 0));
+        changes.add(g -> g.V().has("uid", 1).properties("visit").hasValue("v0").properties("at").drop());
+        changes.forEach(change -> change.apply(reference).iterate());
+        for (final boolean batch : new boolean[]{true, false}) {
+            final JanusGraphTransaction changeTx = graph.buildTransaction().multiQuery(batch).start();
+            changes.forEach(change -> change.apply(changeTx.traversal()).iterate());
+            for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+                assertEquals(relationResults(traversal.apply(reference)),
+                    relationResults(traversal.apply(changeTx.traversal())),
+                    (batch ? "batch: " : "") + "in a transaction: " + traversal.apply(reference));
+            }
+            changeTx.rollback();
+        }
+
+        //Where a vertex-centric index sorts the edges by the key, in either order, its slice leaves out those without
+        //the key, and so does that of a range open toward the larger values, so that the query is fitted. The index
+        //gives its own order only
+        final JanusGraphTransaction check = graph.newTransaction();
+        final JanusGraphVertex v = (JanusGraphVertex) check.traversal().V().has("uid", 1).next();
+        for (final String label : Arrays.asList("sorted", "ascending")) {
+            final boolean descending = label.equals("sorted");
+            evaluateQuery(v.query().labels(label).direction(OUT).has("weight").orderBy("weight", asc),
+                EDGE, 4, 1, new boolean[]{true, !descending}, weight, Order.ASC);
+            evaluateQuery(v.query().labels(label).direction(OUT).has("weight").orderBy("weight", desc),
+                EDGE, 4, 1, new boolean[]{true, descending}, weight, Order.DESC);
+            evaluateQuery(v.query().labels(label).direction(OUT).has("weight", Cmp.GREATER_THAN, 1),
+                EDGE, 3, 1, new boolean[]{true, true});
+            //A has(key) next to a range of the key, before or after it, is that range
+            evaluateQuery(v.query().labels(label).direction(OUT).has("weight").has("weight", Cmp.GREATER_THAN, 1),
+                EDGE, 3, 1, new boolean[]{true, true});
+            evaluateQuery(v.query().labels(label).direction(OUT).has("weight", Cmp.GREATER_THAN, 1).has("weight"),
+                EDGE, 3, 1, new boolean[]{true, true});
+        }
+        //A label without such an index checks the key in memory, and so does a query of both directions, as before
+        evaluateQuery(v.query().labels("plain").direction(OUT).has("weight").orderBy("weight", asc),
+            EDGE, 4, 1, new boolean[]{false, false}, weight, Order.ASC);
+        evaluateQuery(v.query().labels("sorted").direction(BOTH).has("weight"), EDGE, 4, 1,
+            new boolean[]{false, true});
+        //and so does one of an implicit key, which a slice takes as points only
+        final JanusGraphVertex to = (JanusGraphVertex) check.traversal().V().has("uid", 2).next();
+        evaluateQuery(v.query().labels("plain").direction(OUT).adjacent(to).has(ImplicitKey.JANUSGRAPHID.name()),
+            EDGE, 1, 1, new boolean[]{false, true});
+        //A range of floating point numbers from a start is fitted too, where an index sorts the edges by the key: its
+        //slice ends before NaN, which they sort after the others, and starts after +0.0 where its start is a strict
+        //zero, as the range takes the zeros as equal. A has(key) holds them all
+        evaluateQuery(v.query().labels("scored").direction(OUT).has("score"), EDGE, 4, 1, new boolean[]{true, true});
+        evaluateQuery(v.query().labels("scored").direction(OUT).has("score", Cmp.GREATER_THAN, 1.0), EDGE, 1, 1,
+            new boolean[]{true, true});
+        evaluateQuery(v.query().labels("scored").direction(OUT).has("score", Cmp.GREATER_THAN, -0.0), EDGE, 1, 1,
+            new boolean[]{true, true});
+        check.rollback();
+    }
+
+    //The uids of the edges, and the values of the properties, which the traversal returns, in its order
+    private static List<Object> relationResults(GraphTraversal<?, ?> traversal) {
+        final List<Object> results = new ArrayList<>();
+        traversal.forEachRemaining(result -> results.add(result instanceof VertexProperty
+            ? ((VertexProperty<?>) result).value() : ((Element) result).value("uid")));
+        return results;
+    }
+
+    //Each relation's value of the key, null where it has none
+    private static List<Object> relationResults(Iterable<? extends JanusGraphRelation> relations, String key) {
+        final List<Object> values = new ArrayList<>();
+        relations.forEach(relation -> values.add(relation.property(key).orElse(null)));
+        return values;
+    }
+
+    /**
+     * A range of a Float or Double key of the edges or properties of a vertex returns those whose values its conditions
+     * hold ({@link JanusGraphPredicate#test}), which take -0.0 and +0.0 as equal, and NaN as equal to NaN alone and
+     * comparable with no other value, also where a vertex-centric index sorts them by the key, ascending or descending,
+     * in an order which puts -0.0 before +0.0 and NaN after positive infinity: on such indexes of edges, alone or after
+     * another key, and of properties, as on a label which no index sorts, where a key of type Object holds the same
+     * values. Each condition, and each pair of conditions but those at the infinities, runs in a transaction of its
+     * own, which reads the slices from the storage backend, and each condition alone in a multi-query too, of the
+     * vertex and of the one which its edges go to, which reads the slices of both at once and returns their relations
+     * from the vertices' caches. The slices hold what the conditions hold, so the queries which they answer are fitted,
+     * that of a range from a start too.
+     */
+    @Test
+    public void testVertexCentricRangesOfFloatsAndDoublesHoldWhatTheirComparisonsHold() {
+        final PropertyKey score = mgmt.makePropertyKey("score").dataType(Double.class).make();
+        final PropertyKey rate = mgmt.makePropertyKey("rate").dataType(Float.class).make();
+        mgmt.makePropertyKey("any").dataType(Object.class).make();
+        mgmt.makePropertyKey("uid").dataType(Integer.class).make();
+        final PropertyKey group = mgmt.makePropertyKey("group").dataType(Integer.class).make();
+        mgmt.makeEdgeLabel("plain").make();
+        for (final PropertyKey key : Arrays.asList(score, rate)) {
+            mgmt.buildEdgeIndex(mgmt.makeEdgeLabel(key.name() + "Asc").make(), "by" + key.name(), OUT, asc, key);
+            mgmt.buildEdgeIndex(mgmt.makeEdgeLabel(key.name() + "Desc").make(), "by" + key.name(), OUT, desc, key);
+            mgmt.buildEdgeIndex(mgmt.makeEdgeLabel(key.name() + "Grouped").make(), "by" + key.name(), OUT,
+                key == score ? asc : desc, group, key);
+            mgmt.buildPropertyIndex(mgmt.makePropertyKey(key.name() + "Notes").dataType(String.class)
+                .cardinality(Cardinality.LIST).make(), "by" + key.name(), key == score ? desc : asc, key);
+        }
+        finishSchema();
+
+        //Edges of each label and properties of each key with these values of the keys, the last without them
+        final Double[] values = {Double.NaN, -0.0, 0.0, -1.5, 1.5, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY,
+            null};
+        final JanusGraphVertex v = tx.addVertex();
+        final JanusGraphVertex to = tx.addVertex();
+        for (int uid = 0; uid < values.length; uid++) {
+            for (final String type : Arrays.asList("plain", "scoreAsc", "scoreDesc", "scoreGrouped", "rateAsc",
+                    "rateDesc", "rateGrouped", "scoreNotes", "rateNotes")) {
+                final JanusGraphRelation relation = type.endsWith("Notes")
+                    ? v.property(VertexProperty.Cardinality.list, type, "note") : v.addEdge(type, to, "group", 1);
+                relation.property("uid", uid);
+                if (values[uid] != null) {
+                    relation.property("score", values[uid]);
+                    relation.property("rate", values[uid].floatValue());
+                    relation.property("any", values[uid]);
+                }
+            }
+        }
+        tx.commit();
+
+        //A key of type Object, which no index can sort, is read on the label without an index alone
+        for (final String key : Arrays.asList("score", "rate", "any")) {
+            final Function<Double, Object> typed = key.equals("rate") ? Double::floatValue : value -> value;
+            final List<String> types = key.equals("any") ? Collections.singletonList("plain")
+                : Arrays.asList("plain", key + "Asc", key + "Desc", key + "Grouped", key + "Notes");
+            //Each range at each bound, the equalities of both zeros and of NaN, two within(), and has(key), as pairs
+            //of a predicate and its value
+            final List<Object[]> conditions = new ArrayList<>();
+            for (final double bound : new double[]{Double.NEGATIVE_INFINITY, -1.5, -0.0, 0.0, 1.5,
+                    Double.POSITIVE_INFINITY, Double.NaN}) {
+                for (final Cmp cmp : new Cmp[]{Cmp.LESS_THAN, Cmp.LESS_THAN_EQUAL, Cmp.GREATER_THAN,
+                        Cmp.GREATER_THAN_EQUAL}) {
+                    conditions.add(new Object[]{cmp, typed.apply(bound)});
+                }
+            }
+            for (final double point : new double[]{-0.0, 0.0, Double.NaN}) {
+                conditions.add(new Object[]{Cmp.EQUAL, typed.apply(point)});
+            }
+            conditions.add(new Object[]{Contain.IN, Arrays.asList(typed.apply(-0.0), typed.apply(0.0))});
+            conditions.add(new Object[]{Contain.IN, Arrays.asList(typed.apply(Double.NaN), typed.apply(1.5))});
+            conditions.add(new Object[]{Cmp.NOT_EQUAL, null});
+            //Each condition alone, and each pair of them but for the bounds at the infinities, in either order
+            final List<List<Object[]>> queries = new ArrayList<>();
+            conditions.forEach(condition -> queries.add(Collections.singletonList(condition)));
+            for (final Object[] first : conditions) {
+                for (final Object[] second : conditions) {
+                    if (first != second && !isInfinite(first[1]) && !isInfinite(second[1])) {
+                        queries.add(Arrays.asList(first, second));
+                    }
+                }
+            }
+            for (final List<Object[]> query : queries) {
+                final List<Integer> expected = new ArrayList<>();
+                for (int uid = 0; uid < values.length; uid++) {
+                    final Object value = values[uid] == null ? null : typed.apply(values[uid]);
+                    if (query.stream().allMatch(condition -> ((JanusGraphPredicate) condition[0]).test(value,
+                            condition[1]))) {
+                        expected.add(uid);
+                    }
+                }
+                final String conditionsText = query.stream().map(condition -> key + " " + condition[0] + " "
+                    + condition[1]).collect(Collectors.joining(", "));
+                for (final boolean batch : query.size() == 1 ? new boolean[]{false, true} : new boolean[]{false}) {
+                    final JanusGraphTransaction check = graph.newTransaction();
+                    final JanusGraphVertex vertex = check.getVertex(v.id());
+                    for (final String type : types) {
+                        final List<Integer> uids;
+                        if (batch) {
+                            //Together with the vertex which the edges go to, which has no such edges out nor properties
+                            final JanusGraphVertex other = check.getVertex(to.id());
+                            final JanusGraphMultiVertexQuery relations = (JanusGraphMultiVertexQuery)
+                                relationsOf(check.multiQuery(vertex, other), type, key, query);
+                            final Map<JanusGraphVertex, ?> results = type.endsWith("Notes")
+                                ? relations.properties() : relations.edges();
+                            assertTrue(Iterables.isEmpty((Iterable<?>) results.get(other)),
+                                type + ": " + conditionsText);
+                            uids = sortedUids((Iterable<? extends JanusGraphRelation>) results.get(vertex));
+                        } else {
+                            final JanusGraphVertexQuery relations =
+                                (JanusGraphVertexQuery) relationsOf(vertex.query(), type, key, query);
+                            uids = sortedUids(type.endsWith("Notes") ? relations.properties() : relations.edges());
+                        }
+                        assertEquals(expected, uids, (batch ? "batch: " : "") + type + ": " + conditionsText);
+                    }
+                    check.rollback();
+                }
+            }
+        }
+
+        //A range from a start, which ends before NaN, one which ends at a zero, has(key), a range of NaN, which holds
+        //NaN alone, and both zeros, a slice each, are fitted where an index sorts the relations by the key, and
+        //checked in memory where none does
+        final JanusGraphTransaction plan = graph.newTransaction();
+        final JanusGraphVertex vertex = plan.getVertex(v.id());
+        for (final String key : Arrays.asList("score", "rate")) {
+            final Function<Double, Object> typed = key.equals("rate") ? Double::floatValue : value -> value;
+            for (final String type : Arrays.asList(key + "Asc", key + "Desc", key + "Grouped", key + "Notes")) {
+                final RelationCategory category = type.endsWith("Notes") ? PROPERTY : EDGE;
+                final Function<Object[], JanusGraphVertexQuery> relations = condition -> (JanusGraphVertexQuery)
+                    relationsOf(vertex.query(), type, key, Collections.singletonList(condition));
+                evaluateQuery(relations.apply(new Object[]{Cmp.GREATER_THAN, typed.apply(1.5)}),
+                    category, 1, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Cmp.GREATER_THAN_EQUAL, typed.apply(0.0)}),
+                    category, 4, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Cmp.LESS_THAN, typed.apply(-0.0)}),
+                    category, 2, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Cmp.LESS_THAN_EQUAL, typed.apply(0.0)}),
+                    category, 4, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Cmp.NOT_EQUAL, null}),
+                    category, 7, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Cmp.LESS_THAN_EQUAL, typed.apply(Double.NaN)}),
+                    category, 1, 1, new boolean[]{true, true});
+                evaluateQuery(relations.apply(new Object[]{Contain.IN,
+                    Arrays.asList(typed.apply(-0.0), typed.apply(0.0))}), category, 2, 2, new boolean[]{true, true});
+            }
+            evaluateQuery((JanusGraphVertexQuery) relationsOf(vertex.query(), "plain", key,
+                    Collections.singletonList(new Object[]{Cmp.GREATER_THAN, typed.apply(1.5)})),
+                EDGE, 1, 1, new boolean[]{false, true});
+        }
+        plan.rollback();
+    }
+
+    //The query of the vertex's properties of the type, a key whose name ends in "Notes", or of its edges of the label,
+    //out, of group 1 where the label's index sorts them by the group first, under the conditions on the key
+    private static BaseVertexQuery relationsOf(BaseVertexQuery query, String type, String key,
+                                               List<Object[]> conditions) {
+        query = type.endsWith("Notes") ? query.keys(type) : query.labels(type).direction(OUT);
+        if (type.endsWith("Grouped")) query = query.has("group", 1);
+        for (final Object[] condition : conditions) {
+            query = query.has(key, (JanusGraphPredicate) condition[0], condition[1]);
+        }
+        return query;
+    }
+
+    private static boolean isInfinite(Object value) {
+        return value instanceof Number && Double.isInfinite(((Number) value).doubleValue());
+    }
+
+    //The uids of the relations, ascending
+    private static List<Integer> sortedUids(Iterable<? extends JanusGraphRelation> relations) {
+        final List<Integer> uids = new ArrayList<>();
+        relations.forEach(relation -> uids.add(relation.value("uid")));
+        Collections.sort(uids);
+        return uids;
     }
 
     // flaky test: https://github.com/JanusGraph/janusgraph/issues/1498
@@ -2524,6 +3018,58 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
                 ElementCategory.EDGE, 0, new boolean[]{true, true}, "edgesByTime");
     }
 
+    //A composite index still holds the edges which the transaction removed, and a query leaves them out of what the
+    //index returns: one with a limit reads on past them
+    @Test
+    public void testLimitedQueryOfACompositeIndexReadsPastTheEdgesWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("roadsByKind", Edge.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex();
+        final Vertex to = tx.addVertex();
+        for (long w = 1; w <= 30; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+        tx.traversal().V(from).outE("road").has("weight", P.lte(25L)).toList().forEach(Edge::remove);
+
+        final List<Edge> anyThree = tx.traversal().E().has("kind", "paved").limit(3).toList();
+        assertEquals(3, anyThree.stream().distinct().count());
+        for (final Edge edge : anyThree) {
+            assertTrue(edge.<Long>value("weight") > 25);
+        }
+        assertEquals(5, tx.traversal().E().has("kind", "paved").toList().size());
+        tx.rollback();
+        newTx();
+
+        //A query which drops the edges it reads, as it reads them, before it reads on drops each of its edges once
+        tx.traversal().V(from).outE("road").has("weight", P.inside(8L, 26L)).toList().forEach(Edge::remove);
+        tx.traversal().V(from).outE("road").has("weight", P.lte(5L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("kind", "paved").limit(5).drop().iterate();
+        assertEquals(3, tx.traversal().E().has("kind", "paved").toList().size());
+    }
+
+    //A query without a limit which the index answers under one all the same, as under query.hard-max-limit, and which
+    //drops the edges it reads, as it reads them, drops each of them once it reads on past that limit
+    @Test
+    public void testQueryUnderTheHardMaxLimitDropsEveryEdgeItReads() {
+        clopen(option(HARD_MAX_LIMIT), 10);
+        final PropertyKey kind = makeKey("kind", String.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("roadsByKind", Edge.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex();
+        final Vertex to = tx.addVertex();
+        for (int i = 0; i < 30; i++) {
+            from.addEdge("road", to, "kind", "paved");
+        }
+        newTx();
+        tx.traversal().E().has("kind", "paved").drop().iterate();
+        assertEquals(0L, tx.traversal().V(from).outE("road").count().next());
+    }
+
     @Test
     public void testRemoveStaleEntriesActionApplicability() {
         mgmt.makePropertyKey("name").dataType(String.class).make();
@@ -2907,6 +3453,242 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         } catch (IllegalArgumentException ignored) {
         }
 
+    }
+
+    @Test
+    public void testEdgesOfAVertexHasIdWithin() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        Edge e1 = v.addEdge("knows", u);
+        Edge e2 = v.addEdge("knows", u);
+        Edge e3 = v.addEdge("knows", w);
+        Edge e4 = u.addEdge("knows", v);
+        Edge other = u.addEdge("knows", w);
+
+        assertEdgesOfAVertexHasIdWithin(graph.traversal(), v, e1, e2, e3, e4, other);
+        graph.tx().commit();
+        assertEdgesOfAVertexHasIdWithin(graph.traversal(), v, e1, e2, e3, e4, other);
+    }
+
+    private void assertEdgesOfAVertexHasIdWithin(GraphTraversalSource g, Vertex v, Edge e1, Edge e2, Edge e3, Edge e4,
+                                                 Edge other) {
+        RelationIdentifier missing = RelationIdentifier.get(new Object[]{4L, 5L, 6L, 7L});
+
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(e1.id()).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(P.within(e1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), g.V(v).outE().hasId(P.within(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).outE("knows").hasId(P.within(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).outE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e4.id()), g.V(v).inE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e4.id()), g.V(v).bothE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(P.within(e1.id(), e1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(P.within(e1.id().toString(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e3.id()), g.V(v).bothE().hasId(P.within(e3.id(), other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).bothE().hasId(P.within(other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).bothE().hasId(P.within()).id().toSet());
+
+        assertEquals(ImmutableSet.of(e3.id(), e4.id()), g.V(v).bothE().hasId(P.without(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id(), e3.id()), g.V(v).outE().hasId(P.without(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id(), e4.id()),
+            g.V(v).bothE().hasId(P.without(other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id(), e4.id()),
+            g.V(v).bothE().hasId(P.without()).id().toSet());
+
+        //Several ids or a collection of them, which TinkerPop turns into within
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), g.V(v).bothE().hasId(e1.id(), e2.id()).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(Arrays.asList(e1.id(), e2.id())).id().toSet());
+        //Connective predicates, each of whose predicates compares ids
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(P.eq(e1.id()).or(P.eq(e2.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id()),
+            g.V(v).bothE().hasId(P.within(e1.id(), e2.id()).or(P.eq(e3.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e3.id()),
+            g.V(v).bothE().hasId(P.within(e1.id(), e2.id(), e3.id()).and(P.without(e2.id()))).id().toSet());
+    }
+
+    @Test
+    public void testEdgesOfAVertexHasIdWithinOnSortKeyAndConstrainedLabels() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makeEdgeLabel("manager").multiplicity(Multiplicity.MANY2ONE).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        Edge rated1 = v.addEdge("rated", u, "time", 1);
+        Edge rated2 = v.addEdge("rated", u, "time", 2);
+        Edge rated3 = v.addEdge("rated", w, "time", 2);
+        Edge manager = v.addEdge("manager", w);
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of(rated1.id(), rated3.id()),
+            g.V(v).outE("rated").hasId(P.within(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated3.id()),
+            g.V(v).outE("rated").has("time", 2).hasId(P.within(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated2.id()),
+            g.V(v).outE("rated").hasId(P.without(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(manager.id()),
+            g.V(v).outE("manager").hasId(P.within(manager.id(), rated1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).outE("manager").hasId(P.without(manager.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated2.id(), manager.id()),
+            g.V(v).outE("rated", "manager").hasId(P.within(rated2.id(), manager.id())).id().toSet());
+    }
+
+    //With an adjacent vertex, the ids of the edges of a label of several edges between two vertices are part of the
+    //columns which the query reads, so a collection of them narrows the read itself
+    @Test
+    public void testEdgesOfAVertexToAnAdjacentVertexHasIdWithin() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u);
+        JanusGraphEdge e2 = v.addEdge("knows", u);
+        JanusGraphEdge e3 = v.addEdge("knows", w);
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.NOT_IN, ImmutableList.of(e1.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), edgeIds(v.query().adjacent(u).direction(BOTH).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e2.id(), e3.id())).edges()));
+    }
+
+    //Conditions on the same key of a vertex-centric query narrow each other, also where they narrow its read
+    @Test
+    public void testConditionsOnTheSameKeyOfAVertexCentricQueryNarrowEachOther() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makePropertyKey("payload").dataType(byte[].class).make();
+        mgmt.makePropertyKey("any").dataType(Object.class).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u, "payload", new byte[]{1});
+        JanusGraphEdge e2 = v.addEdge("knows", u, "any", 2L);
+        JanusGraphEdge e3 = v.addEdge("knows", u);
+        for (int i = 1; i <= 3; i++) {
+            v.addEdge("rated", u, "time", i);
+        }
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e2.id()))
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e2.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, new AndJanusPredicate(Arrays.asList(Contain.IN, Contain.IN)),
+                Arrays.asList(ImmutableList.of(e1.id(), e2.id()), ImmutableList.of(e2.id(), e3.id()))).edges()));
+        assertEquals(ImmutableSet.of(), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id()))
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e3.id())).edges()));
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within(1, 2)).has("time", P.within(2, 3)).values("time").toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.gt(1)).has("time", P.within(1, 2)).values("time").toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within(1, 2)).has("time", P.gt(1)).values("time").toList());
+
+        //Arrays are equal by their contents, as the conditions compare them, not by identity
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().labels("knows")
+            .has("payload", Contain.IN, Arrays.asList(new byte[]{1}, new byte[]{2}))
+            .has("payload", Contain.IN, Arrays.asList(new byte[]{1}, new byte[]{3})).edges()));
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().labels("knows")
+            .has("payload", new byte[]{1}).has("payload", new byte[]{1}).edges()));
+
+        //The values of a key of any type may be numbers of different types, which the conditions compare
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Cmp.GREATER_THAN, 1).has("any", Contain.IN, Arrays.asList(2L, 3L)).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Contain.IN, Arrays.asList(2L, 3L)).has("any", Cmp.GREATER_THAN, 1).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Cmp.GREATER_THAN, 1).has("any", Cmp.LESS_THAN, 5L).edges()));
+    }
+
+    //A branch of a disjunction which no value satisfies, such as within() of nothing, leaves the other branches, and a
+    //disjunction of such branches alone is satisfied by none
+    @Test
+    public void testDisjunctionsOfConditionsWithBranchesWhichNothingSatisfies() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex("name", "a"), u = graph.addVertex("name", "b");
+        Edge e1 = v.addEdge("knows", u);
+        Edge e2 = v.addEdge("knows", u);
+        v.addEdge("rated", u, "time", 1);
+        v.addEdge("rated", u, "time", 2);
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of(), g.V(v).outE().hasId(P.within().or(P.within())).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id()),
+            g.V(v).outE().hasId(P.within().and(P.eq(e1.id())).or(P.eq(e2.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id()),
+            g.V(v).outE().hasId(P.eq(e2.id()).or(P.within().and(P.eq(e1.id())))).id().toSet());
+
+        assertEquals(ImmutableList.of(), g.V(v).outE("rated").has("time", P.within().or(P.within())).toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within().and(P.eq(1)).or(P.eq(2))).values("time").toList());
+
+        assertEquals(ImmutableList.of(), g.V().has("name", P.within().or(P.within())).toList());
+        assertEquals(ImmutableList.of("b"),
+            g.V().has("name", P.within().and(P.eq("a")).or(P.eq("b"))).values("name").toList());
+        assertEquals(ImmutableList.of("b"),
+            g.V().has("name", P.eq("b").or(P.within().and(P.eq("a")))).values("name").toList());
+    }
+
+    @Test
+    public void testPropertiesOfAVertexHasIdWithin() {
+        mgmt.makePropertyKey("nickname").dataType(String.class).cardinality(Cardinality.LIST).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex();
+        VertexProperty<?> a = v.property(VertexProperty.Cardinality.list, "nickname", "a");
+        VertexProperty<?> b = v.property(VertexProperty.Cardinality.list, "nickname", "b");
+        VertexProperty<?> c = v.property(VertexProperty.Cardinality.list, "nickname", "c");
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of("a", "c"),
+            g.V(v).properties("nickname").hasId(P.within(a.id(), c.id())).value().toSet());
+        assertEquals(ImmutableSet.of("b"),
+            g.V(v).properties("nickname").hasId(P.without(a.id(), c.id())).value().toSet());
+        assertEquals(ImmutableSet.of("a", "b"), g.V(v).properties().hasId(a.id(), b.id()).value().toSet());
+    }
+
+    @Test
+    public void testVertexCentricQueryHasIdCollection() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u);
+        JanusGraphEdge e2 = v.addEdge("knows", u);
+        JanusGraphEdge e3 = v.addEdge("knows", u);
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1, e2.id().toString())).edges()));
+        assertEquals(ImmutableSet.of(e3.id()), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.NOT_IN, ImmutableList.of(e1.id(), e2.id())).edges()));
+        assertEquals(ImmutableSet.of(e3.id()), edgeIds(u.query().direction(IN).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e3.id())).edges()));
+        assertEquals(ImmutableSet.of(), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.IN, ImmutableList.of()).edges()));
+
+        //An id which isn't one, among several or alone
+        IllegalArgumentException invalid = assertThrows(IllegalArgumentException.class,
+            () -> v.query().has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), "notAnEdgeId")));
+        assertTrue(invalid.getMessage().contains("notAnEdgeId"), invalid::getMessage);
+        //A predicate other than within and without compares one id, not a collection of them
+        assertThrows(IllegalArgumentException.class,
+            () -> v.query().has(ID_NAME, Cmp.EQUAL, ImmutableList.of(e1.id(), e2.id())));
+    }
+
+    private static Set<Object> edgeIds(Iterable<JanusGraphEdge> edges) {
+        final Set<Object> ids = new HashSet<>();
+        edges.forEach(edge -> ids.add(edge.id()));
+        return ids;
     }
 
     @Test
@@ -3669,10 +4451,13 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
     /**
      * Execute multiple identical transactions concurrently. Note that since these transactions are running in the same process,
-     * {@link org.janusgraph.diskstorage.locking.LocalLockMediator} is used to resolve lock contentions. If there is only
-     * one lock needed in the whole transaction, exactly one transaction shall succeed and others shall fail due to local
-     * lock contention. If there is more than one lock needed in the transaction, at most one transaction shall succeed
-     * and others shall fail due to local lock contention.
+     * lock contentions are resolved within it: by {@link org.janusgraph.diskstorage.locking.LocalLockMediator} for
+     * JanusGraph's own locker, and by the locks of the storage backend where it has them, as BerkeleyJE does. If there
+     * is only one lock needed in the whole transaction, exactly one transaction shall succeed and others shall fail due
+     * to local lock contention. If there is more than one lock needed in the transaction, at most one transaction shall
+     * succeed and others shall fail due to local lock contention. A transaction which takes a lock only once the one
+     * which succeeded has released it fails on the value it expected instead, which a thread a few milliseconds late
+     * does on BerkeleyJE, whose locks last as long as the commit which takes them.
      * @throws Exception
      */
     @Test
@@ -3736,7 +4521,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
      * Execute multiple transactions in different threads concurrently to test locking
      * @param job A transaction job which triggers locking
      * @param concurrency Number of threads, each of which runs a transaction
-     * @return [number of successful transactions, number of transactions failed due to local lock contention]
+     * @return [number of successful transactions, number of transactions which failed on a lock]
      */
     private int[] executeParallelTransactions(final TransactionJob job, int concurrency) {
         final CountDownLatch startLatch = new CountDownLatch(concurrency);
@@ -3758,8 +4543,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
                     } catch (Exception ex) {
                         ex.printStackTrace();
                         if (tx.isOpen()) tx.rollback();
-                        if (ex.getCause() instanceof PermanentLockingException &&
-                            ex.getCause().getMessage().contains("Local lock contention")) {
+                        if (isLockingFailure(ex)) {
                             lockingExCount.incrementAndGet();
                         }
                     } finally {
@@ -3784,6 +4568,150 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             e.printStackTrace();
         }
         return new int[] {txSuccess.get(), lockingExCount.get()};
+    }
+
+    /**
+     * Transactions which add a vertex of the same value of a unique index with LOCK consistency commit at once: one of
+     * them adds it, and the commits of the others fail on the lock of the index entry.
+     */
+    @Test
+    public void testConcurrentTransactionsCannotAddTheSameValueOfALockedUniqueIndex() throws Exception {
+        makeLockedUniqueName();
+        assertEquals(1, addVerticesAtOnce(Collections.singletonList(graph), 8, "same"));
+        newTx();
+        assertEquals(1, verticesNamed(tx, "same").size());
+    }
+
+    /**
+     * A transaction which adds a value of a unique index with LOCK consistency that another transaction committed after
+     * it began fails to commit, as the locked index entry no longer has the value it read, and releases the lock.
+     */
+    @Test
+    public void testCommitWhichFailsOnALockReleasesIt() {
+        makeLockedUniqueName();
+        final JanusGraphTransaction late = graph.newTransaction();
+        late.addVertex("name", "one");
+        tx.addVertex("name", "one");
+        newTx();
+        final JanusGraphException failure = assertThrows(JanusGraphException.class, late::commit);
+        assertTrue(isLockingFailure(failure), () -> "Not a locking failure: " + failure);
+
+        //Removing the vertex and adding the value again lock the index entry too, which a leaked lock would fail
+        Iterables.getOnlyElement(tx.query().has("name", "one").vertices()).remove();
+        newTx();
+        tx.addVertex("name", "one");
+        newTx();
+        assertEquals(1, verticesNamed(tx, "one").size());
+    }
+
+    protected void makeLockedUniqueName() {
+        final PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.setConsistency(mgmt.buildIndex("byName", Vertex.class).addKey(name).unique().buildCompositeIndex(),
+            ConsistencyModifier.LOCK);
+        finishSchema();
+    }
+
+    /**
+     * Adds a vertex of the given name in a transaction of each thread, of the graphs in turn, which all commit at once.
+     * The commits which fail must fail on a lock.
+     *
+     * @return the number of transactions which committed
+     */
+    protected static int addVerticesAtOnce(List<? extends JanusGraph> graphs, int threads, String name)
+            throws Exception {
+        final CyclicBarrier readyToCommit = new CyclicBarrier(threads);
+        final ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            final List<Future<?>> commits = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                final JanusGraph threadGraph = graphs.get(i % graphs.size());
+                commits.add(executor.submit(() -> {
+                    final JanusGraphTransaction transaction = threadGraph.newTransaction();
+                    try {
+                        transaction.addVertex("name", name);
+                        readyToCommit.await(30, TimeUnit.SECONDS);
+                        transaction.commit();
+                        return null;
+                    } catch (Exception e) {
+                        //A rollback which fails as well mustn't hide why the transaction failed
+                        try {
+                            if (transaction.isOpen()) transaction.rollback();
+                        } catch (RuntimeException rollbackFailure) {
+                            e.addSuppressed(rollbackFailure);
+                        }
+                        throw e;
+                    }
+                }));
+            }
+            int committed = 0;
+            for (Future<?> commit : commits) {
+                try {
+                    commit.get(60, TimeUnit.SECONDS);
+                    committed++;
+                } catch (ExecutionException e) {
+                    assertTrue(isLockingFailure(e.getCause()), () -> "Not a locking failure: " + e.getCause());
+                }
+            }
+            return committed;
+        } finally {
+            //Not interrupted, as BerkeleyJE invalidates its environment when a thread is interrupted in it
+            executor.shutdown();
+        }
+    }
+
+    //Every vertex of the name, which a unique index can't tell, as it holds one entry for each value
+    protected static List<JanusGraphVertex> verticesNamed(JanusGraphTransaction transaction, String name) {
+        final List<JanusGraphVertex> named = new ArrayList<>();
+        for (JanusGraphVertex vertex : transaction.query().vertices()) {
+            if (name.equals(vertex.valueOrNull(transaction.getPropertyKey("name")))) named.add(vertex);
+        }
+        return named;
+    }
+
+    /**
+     * Two management systems which create a type of the same name: the commit of the second one fails on the lock of
+     * the schema name, and the schema keeps the first type alone. The failed commit releases the lock: renaming the
+     * type takes it again.
+     */
+    @Test
+    public void testManagementSystemsCannotBothCreateATypeOfOneName() {
+        final JanusGraphManagement first = graph.openManagement();
+        final JanusGraphManagement second = graph.openManagement();
+        first.makePropertyKey("age").dataType(Integer.class).make();
+        second.makePropertyKey("age").dataType(Long.class).make();
+        first.commit();
+        final JanusGraphException failure = assertThrows(JanusGraphException.class, second::commit);
+        assertTrue(isLockingFailure(failure), () -> "Not a locking failure: " + failure);
+        if (second.isOpen()) second.rollback();
+
+        final JanusGraphManagement schema = graph.openManagement();
+        try {
+            final List<Class<?>> ages = new ArrayList<>();
+            for (PropertyKey key : schema.getRelationTypes(PropertyKey.class)) {
+                if (key.name().equals("age")) ages.add(key.dataType());
+            }
+            assertEquals(Collections.singletonList(Integer.class), ages);
+        } finally {
+            schema.rollback();
+        }
+
+        final JanusGraphManagement rename = graph.openManagement();
+        rename.changeName(rename.getPropertyKey("age"), "years");
+        rename.commit();
+        final JanusGraphManagement renamed = graph.openManagement();
+        try {
+            assertFalse(renamed.containsPropertyKey("age"));
+            assertEquals(Integer.class, renamed.getPropertyKey("years").dataType());
+        } finally {
+            renamed.rollback();
+        }
+    }
+
+    protected static boolean isLockingFailure(Throwable failure) {
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            if (cause instanceof PermanentLockingException || cause instanceof TemporaryLockingException) return true;
+        }
+        return false;
     }
 
    /* ==================================================================================
@@ -4292,7 +5220,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         u = getV(tx, u);
 
         evaluateQuery(v.query().keys("name").has("weight", Cmp.GREATER_THAN, 3.6),
-                PROPERTY, 2 * numV / 10, 1, new boolean[]{false, true});
+                PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true});
         evaluateQuery(v.query().keys("name").has("weight", Cmp.LESS_THAN, 0.9).orderBy("weight", asc),
                 PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true}, weight, Order.ASC);
         evaluateQuery(v.query().keys("name").interval("weight", 1.1, 2.2).orderBy("weight", desc).limit(numV / 10),
@@ -4376,7 +5304,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         u = getV(tx, u);
 
         evaluateQuery(v.query().keys("name").has("weight", Cmp.GREATER_THAN, 3.6),
-                PROPERTY, 2 * numV / 10, 1, new boolean[]{false, true});
+                PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true});
         evaluateQuery(v.query().keys("name").has("weight", Cmp.LESS_THAN, 0.9).orderBy("weight", asc),
                 PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true}, weight, Order.ASC);
         evaluateQuery(v.query().keys("name").interval("weight", 1.1, 2.2).orderBy("weight", desc).limit(numV / 10),
@@ -4472,7 +5400,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //######### UPDATED QUERIES ##########
 
         evaluateQuery(v.query().keys("name").has("weight", Cmp.GREATER_THAN, 3.6),
-                PROPERTY, 2 * numV / 10, 1, new boolean[]{false, true});
+                PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true});
         evaluateQuery(v.query().keys("name").interval("time", numV / 2 - 10, numV / 2 + 10),
                 PROPERTY, 10, 1, new boolean[]{false, true});
         evaluateQuery(v.query().keys("name").interval("time", numV / 2 - 10, numV / 2 + 10).orderBy("weight", desc),
@@ -4508,7 +5436,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //######### UPDATED QUERIES (copied from above) ##########
 
         evaluateQuery(v.query().keys("name").has("weight", Cmp.GREATER_THAN, 3.6),
-                PROPERTY, 2 * numV / 10, 1, new boolean[]{false, true});
+                PROPERTY, 2 * numV / 10, 1, new boolean[]{true, true});
         evaluateQuery(v.query().keys("name").interval("time", numV / 2 - 10, numV / 2 + 10),
                 PROPERTY, 10, 1, new boolean[]{false, true});
         evaluateQuery(v.query().keys("name").interval("time", numV / 2 - 10, numV / 2 + 10).orderBy("weight", desc),
@@ -4994,6 +5922,38 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         }
     }
 
+    @Test
+    public void testEdgeLabelMappedConnectionsSharingOutVertexLabel() {
+        VertexLabel transaction = mgmt.makeVertexLabel("transaction").make();
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        VertexLabel entity = mgmt.makeVertexLabel("entity").make();
+        VertexLabel account = mgmt.makeVertexLabel("account").make();
+        EdgeLabel from = mgmt.makeEdgeLabel("from").make();
+        mgmt.addConnection(from, person, transaction);
+        mgmt.addConnection(from, entity, transaction);
+        EdgeLabel to = mgmt.makeEdgeLabel("to").make();
+        mgmt.addConnection(to, transaction, person);
+        mgmt.addConnection(to, transaction, entity);
+        mgmt.addConnection(to, transaction, account);
+        //Each connection once, also before the schema is committed: three connections sharing their outgoing vertex
+        //label came nine times
+        assertEquals(3, to.mappedConnections().size());
+        finishSchema();
+
+        assertEquals(Arrays.asList("entity->transaction", "person->transaction"),
+            connections(mgmt.getEdgeLabel("from")));
+        assertEquals(Arrays.asList("transaction->account", "transaction->entity", "transaction->person"),
+            connections(mgmt.getEdgeLabel("to")));
+    }
+
+    //The connections of the edge label as outgoing->incoming vertex label names, in alphabetical order
+    private static List<String> connections(EdgeLabel label) {
+        return label.mappedConnections().stream()
+            .map(c -> c.getOutgoingVertexLabel().name() + "->" + c.getIncomingVertexLabel().name())
+            .sorted()
+            .collect(Collectors.toList());
+    }
+
     private void createStrictSchemaForConnections() {
         clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
         VertexLabel user = mgmt.makeVertexLabel("user").make();
@@ -5116,6 +6076,196 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertThrows(IllegalArgumentException.class, () -> v3.addEdge("E2", v4));
         assertThrows(IllegalArgumentException.class, () -> v3.addEdge("E1", v2));
         assertThrows(IllegalArgumentException.class, () -> v1.addEdge("E1", v4));
+    }
+
+    @Test
+    public void testAddingAConnectionTwiceInATransactionWritesItOnce() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        VertexLabel company = mgmt.makeVertexLabel("company").make();
+        EdgeLabel worksAt = mgmt.makeEdgeLabel("worksAt").make();
+        mgmt.addConnection(worksAt, person, company);
+        mgmt.addConnection(worksAt, person, company);
+        //The connection is found once, also before the schema is committed
+        assertEquals(1, worksAt.mappedConnections().size());
+        assertEquals(1, person.mappedConnections().size());
+        finishSchema();
+
+        assertEquals(1, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    @Test
+    public void testAddingACommittedConnectionAgainWritesNothing() {
+        mgmt.addConnection(mgmt.makeEdgeLabel("worksAt").make(), mgmt.makeVertexLabel("person").make(),
+            mgmt.makeVertexLabel("company").make());
+        finishSchema();
+
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("company"));
+        finishSchema();
+
+        assertEquals(1, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+        //A connection from a vertex label to itself as well
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("person"));
+        finishSchema();
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("person"));
+        finishSchema();
+
+        assertEquals(2, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(2, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    /**
+     * An edge label finds its connections through the outgoing vertex labels it links to: the connections of an edge
+     * label which share an outgoing vertex label link to it once.
+     */
+    @Test
+    public void testConnectionsWhichShareTheirOutgoingVertexLabelLinkToItOnce() {
+        VertexLabel transfer = mgmt.makeVertexLabel("transfer").make();
+        EdgeLabel to = mgmt.makeEdgeLabel("to").make();
+        for (String name : new String[]{"person", "company", "account"}) {
+            mgmt.addConnection(to, transfer, mgmt.makeVertexLabel(name).make());
+        }
+        assertEquals(1, Iterables.size(((JanusGraphSchemaVertex) to).getEdges(
+            TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, Direction.OUT)));
+        finishSchema();
+
+        assertEquals(1, Iterables.size(((JanusGraphSchemaVertex) mgmt.getEdgeLabel("to")).getEdges(
+            TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, Direction.OUT)));
+    }
+
+    /**
+     * An ordinary transaction which adds several edges of a connection it creates under schema.constraints=true checks
+     * the connections of the committed schema each time, which don't hold it yet, and creates the connection once.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsWrittenOnceByATransaction() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        final JanusGraphTransaction t = graph.newTransaction();
+        for (int i = 0; i < 3; i++) {
+            t.addVertex("person").addEdge("knows", t.addVertex("person"));
+        }
+        t.commit();
+
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    @Test
+    public void testAddingAPropertyWhichALabelHasWritesNothing() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        EdgeLabel knows = mgmt.makeEdgeLabel("knows").make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        PropertyKey since = mgmt.makePropertyKey("since").dataType(Integer.class).make();
+        mgmt.addProperties(person, name);
+        mgmt.addProperties(person, name, name);
+        mgmt.addProperties(knows, since);
+        mgmt.addProperties(knows, since);
+        //Each property is found once, also before the schema is committed
+        assertEquals(Collections.singletonList(name), new ArrayList<>(person.mappedProperties()));
+        assertEquals(Collections.singletonList(since), new ArrayList<>(knows.mappedProperties()));
+        finishSchema();
+
+        //A call of one key, and of several keys: one of which the label has, and one which it doesn't have, twice
+        mgmt.addProperties(mgmt.getVertexLabel("person"), mgmt.getPropertyKey("name"));
+        mgmt.addProperties(mgmt.getVertexLabel("person"), mgmt.getPropertyKey("name"),
+            mgmt.makePropertyKey("age").dataType(Integer.class).make());
+        mgmt.addProperties(mgmt.getEdgeLabel("knows"), mgmt.getPropertyKey("since"));
+        final PropertyKey weight = mgmt.makePropertyKey("weight").dataType(Double.class).make();
+        mgmt.addProperties(mgmt.getEdgeLabel("knows"), weight, weight);
+        finishSchema();
+
+        assertEquals(Arrays.asList("age", "name"), mgmt.getVertexLabel("person").mappedProperties().stream()
+            .map(PropertyKey::name).sorted().collect(Collectors.toList()));
+        assertEquals(Arrays.asList("since", "weight"), mgmt.getEdgeLabel("knows").mappedProperties().stream()
+            .map(PropertyKey::name).sorted().collect(Collectors.toList()));
+    }
+
+    /**
+     * An ordinary transaction which adds a property to several vertices and edges under schema.constraints=true checks
+     * the properties of the committed schema each time, which don't hold it yet, and adds the property to the label
+     * once.
+     */
+    @Test
+    public void testAutoCreatedPropertyConstraintsAreWrittenOnceByATransaction() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.makePropertyKey("since").dataType(Integer.class).make();
+        finishSchema();
+
+        final JanusGraphTransaction t = graph.newTransaction();
+        for (int i = 0; i < 3; i++) {
+            t.addVertex(T.label, "person", "name", "n" + i).addEdge("knows", t.addVertex("person"), "since", i);
+        }
+        t.commit();
+
+        assertEquals(1, mgmt.getVertexLabel("person").mappedProperties().size());
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedProperties().size());
+    }
+
+    /**
+     * A read-only transaction can't add a connection or property, also not one which the schema has already: the
+     * write access is checked before the schema is.
+     */
+    @Test
+    public void testAddingAConstraintWhichTheSchemaHasFailsInAReadOnlyTransaction() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        PropertyKey age = mgmt.makePropertyKey("age").dataType(Integer.class).make();
+        mgmt.addConnection(mgmt.makeEdgeLabel("knows").make(), person, person);
+        mgmt.addProperties(person, name, age);
+        finishSchema();
+
+        final JanusGraphTransaction readOnly = graph.buildTransaction().readOnly().start();
+        try {
+            final VertexLabel readPerson = readOnly.getVertexLabel("person");
+            assertThrows(ReadOnlyTransactionException.class,
+                () -> readOnly.addConnection(readOnly.getEdgeLabel("knows"), readPerson, readPerson));
+            assertThrows(ReadOnlyTransactionException.class,
+                () -> readOnly.addProperties(readPerson, readOnly.getPropertyKey("name")));
+            assertThrows(ReadOnlyTransactionException.class, () -> readOnly.addProperties(readPerson,
+                readOnly.getPropertyKey("name"), readOnly.getPropertyKey("age")));
+        } finally {
+            readOnly.rollback();
+        }
+    }
+
+    /**
+     * Renaming an edge label renames each of its connection edges, also the copies of a connection which an earlier
+     * JanusGraph version wrote when the connection was added more than once.
+     */
+    @Test
+    public void testRenamingAnEdgeLabelRenamesEachCopyOfItsConnections() {
+        clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
+        VertexLabel v1 = mgmt.makeVertexLabel("V1").make();
+        VertexLabel v2 = mgmt.makeVertexLabel("V2").make();
+        EdgeLabel e1 = mgmt.makeEdgeLabel("E1").make();
+        //Two copies of the connection and of the edge label's link to V1, as earlier versions wrote them
+        final StandardJanusGraphTx schemaTx = ((ManagementSystem) mgmt).getWrappedTx();
+        for (int i = 0; i < 2; i++) {
+            schemaTx.addSchemaEdge(v1, v2, TypeDefinitionCategory.CONNECTION_EDGE, "E1");
+            schemaTx.addSchemaEdge(e1, v1, TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, null);
+        }
+        finishSchema();
+
+        mgmt.changeName(mgmt.getEdgeLabel("E1"), "E2");
+        finishSchema();
+
+        final Collection<Connection> connections = mgmt.getVertexLabel("V1").mappedConnections();
+        assertEquals(2, connections.size());
+        for (Connection connection : connections) {
+            assertEquals("E2", connection.getEdgeLabel());
+        }
+        tx.addVertex("V1").addEdge("E2", tx.addVertex("V2"));
     }
 
 
@@ -8656,6 +9806,45 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             annotatnions.get("queries").equals("[friend-no-index:SliceQuery[0x7180,0x7181), 2069:byTime:SliceQuery[0xB0E0FF7FFFFF9B,0xB0E0FF7FFFFF9C)]"));
     }
 
+    /**
+     * The conditions of a vertex-centric query compare two strings by UTF-16 unit, the order in which the storage
+     * backend holds the sort keys whose slices answer the query, so that the edges the transaction added match as the
+     * stored ones do; a graph query compares them by code point instead. By UTF-16 unit, U+1F600 and U+1F601, whose
+     * first units are surrogates, come before U+E000.
+     */
+    @Test
+    public void testVertexCentricConditionsCompareStringsByUtf16Unit() {
+        final PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        final EdgeLabel link = mgmt.makeEdgeLabel("link").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildEdgeIndex(link, "linkByName", Direction.OUT, asc, name);
+        finishSchema();
+        JanusGraphVertex v = tx.addVertex();
+        for (final String s : Arrays.asList("a", "\uE000", "\uFFFF", "\uD83D\uDE00")) {
+            v.addEdge("link", tx.addVertex(), "name", s);
+        }
+        newTx();
+        v = getV(tx, v);
+        for (final String s : Arrays.asList("\uE000a", "\uD83D\uDE01")) {
+            v.addEdge("link", tx.addVertex(), "name", s);
+        }
+        //The stored edges from a slice of the index, the new ones checked in memory, all in UTF-16 order
+        assertEquals(Arrays.asList("\uE000a", "\uFFFF"), edgeNames(v.query().labels("link").direction(OUT)
+            .has("name", Cmp.GREATER_THAN, "\uE000").orderBy("name", asc).edges()));
+        assertEquals(Arrays.asList("a", "\uD83D\uDE00", "\uD83D\uDE01"), edgeNames(v.query().labels("link")
+            .direction(OUT).has("name", Cmp.LESS_THAN, "\uE000").orderBy("name", asc).edges()));
+        assertEquals(Arrays.asList("\uE000a", "\uFFFF"), tx.traversal().V(v).outE("link").has("name", P.gt("\uE000"))
+            .order().by("name", asc).values("name").toList());
+        //A graph query, here a scan, compares them by code point
+        assertEquals(Arrays.asList("\uE000a", "\uFFFF", "\uD83D\uDE00", "\uD83D\uDE01"),
+            tx.traversal().E().has("name", P.gt("\uE000")).order().by("name", asc).values("name").toList());
+    }
+
+    private static List<String> edgeNames(Iterable<JanusGraphEdge> edges) {
+        final List<String> names = new ArrayList<>();
+        edges.forEach(edge -> names.add(edge.value("name")));
+        return names;
+    }
+
     @Test
     public void testVertexCentricIndexWithNull() {
         EdgeLabel bought = makeLabel("bought");
@@ -8695,6 +9884,124 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             .edgeCount());
         assertEquals(2, v1.query().direction(OUT).labels("bought").hasNot("time").edgeCount());
         assertEquals(5, v1.query().direction(OUT).labels("bought").edgeCount());
+    }
+
+    //UUIDs in the order of their string forms, the first digit of either half of each from 8 up, or below it
+    private static final List<UUID> UUIDS_BY_STRING = Arrays.asList(
+        UUID.fromString("00000000-0000-0000-0000-000000000001"),
+        UUID.fromString("12345678-0000-0000-7fff-ffffffffffff"),
+        UUID.fromString("12345678-0000-0000-8000-000000000000"),
+        UUID.fromString("7fffffff-ffff-ffff-ffff-ffffffffffff"),
+        UUID.fromString("80000000-0000-0000-0000-000000000000"),
+        UUID.fromString("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+
+    /**
+     * The storage backend holds UUIDs which are sort keys by their bits as unsigned numbers, the order of their string
+     * forms, where UUID.compareTo compares them as signed numbers. A vertex-centric query compares them in that order:
+     * the edges which the transaction added come among the stored ones where the storage backend has those, and a range
+     * holds the UUIDs between its ends in that order, which select the slice of the stored ones.
+     */
+    @Test
+    public void testVertexCentricQueriesCompareUUIDsAsTheStorageBackendHoldsThem() {
+        final PropertyKey uid = mgmt.makePropertyKey("uid").dataType(UUID.class).make();
+        final EdgeLabel link = mgmt.makeEdgeLabel("link").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildEdgeIndex(link, "linkByUid", Direction.OUT, asc, uid);
+        finishSchema();
+        final List<UUID> byString = UUIDS_BY_STRING;
+        JanusGraphVertex v = tx.addVertex();
+        for (int i = 0; i < byString.size(); i += 2) {
+            v.addEdge("link", tx.addVertex(), "uid", byString.get(i));
+        }
+        newTx();
+        v = getV(tx, v);
+        for (int i = 1; i < byString.size(); i += 2) {
+            v.addEdge("link", tx.addVertex(), "uid", byString.get(i));
+        }
+        final List<UUID> reversed = new ArrayList<>(byString);
+        Collections.reverse(reversed);
+        assertEquals(byString, edgeUids(v.query().labels("link").direction(OUT).orderBy("uid", asc).edges()));
+        assertEquals(reversed, edgeUids(v.query().labels("link").direction(OUT).orderBy("uid", desc).edges()));
+        //Through a traversal whose order of the edges JanusGraph folds into the vertex-centric query
+        assertEquals(byString,
+            tx.traversal().V(v).local(__.outE("link").order().by("uid", asc)).values("uid").toList());
+        assertEquals(byString.subList(2, 6), edgeUids(v.query().labels("link").direction(OUT)
+            .has("uid", Cmp.GREATER_THAN, byString.get(1)).orderBy("uid", asc).edges()));
+        assertEquals(byString.subList(0, 3), edgeUids(v.query().labels("link").direction(OUT)
+            .has("uid", Cmp.LESS_THAN_EQUAL, byString.get(2)).orderBy("uid", asc).edges()));
+        //Ranges whose ends are in order only as unsigned numbers, or only as signed ones
+        assertEquals(byString.subList(4, 5), edgeUids(v.query().labels("link").direction(OUT)
+            .has("uid", Cmp.GREATER_THAN, byString.get(3)).has("uid", Cmp.LESS_THAN, byString.get(5)).edges()));
+        assertEquals(Collections.emptyList(), edgeUids(v.query().labels("link").direction(OUT)
+            .has("uid", Cmp.GREATER_THAN, byString.get(5)).has("uid", Cmp.LESS_THAN, byString.get(0)).edges()));
+    }
+
+    private static List<UUID> edgeUids(Iterable<JanusGraphEdge> edges) {
+        final List<UUID> uids = new ArrayList<>();
+        edges.forEach(edge -> uids.add(edge.value("uid")));
+        return uids;
+    }
+
+    /**
+     * A graph query which JanusGraph answers in memory, through a composite index or by a scan, orders UUIDs and checks
+     * ranges of them as the indexes sort them, by their string forms, with the vertices the transaction added.
+     */
+    @Test
+    public void testGraphQueriesCompareUUIDsInMemoryAsTheirStringForms() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("uid", UUID.class);
+        mgmt.buildIndex("byKind", Vertex.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final List<UUID> byString = UUIDS_BY_STRING;
+        for (int i = 0; i < byString.size(); i += 2) {
+            tx.addVertex("kind", "k", "uid", byString.get(i));
+        }
+        newTx();
+        for (int i = 1; i < byString.size(); i += 2) {
+            tx.addVertex("kind", "k", "uid", byString.get(i));
+        }
+        final GraphTraversalSource g = tx.traversal();
+        final List<UUID> reversed = new ArrayList<>(byString);
+        Collections.reverse(reversed);
+        //Through the composite index on the kind, and by a scan
+        for (final String kindOrScan : Arrays.asList("k", null)) {
+            assertEquals(byString, withKindOrUid(g, kindOrScan).order().by("uid", asc).values("uid").toList());
+            assertEquals(reversed.subList(0, 4),
+                withKindOrUid(g, kindOrScan).order().by("uid", desc).limit(4).values("uid").toList());
+            assertEquals(byString.subList(2, 6), withKindOrUid(g, kindOrScan).has("uid", P.gt(byString.get(1)))
+                .order().by("uid", asc).values("uid").toList());
+            assertEquals(byString.subList(0, 4), withKindOrUid(g, kindOrScan).has("uid", P.lte(byString.get(3)))
+                .order().by("uid", asc).values("uid").toList());
+        }
+    }
+
+    private static GraphTraversal<Vertex, Vertex> withKindOrUid(GraphTraversalSource g, String kind) {
+        return kind == null ? g.V().has("uid") : g.V().has("kind", kind);
+    }
+
+    /**
+     * The values of a key of SET cardinality come in the order in which the storage backend holds them, by their bits
+     * as unsigned numbers for UUIDs, with the values which the transaction added among the stored ones.
+     */
+    @Test
+    public void testUUIDsOfASetComeInTheOrderOfTheStorageBackend() {
+        mgmt.makePropertyKey("uids").dataType(UUID.class).cardinality(Cardinality.SET).make();
+        finishSchema();
+        JanusGraphVertex v = tx.addVertex();
+        for (int i = 0; i < UUIDS_BY_STRING.size(); i += 2) {
+            v.property("uids", UUIDS_BY_STRING.get(i));
+        }
+        newTx();
+        v = getV(tx, v);
+        for (int i = 1; i < UUIDS_BY_STRING.size(); i += 2) {
+            v.property("uids", UUIDS_BY_STRING.get(i));
+        }
+        final List<Object> uids = new ArrayList<>();
+        v.properties("uids").forEachRemaining(property -> uids.add(property.value()));
+        assertEquals(UUIDS_BY_STRING, uids);
+        newTx();
+        uids.clear();
+        getV(tx, v).properties("uids").forEachRemaining(property -> uids.add(property.value()));
+        assertEquals(UUIDS_BY_STRING, uids);
     }
 
     //Add more removal operations, different transaction contexts

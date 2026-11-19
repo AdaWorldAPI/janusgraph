@@ -45,18 +45,29 @@ import org.locationtech.spatial4j.shape.Shape;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.reflect.Array;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.UUID;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 
+import static org.janusgraph.testutil.JanusGraphAssert.assertSameChars;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -104,6 +115,67 @@ public class SerializerTest extends SerializerTestCommon {
             assertEquals(s2, serialize.readObjectByteOrder(b2.asReadBuffer(), String.class));
             assertEquals(Integer.signum(s1.compareTo(s2)), Integer.signum(b1.compareTo(b2)), s1 + " vs " + s2);
         }
+    }
+
+    /**
+     * The data types whose missing values the serializer writes last, as the byte -1 after every value of theirs, which
+     * lets the slice of a vertex-centric index end before the relations without a value of its sort key
+     */
+    @Test
+    public void testMissingValuesOfTheTypesWhichWriteThemLastComeAfterTheirValues() {
+        final Map<Class<?>, Object[]> values = new LinkedHashMap<>();
+        values.put(Byte.class, new Object[]{Byte.MIN_VALUE, (byte) -1, (byte) 0, Byte.MAX_VALUE});
+        values.put(Short.class, new Object[]{Short.MIN_VALUE, (short) -1, (short) 0, Short.MAX_VALUE});
+        values.put(Integer.class, new Object[]{Integer.MIN_VALUE, -1, 0, Integer.MAX_VALUE});
+        values.put(Long.class, new Object[]{Long.MIN_VALUE, -1L, 0L, Long.MAX_VALUE});
+        values.put(Float.class, new Object[]{Float.NEGATIVE_INFINITY, -0.0f, 0.0f, Float.MAX_VALUE,
+            Float.POSITIVE_INFINITY, Float.NaN});
+        values.put(Double.class, new Object[]{Double.NEGATIVE_INFINITY, -0.0, 0.0, Double.MAX_VALUE,
+            Double.POSITIVE_INFINITY, Double.NaN});
+        values.put(Character.class, new Object[]{Character.MIN_VALUE, 'a', Character.MAX_VALUE});
+        values.put(Boolean.class, new Object[]{false, true});
+        values.put(Date.class, new Object[]{new Date(Long.MIN_VALUE), new Date(0), new Date(Long.MAX_VALUE)});
+        values.put(UUID.class, new Object[]{new UUID(0, 0), new UUID(-1, -1)});
+        values.put(String.class, new Object[]{"", "a", "\uFFFF\uFFFF", "\uD83D\uDE00"});
+        for (final Map.Entry<Class<?>, Object[]> type : values.entrySet()) {
+            assertTrue(serialize.writesMissingValuesLast(type.getKey()), type.getKey().getName());
+            final StaticBuffer missing = byteOrder(null, type.getKey());
+            assertEquals(1, missing.length(), type.getKey().getName());
+            assertEquals((byte) -1, missing.getByte(0), type.getKey().getName());
+            for (final Object value : type.getValue()) {
+                assertTrue(byteOrder(value, type.getKey()).compareTo(missing) < 0,
+                    type.getKey().getName() + " " + value);
+            }
+        }
+        //A class is written as the number of its registration, 0 where it's missing, and an instant and an array keep
+        //no order
+        assertFalse(serialize.writesMissingValuesLast(Class.class));
+        assertFalse(serialize.writesMissingValuesLast(Instant.class));
+        assertFalse(serialize.writesMissingValuesLast(byte[].class));
+    }
+
+    /**
+     * Every NaN, whatever its sign and payload, is written in byte order as the same value, after +∞, so that the slice
+     * of a vertex-centric index which ends before NaN holds every other value, and that of NaN every NaN
+     */
+    @Test
+    public void testEveryNaNIsWrittenInByteOrderAsOneValueAfterPositiveInfinity() {
+        final StaticBuffer doubleNaN = byteOrder(Double.NaN, Double.class);
+        assertTrue(byteOrder(Double.POSITIVE_INFINITY, Double.class).compareTo(doubleNaN) < 0);
+        for (final long bits : new long[]{0x7ff0000000000001L, 0x7fffffffffffffffL, 0xfff8000000000000L, -1L}) {
+            assertEquals(doubleNaN, byteOrder(Double.longBitsToDouble(bits), Double.class), Long.toHexString(bits));
+        }
+        final StaticBuffer floatNaN = byteOrder(Float.NaN, Float.class);
+        assertTrue(byteOrder(Float.POSITIVE_INFINITY, Float.class).compareTo(floatNaN) < 0);
+        for (final int bits : new int[]{0x7f800001, 0x7fffffff, 0xffc00000, -1}) {
+            assertEquals(floatNaN, byteOrder(Float.intBitsToFloat(bits), Float.class), Integer.toHexString(bits));
+        }
+    }
+
+    private StaticBuffer byteOrder(Object value, Class<?> type) {
+        final DataOutput out = serialize.getDataOutput(64);
+        out.writeObjectByteOrder(value, type);
+        return out.getStaticBuffer();
     }
 
     @Test
@@ -334,6 +406,152 @@ public class SerializerTest extends SerializerTestCommon {
             assertEquals(x,y);
         }
 
+    }
+
+    private static final String PAIR = new String(Character.toChars(0x1F600));
+    private static final char HIGH = (char) 0xD800;
+    private static final char LAST_HIGH = (char) 0xDBFF;
+    private static final char LOW = (char) 0xDC00;
+    private static final char LAST_LOW = (char) 0xDFFF;
+    private static final char REPLACEMENT = (char) 0xFFFD;
+
+    //8,004 chars: ASCII, Latin-1, Cyrillic and CJK characters, and surrogate pairs
+    private static final String HALF =
+        ("word " + (char) 0xE9 + (char) 0x436 + (char) 0x4E2D + " " + PAIR + " ").repeat(667);
+
+    //Strings longer than LONG_COMPRESSION_THRESHOLD are compressed. They keep their unpaired surrogates, as shorter
+    //strings do, at the start, in the middle and at the end, next to pairs, to other unpaired surrogates, to '?' and
+    //to U+FFFD
+    @Test
+    public void testLongStringsKeepUnpairedSurrogates() {
+        String[] surrogates = {String.valueOf(HIGH), String.valueOf(LAST_HIGH), String.valueOf(LOW),
+            String.valueOf(LAST_LOW), "" + LOW + HIGH, "" + HIGH + HIGH, "" + LOW + LOW, HIGH + PAIR, PAIR + LOW,
+            HIGH + "?" + REPLACEMENT + LAST_LOW};
+        for (String surrogate : surrogates) {
+            String[] texts = {surrogate + HALF + HALF, HALF + surrogate + HALF, HALF + HALF + surrogate};
+            for (String text : texts) {
+                assertTrue(text.length() > StringSerializer.LONG_COMPRESSION_THRESHOLD);
+                assertSameChars(text, writeAndRead(text));
+            }
+            String shortText = surrogate + "word" + surrogate;
+            assertSameChars(shortText, writeAndRead(shortText));
+        }
+        String atThreshold = "a".repeat(StringSerializer.LONG_COMPRESSION_THRESHOLD - 1) + LOW;
+        assertSameChars(atThreshold, writeAndRead(atThreshold));
+        assertSameChars(atThreshold + HIGH, writeAndRead(atThreshold + HIGH));
+        String surrogatesOnly = String.valueOf(LOW).repeat(StringSerializer.LONG_COMPRESSION_THRESHOLD + 1);
+        assertSameChars(surrogatesOnly, writeAndRead(surrogatesOnly));
+    }
+
+    //Random long strings of every kind of character, unpaired surrogates included, are read as they were written.
+    //Earlier versions decode the bytes with Java's UTF-8 decoder, which reads an unpaired surrogate as U+FFFD
+    @Test
+    public void testRandomLongStringsKeepUnpairedSurrogates() throws IOException {
+        char[] chars = {'a', '?', 0x7F, 0x80, 0xE9, 0x7FF, 0x800, 0x4E2D, 0xD7FF, HIGH, LAST_HIGH, LOW, LAST_LOW,
+            0xE000, REPLACEMENT, 0xFFFF};
+        for (int t = 0; t < 100; t++) {
+            int length = StringSerializer.LONG_COMPRESSION_THRESHOLD + 1 + random.nextInt(1000);
+            StringBuilder sb = new StringBuilder(length + 1);
+            while (sb.length() < length) {
+                if (random.nextInt(4) == 0) sb.appendCodePoint(Character.MIN_SUPPLEMENTARY_CODE_POINT
+                    + random.nextInt(Character.MAX_CODE_POINT + 1 - Character.MIN_SUPPLEMENTARY_CODE_POINT));
+                else sb.append(chars[random.nextInt(chars.length)]);
+            }
+            String text = sb.toString();
+            StaticBuffer written = getStringBuffer(text);
+            assertSameChars(text, serialize.readObjectNotNull(written.asReadBuffer(), String.class));
+            String readBefore = new String(gunzip(written), StandardCharsets.UTF_8);
+            assertSameChars(replaceUnpairedSurrogates(text, REPLACEMENT), readBefore);
+        }
+    }
+
+    //An unpaired surrogate is written as the three bytes UTF-8 would give its code point, and the string stays
+    //compressed with GZIP, which earlier versions read
+    @Test
+    public void testUnpairedSurrogatesOfLongStringsAreWrittenAsTheirCodePoints() throws IOException {
+        String text = LOW + HALF + HIGH + PAIR + HALF + LAST_LOW;
+        StaticBuffer written = getStringBuffer(text);
+        assertEquals(1, VariableLong.readPositive(written.asReadBuffer()) & 7); //GZIP
+        byte[] utf8Half = HALF.getBytes(StandardCharsets.UTF_8);
+        byte[] expected = concat(new byte[]{(byte) 0xED, (byte) 0xB0, (byte) 0x80}, utf8Half,
+            new byte[]{(byte) 0xED, (byte) 0xA0, (byte) 0x80, (byte) 0xF0, (byte) 0x9F, (byte) 0x98, (byte) 0x80},
+            utf8Half, new byte[]{(byte) 0xED, (byte) 0xBF, (byte) 0xBF});
+        assertArrayEquals(expected, gunzip(written));
+        assertSameChars(REPLACEMENT + HALF + REPLACEMENT + PAIR + HALF + REPLACEMENT,
+            new String(expected, StandardCharsets.UTF_8));
+    }
+
+    //A long string without unpaired surrogates is written byte for byte as earlier versions wrote it
+    @Test
+    public void testLongStringsWithoutUnpairedSurrogatesAreWrittenAsBefore() throws IOException {
+        String[] texts = {"a".repeat(StringSerializer.LONG_COMPRESSION_THRESHOLD + 1), HALF + HALF,
+            REPLACEMENT + HALF + "?" + HALF + REPLACEMENT, String.valueOf((char) 0x4E2D).repeat(20000),
+            PAIR.repeat(10000), getRandomString(StringSerializer.LONG_COMPRESSION_THRESHOLD * 4, MAX_CHAR_VALUE)
+                + "x".repeat(StringSerializer.LONG_COMPRESSION_THRESHOLD + 1)};
+        for (String text : texts) {
+            assertTrue(text.length() > StringSerializer.LONG_COMPRESSION_THRESHOLD);
+            assertEquals(writtenAsBefore(text), getStringBuffer(text));
+            assertSameChars(text, writeAndRead(text));
+        }
+    }
+
+    //A long string which earlier versions wrote is read as they read it: they wrote each unpaired surrogate as '?'
+    @Test
+    public void testLongStringsWrittenBeforeAreReadAsBefore() throws IOException {
+        String text = LOW + HALF + HIGH + PAIR + REPLACEMENT + "?" + HALF + LAST_HIGH;
+        String asWritten = new String(text.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
+        assertSameChars("?" + HALF + "?" + PAIR + REPLACEMENT + "?" + HALF + "?", asWritten);
+        ReadBuffer buffer = writtenAsBefore(text).asReadBuffer();
+        assertSameChars(asWritten, serialize.readObjectNotNull(buffer, String.class));
+        assertFalse(buffer.hasRemaining());
+    }
+
+    private String writeAndRead(String text) {
+        ReadBuffer buffer = getStringBuffer(text).asReadBuffer();
+        String read = serialize.readObjectNotNull(buffer, String.class);
+        assertFalse(buffer.hasRemaining());
+        return read;
+    }
+
+    //What earlier versions wrote for a string longer than LONG_COMPRESSION_THRESHOLD: the length of the compressed
+    //bytes and the compressor id, 1 for GZIP, then String.getBytes(UTF_8) compressed with GZIP
+    private StaticBuffer writtenAsBefore(String text) throws IOException {
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        try (OutputStream out = new GZIPOutputStream(compressed)) {
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+        }
+        DataOutput out = serialize.getDataOutput(compressed.size() + 8);
+        VariableLong.writePositive(out, ((long) compressed.size() << 3) + 1);
+        out.putBytes(compressed.toByteArray());
+        return out.getStaticBuffer();
+    }
+
+    //The bytes of a long string, as they were before compression
+    private static byte[] gunzip(StaticBuffer written) throws IOException {
+        ReadBuffer buffer = written.asReadBuffer();
+        int length = (int) (VariableLong.readPositive(buffer) >>> 3);
+        try (InputStream in = new GZIPInputStream(new ByteArrayInputStream(buffer.getBytes(length)))) {
+            return in.readAllBytes();
+        }
+    }
+
+    private static String replaceUnpairedSurrogates(String text, char replacement) {
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isHighSurrogate(c) && i + 1 < text.length() && Character.isLowSurrogate(text.charAt(i + 1))) {
+                sb.append(c).append(text.charAt(++i));
+            } else {
+                sb.append(Character.isSurrogate(c) ? replacement : c);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static byte[] concat(byte[]... arrays) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] array : arrays) out.write(array, 0, array.length);
+        return out.toByteArray();
     }
 
     @Test

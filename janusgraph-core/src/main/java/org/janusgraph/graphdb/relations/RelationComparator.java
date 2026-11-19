@@ -19,6 +19,7 @@ import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphVertexProperty;
 import org.janusgraph.core.PropertyKey;
+import org.janusgraph.graphdb.database.serialize.AttributeUtils;
 import org.janusgraph.graphdb.internal.AbstractElement;
 import org.janusgraph.graphdb.internal.InternalRelation;
 import org.janusgraph.graphdb.internal.InternalRelationType;
@@ -57,12 +58,8 @@ public class RelationComparator implements Comparator<InternalRelation> {
         if (r1.equals(r2)) return 0;
 
         //1) Based on orders (if any)
-        if (!orders.isEmpty()) {
-            for (OrderList.OrderEntry order : orders) {
-                int orderCompare = compareOnKey(r1, r2, order.getKey(), order.getOrder());
-                if (orderCompare != 0) return orderCompare;
-            }
-        }
+        final int orderCompare = compareOnOrders(r1, r2, orders);
+        if (orderCompare != 0) return orderCompare;
 
         //2) RelationType (determine if property or edge - properties come first)
         int relationTypeCompare = (r1.isProperty()?1:2) - (r2.isProperty()?1:2);
@@ -106,7 +103,8 @@ public class RelationComparator implements Comparator<InternalRelation> {
             if (!o1.equals(o2)) {
                 final int objectCompare;
                 if (Comparable.class.isAssignableFrom(((PropertyKey) t1).dataType())) {
-                    objectCompare = ((Comparable) o1).compareTo(o2);
+                    //UUIDs by their unsigned bits, as the storage backend holds the values of a SET key
+                    objectCompare = AttributeUtils.compareValues(o1, o2);
                 } else {
                     objectCompare = System.identityHashCode(o1) - System.identityHashCode(o2);
                 }
@@ -125,6 +123,21 @@ public class RelationComparator implements Comparator<InternalRelation> {
         return AbstractElement.compare(r1,r2);
     }
 
+    /**
+     * Compares two relations by the values of the keys of the given orders only, as {@link #compare} compares them
+     * first: as {@link #compareValues(Object, Object, Order)} does, which compares strings by UTF-16 code unit and
+     * UUIDs by their bits as unsigned numbers, the order in which the storage backend holds the sort keys of relations,
+     * and puts a missing value first when descending.
+     */
+    public static int compareOnOrders(JanusGraphRelation r1, JanusGraphRelation r2, OrderList orders) {
+        for (int i = 0; i < orders.size(); i++) {
+            final PropertyKey key = orders.getKey(i);
+            final int orderCompare = compareValues(r1.valueOrNull(key), r2.valueOrNull(key), orders.getOrder(i));
+            if (orderCompare != 0) return orderCompare;
+        }
+        return 0;
+    }
+
     public static int compareValues(Object v1, Object v2, Order order) {
         return compareValues(v1,v2)*(order==Order.DESC?-1:1);
     }
@@ -136,7 +149,8 @@ public class RelationComparator implements Comparator<InternalRelation> {
             else return 0;
         } else {
             Preconditions.checkArgument(v1 instanceof Comparable && v2 instanceof Comparable, "Encountered invalid values");
-            return ((Comparable) v1).compareTo(v2);
+            //As the storage backend holds the sort keys, UUIDs by their unsigned bits, unlike UUID.compareTo
+            return AttributeUtils.compareValues(v1, v2);
         }
     }
 

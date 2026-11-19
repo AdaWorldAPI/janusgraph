@@ -26,6 +26,7 @@ import org.janusgraph.diskstorage.indexing.IndexFeatures;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -44,6 +45,8 @@ import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_TYPE_KEY;
 public abstract class AbstractESCompat {
 
     static final Map<String,Object> MATCH_ALL = ImmutableMap.of("match_all", Collections.EMPTY_MAP);
+
+    static final Map<String,Object> MATCH_NONE = ImmutableMap.of("match_none", Collections.EMPTY_MAP);
 
     static IndexFeatures.Builder coreFeatures() {
         return new IndexFeatures.Builder()
@@ -155,6 +158,10 @@ public abstract class AbstractESCompat {
         return ImmutableMap.of("exists", ImmutableMap.of("field", key));
     }
 
+    public Map<String,Object> matchNone() {
+        return MATCH_NONE;
+    }
+
     public Map<String,Object> match(String key, Object value) {
         return match(key, value, null);
     }
@@ -192,7 +199,7 @@ public abstract class AbstractESCompat {
     }
 
     public Map<String,Object> geoShape(String key, Map<String,Object> geoShape, Geo predicate) {
-        final String relation = predicate == Geo.INTERSECT ? "intersects" : predicate.name().toLowerCase();
+        final String relation = predicate == Geo.INTERSECT ? "intersects" : predicate.name().toLowerCase(Locale.ROOT);
         return filter(ImmutableMap.of("geo_shape", ImmutableMap.of(key, ImmutableMap.of("shape", geoShape, "relation", relation))));
     }
 

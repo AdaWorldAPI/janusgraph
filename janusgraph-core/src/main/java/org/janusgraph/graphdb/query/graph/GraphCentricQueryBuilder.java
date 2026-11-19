@@ -15,6 +15,7 @@
 package org.janusgraph.graphdb.query.graph;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 //import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphEdge;
 import org.janusgraph.core.JanusGraphElement;
@@ -24,9 +25,13 @@ import org.janusgraph.core.JanusGraphVertexProperty;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.attribute.Cmp;
 import org.janusgraph.core.attribute.Contain;
+import org.janusgraph.core.schema.Parameter;
+import org.janusgraph.core.schema.SchemaStatus;
 import org.janusgraph.diskstorage.configuration.Configuration;
+import org.janusgraph.diskstorage.indexing.IndexQuery;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.IndexSerializer;
+import org.janusgraph.graphdb.database.util.IndexRecordUtil;
 import org.janusgraph.graphdb.internal.ElementCategory;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.internal.OrderList;
@@ -41,8 +46,14 @@ import org.janusgraph.graphdb.query.condition.MultiCondition;
 import org.janusgraph.graphdb.query.condition.Or;
 import org.janusgraph.graphdb.query.condition.PredicateCondition;
 import org.janusgraph.graphdb.query.index.IndexSelectionStrategy;
+import org.janusgraph.graphdb.query.index.IndexSelectionUtil;
 import org.janusgraph.graphdb.query.profile.QueryProfiler;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
+import org.janusgraph.graphdb.types.CompositeIndexType;
+import org.janusgraph.graphdb.types.IndexType;
+import org.janusgraph.graphdb.types.MixedIndexType;
+import org.janusgraph.graphdb.types.ParameterIndexField;
+import org.janusgraph.graphdb.types.ParameterType;
 import org.janusgraph.graphdb.util.CloseableIteratorUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,10 +92,10 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
     private final List<PredicateCondition<String, JanusGraphElement>> constraints = new ArrayList<>(5);
 
     /**
-     * List of constraints added to one or more Or queries. If there are multiple they will be added to an And query.
-     * None by default.
+     * The sub-queries of each or() call, as they were when it was made. Each or() call holds along with the query's own
+     * constraints. None by default.
      */
-    private final List<List<List<PredicateCondition<String, JanusGraphElement>>>> globalConstraints = new ArrayList<>();
+    private final List<List<SubQuery>> globalConstraints = new ArrayList<>();
     /**
      * The order in which the elements should be returned. None by default.
      */
@@ -109,6 +120,10 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
      * Selection service for the best combination of indexes to be queried
      */
     private IndexSelectionStrategy indexSelector;
+    /**
+     * Whether the elements without a value of an order key are left out of the result, rather than coming last
+     */
+    private boolean requiresOrderValues = false;
 
     public GraphCentricQueryBuilder(StandardJanusGraphTx tx, IndexSerializer serializer, IndexSelectionStrategy indexSelector) {
         Preconditions.checkNotNull(tx);
@@ -124,6 +139,23 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
 
     public void disableSmartLimit() {
         useSmartLimit = false;
+    }
+
+    /**
+     * Leaves the elements without a value of an order key out of the result, as TinkerPop's {@code order().by(key)}
+     * does, rather than placing them last. Unlike a condition of {@link #has(String)}, this one doesn't take part in
+     * choosing the indexes which answer the query's other conditions, so that an index which holds the key isn't read
+     * for every element which has a value of it next to one which answers them: a mixed index which the query reads
+     * for its other conditions checks it where it holds the key, and the query checks it in memory otherwise. It takes
+     * part only where no index answers the other conditions: the query then reads a single mixed index which answers
+     * all of its conditions along with this one, as for a {@code has(key)}, rather than every element, where one does
+     * whose backend sorts by each order key as JanusGraph orders its values.
+     *
+     * @return this query builder
+     */
+    public GraphCentricQueryBuilder requireOrderValues() {
+        requiresOrderValues = true;
+        return this;
     }
 
     /* ---------------------------------------------------------------
@@ -210,9 +242,9 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
 
     @Override
     public GraphCentricQueryBuilder or(Collection<GraphCentricQueryBuilder> subQueries) {
-        final List<List<PredicateCondition<String, JanusGraphElement>>> constraints = new ArrayList<>(subQueries.size());
-        subQueries.forEach(subQuery -> constraints.add(subQuery.getConstraints()));
-        this.globalConstraints.add(constraints);
+        final List<SubQuery> branches = new ArrayList<>(subQueries.size());
+        subQueries.forEach(subQuery -> branches.add(new SubQuery(subQuery)));
+        this.globalConstraints.add(branches);
         return this;
     }
 
@@ -259,29 +291,67 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
         return query;
     }
 
+    /*
+     * The indexes which the strategy selected, sorted only where the first of them takes the query's order, each of its
+     * keys in its direction: a strategy may hold an index to sort the results to which IndexSerializer gave no order,
+     * as it doesn't give an index an order by a key which its backend can't sort by, such as a key of several values
+     * or a string key of TEXT mapping, and a custom strategy which decides by the deprecated
+     * IndexSelectionUtil.indexCoversOrder(MixedIndexType, OrderList) would, as would one which gives the index only
+     * part of the order. JanusGraph sorts such results.
+     */
+    private IndexSelectionStrategy.SelectedIndexQuery sortedOnlyWhereTheIndexSorts(
+            final IndexSelectionStrategy.SelectedIndexQuery selected) {
+        final JointIndexQuery query = selected.getQuery();
+        if (!selected.isSorted() || orders.isEmpty() || takesTheOrder(query)) {
+            return selected;
+        }
+        return new IndexSelectionStrategy.SelectedIndexQuery(query, false);
+    }
+
+    //Whether the first index of the query is a mixed index which sorts the results by the query's order: by each of its
+    //keys in its direction, and by no other key
+    private boolean takesTheOrder(final JointIndexQuery query) {
+        if (query.isEmpty() || !query.getQuery(0).getIndex().isMixedIndex()) {
+            return false;
+        }
+        final MixedIndexType index = (MixedIndexType) query.getQuery(0).getIndex();
+        final List<IndexQuery.OrderEntry> order = query.getQuery(0).getMixedQuery().getOrder();
+        if (order.size() != orders.size()) {
+            return false;
+        }
+        for (int i = 0; i < orders.size(); i++) {
+            final PropertyKey key = orders.getKey(i);
+            if (!index.indexesKey(key) || order.get(i).getOrder() != orders.getOrder(i)
+                    || !IndexRecordUtil.key2Field(index, key).equals(order.get(i).getKey())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public GraphCentricQuery constructQueryWithoutProfile(final ElementCategory resultType) {
         Preconditions.checkNotNull(resultType);
         if (limit == 0) return GraphCentricQuery.emptyQuery(resultType);
 
-        if (globalConstraints.isEmpty()) {
-            globalConstraints.add(Collections.singletonList(constraints));
+        //Prepare constraints, whose conditions compare strings by code point where JanusGraph checks them itself, as
+        //the mixed indexes which answer them and the query's order do (see constraints2QNF). The query's own
+        //conditions, and those of each or() call with a single sub-query which an element can hold, are one
+        //conjunction, along with which each or() of several such sub-queries holds
+        final List<Or<JanusGraphElement>> disjunctions = new ArrayList<>(globalConstraints.size());
+        final And<JanusGraphElement> conjunction = conjunction(constraints, globalConstraints, disjunctions);
+        if (conjunction == null) {
+            return GraphCentricQuery.emptyQuery(resultType);
         }
-        //Prepare constraints
         final MultiCondition<JanusGraphElement> conditions;
-        if (this.globalConstraints.size() == 1 && this.globalConstraints.get(0).size() == 1) {
-            conditions = QueryUtil.constraints2QNF(tx, globalConstraints.get(0).get(0));
-            if (conditions == null) return GraphCentricQuery.emptyQuery(resultType);
+        //An or() alone is its disjunction, as before. Next to other conditions, each or() is written flat where its
+        //sub-queries have a single condition each, so that the condition stays in the normal form which a composite
+        //index, and a mixed index which takes no other form, need to answer any of it
+        if (conjunction.isEmpty() && disjunctions.size() == 1) {
+            conditions = disjunctions.get(0);
         } else {
-            if (this.globalConstraints.size() == 1) {
-                conditions = constructOrCondition(this.globalConstraints.get(0));
-                if (conditions == null) return GraphCentricQuery.emptyQuery(resultType);
-            } else {
-                conditions = new And<>();
-                for (List<List<PredicateCondition<String, JanusGraphElement>>> globalConstraint : this.globalConstraints) {
-                    Or<JanusGraphElement> or = constructOrCondition(globalConstraint);
-                    if (or == null) return GraphCentricQuery.emptyQuery(resultType);
-                    conditions.add(or);
-                }
+            conditions = conjunction;
+            for (final Or<JanusGraphElement> or : disjunctions) {
+                conditions.add(flattened(or));
             }
         }
 
@@ -290,8 +360,61 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
         if (orders.isEmpty()) orders = OrderList.NO_ORDER;
 
         final Set<Condition> coveredClauses = new HashSet<>();
-        final IndexSelectionStrategy.SelectedIndexQuery selectedIndex = indexSelector.selectIndices(
-            resultType, conditions, coveredClauses, orders, serializer);
+        IndexSelectionStrategy.SelectedIndexQuery selectedIndex = sortedOnlyWhereTheIndexSorts(
+            indexSelector.selectIndices(resultType, conditions, coveredClauses, orders, serializer));
+
+        JointIndexQuery indexQuery = selectedIndex.getQuery();
+        MultiCondition<JanusGraphElement> queryConditions = conditions;
+        if (requiresOrderValues && !orders.isEmpty()) {
+            //A value of each order key is a condition of the query, which the indexes chosen for the others take where
+            //they can, unless the query has it already. Another condition on the key doesn't take its place, as an
+            //index may find that one in documents without the key: Solr drops the clause of a condition whose value
+            //the key's analyzer turns into no terms
+            final And<JanusGraphElement> withValues = new And<>(conditions.numChildren() + orders.size());
+            if (conditions instanceof And) {
+                withValues.addAll(conditions);
+            } else {
+                withValues.add(conditions);
+            }
+            final List<PredicateCondition<PropertyKey, JanusGraphElement>> hasValues = new ArrayList<>(orders.size());
+            for (int i = 0; i < orders.size(); i++) {
+                final PredicateCondition<PropertyKey, JanusGraphElement> hasValue =
+                    new PredicateCondition<>(orders.getKey(i), Cmp.NOT_EQUAL, null);
+                if (!withValues.contains(hasValue)) {
+                    withValues.add(hasValue);
+                    hasValues.add(hasValue);
+                }
+            }
+            //Where no index answers the other conditions, the query would read every element. A single mixed index
+            //which answers them all along with these ones is read instead, as for a has(key): the strategy chooses
+            //among the mixed indexes whose backends sort by every order key as JanusGraph orders its values, and a
+            //choice of another index, which a strategy may make, is left aside. Every element is still read where no
+            //such index answers the query whole: checking a condition in memory would read the index in growing
+            //batches and look each element up, and a joint query of several indexes reads all but the first whole
+            if (indexQuery.isEmpty()) {
+                final Set<IndexType> candidates = sortingIndexes(resultType, withValues);
+                final Set<Condition> coveredWithValues = new HashSet<>();
+                final IndexSelectionStrategy.SelectedIndexQuery selectedWithValues = sortedOnlyWhereTheIndexSorts(
+                    indexSelector.selectIndices(candidates, withValues, coveredWithValues, orders, serializer));
+                final JointIndexQuery withValuesQuery = selectedWithValues.getQuery();
+                if (withValuesQuery.size() == 1 && coveredWithValues.size() == withValues.numChildren()
+                        && candidates.contains(withValuesQuery.getQuery(0).getIndex())) {
+                    selectedIndex = selectedWithValues;
+                    indexQuery = withValuesQuery;
+                    coveredClauses.addAll(coveredWithValues);
+                }
+            }
+            for (final PredicateCondition<PropertyKey, JanusGraphElement> hasValue : hasValues) {
+                if (!coveredClauses.contains(hasValue)) {
+                    final JointIndexQuery narrowed = requireValues(indexQuery, hasValue.getKey());
+                    if (narrowed != indexQuery) {
+                        indexQuery = narrowed;
+                        coveredClauses.add(hasValue);
+                    }
+                }
+            }
+            queryConditions = withValues;
+        }
 
         BackendQueryHolder<JointIndexQuery> query;
         if (!coveredClauses.isEmpty()) {
@@ -301,23 +424,189 @@ public class GraphCentricQueryBuilder implements JanusGraphQuery<GraphCentricQue
             } else {
                 indexLimit = limit == Query.NO_LIMIT ? hardMaxLimit : limit;
             }
-            indexLimit = Math.min(hardMaxLimit,
-                QueryUtil.adjustLimitForTxModifications(tx, conditions.numChildren() - coveredClauses.size(), indexLimit));
-            query = new BackendQueryHolder<>(selectedIndex.getQuery().updateLimit(indexLimit),
-                    coveredClauses.size() == conditions.numChildren() || coveredClauses.contains(conditions), selectedIndex.isSorted());
+            indexLimit = Math.min(hardMaxLimit, QueryUtil.adjustLimitForTxModifications(tx,
+                queryConditions.numChildren() - coveredClauses.size(), indexLimit));
+            query = new BackendQueryHolder<>(indexQuery.updateLimit(indexLimit),
+                    coveredClauses.size() == queryConditions.numChildren() || coveredClauses.contains(queryConditions),
+                    selectedIndex.isSorted());
         } else {
             query = new BackendQueryHolder<>(new JointIndexQuery(), false, selectedIndex.isSorted());
         }
-        return new GraphCentricQuery(resultType, conditions, orders, query, limit);
+        return new GraphCentricQuery(resultType, queryConditions, orders, query, limit);
     }
 
-    private Or<JanusGraphElement> constructOrCondition(List<List<PredicateCondition<String, JanusGraphElement>>> globalConstraint) {
-        Or<JanusGraphElement> or = new Or<>();
-        for (final List<PredicateCondition<String, JanusGraphElement>> child : globalConstraint){
-            final And<JanusGraphElement> localconditions = QueryUtil.constraints2QNF(tx, child);
-            if (localconditions == null) return null;
-            or.add(localconditions);
+    /*
+     * The mixed indexes of the result type which may answer the conditions, as the strategies find their candidates
+     * (AbstractIndexSelectionStrategy.createIndexRawCandidates), and which sort the elements by the query's order: they
+     * hold every order key, which their backend sorts by as JanusGraph orders its values, also where the key has
+     * several values (IndexSelectionUtil.indexCoversOrder), and none of them with custom parameters, which may keep
+     * the backend from sorting by it, as Elasticsearch takes them into its mapping. The brute-force strategy weighs an
+     * index which holds a key as a TEXT, which no backend sorts by, as one which holds it as a STRING: where both
+     * answer the query alike, it would take either. The composite indexes are left out, as they can't answer the
+     * presence of a key, a condition of key <> null.
+     */
+    private Set<IndexType> sortingIndexes(final ElementCategory resultType,
+                                          final MultiCondition<JanusGraphElement> conditions) {
+        return IndexSelectionUtil.getMatchingIndexes(conditions, index -> index.getElement() == resultType
+            && index.isMixedIndex() && IndexSelectionUtil.indexCoversOrder((MixedIndexType) index, orders, serializer)
+            && holdsNoOrderKeyWithCustomParameters((MixedIndexType) index));
+    }
+
+    //Whether the mixed index, which holds every order key, holds none of them with custom parameters
+    private boolean holdsNoOrderKeyWithCustomParameters(final MixedIndexType index) {
+        for (int i = 0; i < orders.size(); i++) {
+            for (final Parameter parameter : index.getField(orders.getKey(i)).getParameters()) {
+                if (parameter.key().startsWith(ParameterType.CUSTOM_PARAMETER_PREFIX)) {
+                    return false;
+                }
+            }
         }
-        return or;
+        return true;
+    }
+
+    /*
+     * The index query with each subquery that reads a mixed index which holds the key, enabled and able to tell which
+     * elements have a value of it, leaving out the elements which have none; the given query where no subquery can
+     */
+    private JointIndexQuery requireValues(JointIndexQuery indexQuery, PropertyKey key) {
+        final JointIndexQuery narrowed = new JointIndexQuery();
+        boolean anyNarrowed = false;
+        for (int i = 0; i < indexQuery.size(); i++) {
+            final JointIndexQuery.Subquery subquery = indexQuery.getQuery(i);
+            if (subquery.getIndex().isCompositeIndex()) {
+                narrowed.add((CompositeIndexType) subquery.getIndex(), subquery.getCompositeQuery());
+                continue;
+            }
+            final MixedIndexType index = (MixedIndexType) subquery.getIndex();
+            final IndexQuery mixed = subquery.getMixedQuery();
+            final ParameterIndexField field = index.getField(key);
+            if (field == null || field.getStatus() != SchemaStatus.ENABLED
+                    || !serializer.supportsExistsQuery(index, field)) {
+                narrowed.add(index, mixed);
+                continue;
+            }
+            final And<JanusGraphElement> withValue = JointIndexQuery.conjunction(mixed.getCondition(),
+                new PredicateCondition<>(IndexRecordUtil.key2Field(field), Cmp.NOT_EQUAL, null));
+            narrowed.add(index, new IndexQuery(mixed.getStore(), withValue, ImmutableList.copyOf(mixed.getOrder()),
+                mixed.getLimit()));
+            anyNarrowed = true;
+        }
+        return anyNarrowed ? narrowed : indexQuery;
+    }
+
+    /*
+     * The conjunction of the conditions of a query, or of a sub-query of an or() call, and of those of each of its or()
+     * calls with a single sub-query which an element can hold, without repeating an atom, as constraints2QNF doesn't;
+     * each or() call of several such sub-queries is added to the given disjunctions instead. Null where no element can
+     * hold the conditions.
+     */
+    private And<JanusGraphElement> conjunction(final List<PredicateCondition<String, JanusGraphElement>> own,
+            final List<List<SubQuery>> ors, final List<Or<JanusGraphElement>> disjunctions) {
+        final And<JanusGraphElement> conjunction = QueryUtil.constraints2QNF(tx, own);
+        if (conjunction == null) {
+            return null;
+        }
+        final Set<Condition<JanusGraphElement>> atoms = atomsOf(conjunction);
+        for (final List<SubQuery> subQueries : ors) {
+            final Or<JanusGraphElement> or = disjunction(subQueries);
+            if (or == null) {
+                return null;
+            }
+            if (or.size() == 1) {
+                for (final Condition<JanusGraphElement> condition : or.get(0).getChildren()) {
+                    addOnce(conjunction, atoms, condition);
+                }
+            } else {
+                disjunctions.add(or);
+            }
+        }
+        return conjunction;
+    }
+
+    /*
+     * The disjunction of the sub-queries of an or() call which an element can hold, each the conjunction of its
+     * conditions and of its own or() calls; null where it can hold none, as in an or() of no sub-queries: a sub-query
+     * which no element can hold, such as one on a key which doesn't exist, adds nothing to the others. A sub-query
+     * which every element holds, as one of no conditions, is the or()'s only one, as the or() holds for every element.
+     */
+    private Or<JanusGraphElement> disjunction(final List<SubQuery> subQueries) {
+        final Or<JanusGraphElement> or = new Or<>(subQueries.size());
+        for (final SubQuery subQuery : subQueries) {
+            final List<Or<JanusGraphElement>> nested = new ArrayList<>(subQuery.ors.size());
+            final And<JanusGraphElement> conditions = conjunction(subQuery.constraints, subQuery.ors, nested);
+            if (conditions == null) {
+                continue;
+            }
+            for (final Or<JanusGraphElement> inner : nested) {
+                conditions.add(flattened(inner));
+            }
+            if (conditions.isEmpty()) {
+                final Or<JanusGraphElement> always = new Or<>(1);
+                always.add(conditions);
+                return always;
+            }
+            or.add(conditions);
+        }
+        return or.isEmpty() ? null : or;
+    }
+
+    /*
+     * The disjunction with each branch of a single condition written as that condition, and each disjunction which is
+     * one, as that of a within(), written as its own branches, without repeating an atom: next to other conditions, a
+     * disjunction of single atoms is then in normal form, as is one of a within(), though not one of a P.or() with an
+     * and() in it. A branch of several conditions stays a conjunction: JanusGraph checks it in memory, unless a mixed
+     * index which takes conditions that aren't in normal form covers the whole condition, as Elasticsearch and Lucene
+     * take them.
+     */
+    private static Or<JanusGraphElement> flattened(final Or<JanusGraphElement> or) {
+        final Or<JanusGraphElement> flat = new Or<>(or.size());
+        final Set<Condition<JanusGraphElement>> atoms = new HashSet<>();
+        for (final Condition<JanusGraphElement> branch : or.getChildren()) {
+            final Condition<JanusGraphElement> single = branch instanceof And && branch.numChildren() == 1
+                ? branch.getChildren().iterator().next() : branch;
+            for (final Condition<JanusGraphElement> condition
+                    : single instanceof Or ? single.getChildren() : Collections.singletonList(single)) {
+                addOnce(flat, atoms, condition);
+            }
+        }
+        return flat;
+    }
+
+    /*
+     * The atoms among the conditions. A set of them tells which conditions an atom repeats, as in
+     * QueryUtil.addConstraints: looking each one up in the list would make a long without() quadratic in its values.
+     * Only atoms are compared: MultiCondition.equals() takes a conjunction for another one of as many conditions which
+     * holds each of its own, so that one of X and X would equal one of X and Y.
+     */
+    private static Set<Condition<JanusGraphElement>> atomsOf(final MultiCondition<JanusGraphElement> conditions) {
+        final Set<Condition<JanusGraphElement>> atoms = new HashSet<>();
+        for (final Condition<JanusGraphElement> condition : conditions) {
+            if (condition instanceof PredicateCondition) {
+                atoms.add(condition);
+            }
+        }
+        return atoms;
+    }
+
+    //Adds the condition unless it is an atom which the conditions hold already, as the given atoms tell
+    private static void addOnce(final MultiCondition<JanusGraphElement> conditions,
+            final Set<Condition<JanusGraphElement>> atoms, final Condition<JanusGraphElement> condition) {
+        if (!(condition instanceof PredicateCondition) || atoms.add(condition)) {
+            conditions.add(condition);
+        }
+    }
+
+    /*
+     * The conditions of a sub-query of an or() call when the call was made: its own constraints and the sub-queries of
+     * its own or() calls, which are kept in the same way, so that a later change of the sub-query changes neither
+     */
+    private static final class SubQuery {
+        private final List<PredicateCondition<String, JanusGraphElement>> constraints;
+        private final List<List<SubQuery>> ors;
+
+        private SubQuery(final GraphCentricQueryBuilder query) {
+            constraints = new ArrayList<>(query.constraints);
+            ors = new ArrayList<>(query.globalConstraints);
+        }
     }
 }

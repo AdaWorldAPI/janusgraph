@@ -16,13 +16,19 @@ package org.janusgraph.diskstorage.es;
 
 import org.apache.commons.lang3.mutable.MutableBoolean;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
+import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal;
+import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
+import org.apache.tinkerpop.gremlin.structure.VertexProperty;
+import org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphTransaction;
+import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.attribute.Geo;
 import org.janusgraph.core.attribute.Geoshape;
+import org.janusgraph.core.attribute.Text;
 import org.janusgraph.core.schema.Mapping;
 import org.janusgraph.core.schema.Parameter;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
@@ -35,19 +41,27 @@ import org.janusgraph.diskstorage.mixed.utils.processor.NoTransformCircleProcess
 import org.janusgraph.graphdb.JanusGraphIndexTest;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.util.IndexRecordUtil;
+import org.janusgraph.graphdb.types.ParameterType;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.junit.jupiter.Container;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Function;
 import java.util.stream.IntStream;
 
+import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.FORCE_INDEX_USAGE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_READ_INTERVAL;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_SEND_DELAY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_LOG;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PROPERTY_PREFETCHING;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -66,26 +80,52 @@ public abstract class ElasticsearchJanusGraphIndexTest extends JanusGraphIndexTe
         ModifiableConfiguration config =  esr.setConfiguration(getStorageConfiguration(), indexBackends);
         for (String indexBackend : indexBackends) {
             config.set(GraphDatabaseConfiguration.INDEX_MAX_RESULT_SET_SIZE, 3, indexBackend);
+            // A limited result beyond 10,000 hits, as a query the index can't sort reads, in many pages of 3 as well
+            config.set(ElasticSearchIndex.LIMITED_RESULT_MAX_PAGE_SIZE, 3, indexBackend);
+            config.set(ElasticSearchIndex.PAGING_MODE, getPagingMode().getConfigName(), indexBackend);
         }
         return config.getConfiguration();
     }
 
     public abstract ModifiableConfiguration getStorageConfiguration();
 
+    //How a result larger than a page of 3 is read: the suites of the storage backends cover different modes
+    protected ElasticSearchPagingMode getPagingMode() {
+        return ElasticSearchPagingMode.SCROLL;
+    }
+
+    //Elasticsearch's standard analyzer, which splits a string as Lucene's StandardAnalyzer does
+    @Override
+    protected String getStandardAnalyzerName() {
+        return "standard";
+    }
+
     //An element's document can be missing from the index while the element exists: an index write lost earlier, a
     //document removed by hand. A later update used to recreate it from the fields it touched alone, so the vertex was
     //findable by the property it had just changed and by nothing else. The update now recreates the whole document
     @Test
     public void testAnUpdateRecreatesAMissingDocumentWhole() throws Exception {
+        assertAnUpdateRecreatesAMissingDocumentWhole(true);
+    }
+
+    //A transaction which doesn't prefetch the properties of a vertex reads those of the index's keys alone for the
+    //document, rather than all of them
+    @Test
+    public void testAnUpdateWithoutPropertyPrefetchingRecreatesAMissingDocumentWhole() throws Exception {
+        assertAnUpdateRecreatesAMissingDocumentWhole(false);
+    }
+
+    private void assertAnUpdateRecreatesAMissingDocumentWhole(boolean prefetching) throws Exception {
         final PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
         final PropertyKey age = mgmt.makePropertyKey("age").dataType(Integer.class).make();
+        mgmt.makePropertyKey("note").dataType(String.class).make();
         mgmt.buildIndex("byNameAndAge", Vertex.class).addKey(name, Mapping.STRING.asParameter()).addKey(age)
             .buildMixedIndex(INDEX);
         finishSchema();
 
-        final Object vertexId = graph.addVertex("name", "whole", "age", 1).id();
+        final Object vertexId = graph.addVertex("name", "whole", "age", 1, "note", "not indexed").id();
         graph.tx().commit();
-        clopen(option(FORCE_INDEX_USAGE), true);
+        clopen(option(FORCE_INDEX_USAGE), true, option(PROPERTY_PREFETCHING), prefetching);
         assertTrue(graph.traversal().V().has("name", "whole").hasNext());
 
         esr.deleteDocument(INDEX_NAME.getDefaultValue() + "_bynameandage", "byNameAndAge",
@@ -252,6 +292,12 @@ public abstract class ElasticsearchJanusGraphIndexTest extends JanusGraphIndexTe
         return esr.getEsMajorVersion().getValue() <= 7;
     }
 
+    //Elasticsearch and OpenSearch reject a document with a float or a double which isn't finite
+    @Override
+    protected boolean supportsNonFiniteDecimals() {
+        return false;
+    }
+
     @Test
     public void testCircleBKDIndexMappingCanBeUsedWithDefaultProcessor(){
         clopen();
@@ -330,4 +376,116 @@ public abstract class ElasticsearchJanusGraphIndexTest extends JanusGraphIndexTe
             .toList().stream().anyMatch(vertex -> addedVertex.id().equals(vertex.id()) && circle.equals(vertex.value("foo")));
     }
 
+    //Elasticsearch maps a string key with a string analyzer as a text, as it maps the field which holds the whole
+    //strings of a TEXTSTRING key with one, and takes the custom parameters of a key into its mapping, which may keep it
+    //from sorting by the key, as doc_values false does: a traversal's order by such a key, where no index answers the
+    //traversal's conditions, still reads every element rather than the index, which would fail the query, also after a
+    //key which it sorts by
+    @Test
+    public void testOrderByAKeyWhichElasticsearchMayNotSortByReadsEveryElement() {
+        final PropertyKey name = makeKey("name", String.class);
+        final PropertyKey title = makeKey("title", String.class);
+        final PropertyKey tag = makeKey("tag", String.class);
+        final PropertyKey plain = makeKey("plain", String.class);
+        final Parameter keywordAnalyzer = Parameter.of(ParameterType.STRING_ANALYZER.getName(), "keyword");
+        final Parameter noDocValues = Parameter.of(ParameterType.customParameterName("doc_values"), false);
+        mgmt.buildIndex("mixed", Vertex.class).addKey(name, Mapping.STRING.asParameter(), keywordAnalyzer)
+            .addKey(title, Mapping.TEXTSTRING.asParameter(), keywordAnalyzer)
+            .addKey(tag, Mapping.STRING.asParameter(), noDocValues).addKey(plain, Mapping.STRING.asParameter())
+            .buildMixedIndex(INDEX);
+        finishSchema();
+        tx.addVertex("name", "b", "title", "b", "tag", "b", "plain", "p");
+        tx.addVertex("name", "a", "title", "a", "tag", "a", "plain", "p");
+        tx.addVertex();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        for (final String key : Arrays.asList("name", "title", "tag")) {
+            Assertions.assertEquals(Arrays.asList("a", "b"), g.V().order().by(key).values(key).toList(), key);
+            Assertions.assertEquals(Collections.singletonList("b"),
+                g.V().order().by(key, desc).limit(1).values(key).toList(), key);
+            assertReadsEveryElement(g.V().order().by(key).limit(1));
+        }
+        Assertions.assertEquals(Arrays.asList("a", "b"), g.V().order().by("plain").by("tag").values("tag").toList());
+        assertReadsEveryElement(g.V().order().by("plain").by("tag").limit(1));
+        tx.rollback();
+    }
+
+    //Elasticsearch answers a geoContains of a geo_shape of several values in BKD by leaving out a document which holds
+    //a value that falls within the shape asked about, while in memory one value which contains the shape is enough: a
+    //query in a transaction finds a vertex once the transaction removed such a value
+    @Test
+    public void testTransactionFindsAVertexWhichARemovalMadeContainAShape() {
+        //Elasticsearch 6 answers no geoContains of a geo_shape in BKD
+        Assumptions.assumeTrue(esr.getEsMajorVersion().getValue() >= 7);
+        final PropertyKey shapes = mgmt.makePropertyKey("shapes").dataType(Geoshape.class).cardinality(Cardinality.SET)
+            .make();
+        mgmt.buildIndex("byShapes", Vertex.class).addKey(shapes, Mapping.BKD.asParameter()).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final JanusGraphVertex vertex = tx.addVertex();
+        vertex.property(VertexProperty.Cardinality.set, "shapes", Geoshape.box(0, 0, 10, 10));
+        vertex.property(VertexProperty.Cardinality.set, "shapes", Geoshape.point(5, 5));
+        final Object id = vertex.id();
+        tx.commit();
+        newTx();
+
+        final GraphTraversalSource g = tx.traversal();
+        g.V(id).properties("shapes").hasValue(Geoshape.point(5, 5)).drop().iterate();
+        Assertions.assertEquals(Collections.singletonList(id),
+            g.V().has("shapes", Geo.geoContains(Geoshape.box(4, 4, 6, 6))).id().toList());
+        tx.rollback();
+    }
+
+    //A STRING key with a custom string analyzer, and the field of the whole strings of such a TEXTSTRING key, are text
+    //fields rather than keywords, which Elasticsearch doesn't sort by: JanusGraph sorts an order by such a key itself,
+    //as a TinkerGraph which holds the same vertices does
+    @Test
+    public void testOrderByAStringKeyWithAStringAnalyzerIsSortedByJanusGraph() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        final PropertyKey code = makeKey("code", String.class);
+        final PropertyKey caption = makeKey("caption", String.class);
+        makeKey("uid", Integer.class);
+        final Parameter<String> analyzer = ParameterType.STRING_ANALYZER.getParameter("standard");
+        mgmt.buildIndex("mixed", Vertex.class).addKey(kind, Mapping.STRING.asParameter())
+            .addKey(code, Mapping.STRING.asParameter(), analyzer)
+            .addKey(caption, Mapping.TEXTSTRING.asParameter(), analyzer).buildMixedIndex(INDEX);
+        finishSchema();
+
+        final GraphTraversalSource reference = TinkerGraph.open().traversal();
+        //uid, kind, and the code and caption, whose order isn't that of their words
+        final Object[][] vertices = {{1, "p", "Beta two"}, {2, "p", "alpha"}, {3, "p", null}, {4, "p", "alpha beta"},
+            {5, "p", "Alpha one"}, {6, "q", "beta"}};
+        for (final Object[] vertex : vertices) {
+            onBoth(reference, g -> {
+                final GraphTraversal<Vertex, Vertex> added = g.addV().property("uid", vertex[0])
+                    .property("kind", vertex[1]);
+                return vertex[2] == null ? added : added.property("code", vertex[2]).property("caption", vertex[2]);
+            });
+        }
+        tx.commit();
+        newTx();
+
+        final List<Function<GraphTraversalSource, GraphTraversal<?, ?>>> traversals = Arrays.asList(
+            g -> g.V().has("kind", "p").order().by("code"),
+            g -> g.V().has("kind", "p").order().by("code", desc).limit(2),
+            g -> g.V().has("kind", "p").order().by("caption").limit(3),
+            g -> g.V().has("kind", "p").order().by("caption", desc),
+            g -> g.V().has("caption", Text.textContains("beta")).order().by("caption"));
+        for (final Function<GraphTraversalSource, GraphTraversal<?, ?>> traversal : traversals) {
+            Assertions.assertEquals(results(traversal.apply(reference)), results(traversal.apply(tx.traversal())),
+                traversal.apply(reference).toString());
+        }
+        //The index sorts by kind, a STRING key without an analyzer, and not by the others, as a new transaction's
+        //profile shows
+        tx.rollback();
+        newTx();
+        final GraphTraversalSource g = tx.traversal();
+        Assertions.assertTrue(indexSortsBy(g.V().has("caption", Text.textContains("beta")).order().by("kind").limit(2),
+            "kind"));
+        Assertions.assertFalse(indexSortsBy(g.V().has("kind", "p").order().by("code").limit(2), "code"));
+        Assertions.assertFalse(indexSortsBy(g.V().has("kind", "p").order().by("caption").limit(2), "caption"));
+        tx.rollback();
+    }
 }

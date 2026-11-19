@@ -51,7 +51,58 @@ The versions of JanusGraph listed below are outdated and will no longer receive 
 
 ## Release Notes
 
-### Version 1.2.0 (Release Date: ???)
+### Version 1.3.0 (Release Date: <month> <day>, <year>>)
+
+/// tab | Maven
+```xml
+<dependency>
+    <groupId>org.janusgraph</groupId>
+    <artifactId>janusgraph-core</artifactId>
+    <version>1.3.0</version>
+</dependency>
+```
+///
+
+/// tab | Gradle
+```groovy
+compile "org.janusgraph:janusgraph-core:1.3.0"
+```
+///
+
+**Tested Compatibility:**
+
+* Apache Cassandra 3.11.10, 4.0.6, 5.0.8
+* Apache HBase 2.6.0
+* Oracle BerkeleyJE 7.5.11
+* ScyllaDB 6.2.0
+* Elasticsearch 6.6.0, 7.17.8, 8.15.3, 9.5.4
+* OpenSearch 2.19.6, 3.9.0
+* Apache Lucene 9.12.3
+* Apache Solr 8.11.4, 9.10.1
+* Apache TinkerPop 3.8.2
+* Java 11, 17, 21, 25 (OLAP with Apache Spark: Java 11 and 17 only)
+
+**Installed versions in the Pre-Packaged Distribution:**
+
+* Cassandra 5.0.9
+* Elasticsearch 7.17.29
+
+#### Changes
+
+For more information on features and bug fixes in 1.3.0, see the GitHub milestone:
+
+-   <https://github.com/JanusGraph/janusgraph/milestone/31?closed=1>
+
+#### Assets
+
+* [JavaDoc](https://javadoc.io/doc/org.janusgraph/janusgraph-core/1.3.0)
+* [GitHub Release](https://github.com/JanusGraph/janusgraph/releases/tag/v1.3.0)
+* [JanusGraph zip](https://github.com/JanusGraph/janusgraph/releases/download/v1.3.0/janusgraph-1.3.0.zip)
+* [JanusGraph zip with embedded Cassandra and ElasticSearch](https://github.com/JanusGraph/janusgraph/releases/download/v1.3.0/janusgraph-full-1.3.0.zip)
+
+#### Upgrade Instructions
+
+### Version 1.2.0 (Release Date: October 28, 2026)
 
 /// tab | Maven
 ```xml
@@ -298,6 +349,81 @@ reader) comes first on the classpath, SolrJ fails with
 `NoSuchMethodError: 'java.lang.Object org.noggit.ObjectBuilder.getValStrict()'`. Applications which use
 `janusgraph-solr` should exclude `org.noggit:noggit` as well: Spatial4j works with SolrJ's copy.
 
+##### Solr keeps the clauses of each condition together
+
+Solr's query parser takes the clauses of a condition's query within another condition as clauses of that one, so
+JanusGraph has to group them. It didn't:
+
+* A `textContains` of several words, which Solr gets as a conjunction of its words, failed together with another
+  condition which the same mixed index answers, such as `g.V().has('name', textContains('red green')).has('num',
+  lt(4))`, with `SyntaxError: Cannot parse '++name_t:(red) +name_t:(green) ...'`. So did an `eq` or `neq` whose value a
+  custom `string-analyzer` splits into several terms.
+* Within a disjunction of predicates on one key, such a condition, or a `neq`, restricted the other alternatives:
+  `has('name', textContains('red green').or(textContains('yellow')))` didn't find a vertex named `yellow`, and
+  `has('num', neq(3).or(lt(4)))` didn't find the vertices of `num` 3.
+* In a condition which an application builds for the index provider API itself, a negation within a disjunction
+  excluded its documents from the whole disjunction, and a negation of a negation matched every document.
+
+Solr now gets each such condition as a group, and a group which starts with a negation starts from all documents
+(`*:*`). The other queries are unchanged.
+
+The precision of a shape (`distErrPct=0`), which JanusGraph wrote after the quotes of the query of a key mapped as
+`PREFIX_TREE` and after a `geofilt` query, was a clause of its own as well: a term of the default field, `text`.
+
+* The configset in `conf/solr` has no such field, so with it Solr rejected these queries with `undefined field text`:
+  every geo condition on a `PREFIX_TREE` key other than a `geoIntersect` of a circle or a box, and a `geofilt` one
+  together with another condition of the same mixed index, such as
+  `g.V().has('location', geoWithin(Geoshape.circle(48.5, 0.5, 200))).has('num', 3)` on a key of the default mapping.
+  A condition of a polygon fails earlier there, as before: that configset's geo field parses no polygons.
+* Where the field exists, as in the configset of JanusGraph's tests, a document whose `text` held "0" matched such a
+  query on a `PREFIX_TREE` key on its own, and a `geofilt` query within a disjunction.
+
+The precision now goes within the quotes, where Solr reads it. So the query of a shape on a `PREFIX_TREE` key, which
+every geo condition there gets but a `geoIntersect` of a circle (a `geofilt` query) or of a box (a range query),
+compares the shape as precisely as the field's grid allows, rather than with the field's `distErrPct`. Where that is
+larger than 0, such as 0.025 in Solr's sample `location_rpt` field, such a query may take longer, as it refines more
+cells along the shape's edge; in the configset in `conf/solr`, it is 0 already, so nothing changes there. A `geofilt`
+query takes no such option and gets none.
+
+##### Solr no longer ignores a condition whose value has no terms
+
+On Solr, a condition whose value the key's analyzer turns into no terms, such as punctuation or a stop word, matched
+what the other conditions matched: JanusGraph sent no clause for it, or a clause which Solr's query parser dropped. So
+`g.V().has('kind', 'p').has('title', textContains('!!!'))` found every vertex of kind `p`, also those without a title,
+`g.V().has('title', textContains('!!!'))` alone found every element of the mixed index, and its `count()` counted them
+all. `textContainsPhrase`, `textContains` of a key with a custom `text-analyzer` and `eq` of a key with a custom
+`string-analyzer` found nothing alone, but what the other conditions found next to them. Now such a condition finds
+nothing, as on Lucene, Elasticsearch and OpenSearch, and as the text predicates find in memory, while a `neq` of such a
+value still finds every element with a value.
+
+A `neq` of a value which a custom `string-analyzer` splits into several terms found only the elements which hold none of
+the terms on Solr. It now finds the elements with a value which `eq` doesn't find, those which lack one of the terms or
+more, as on Lucene, Elasticsearch and OpenSearch: with "Tom and Jerry" and "Spike" under the standard analyzer,
+`neq('Tom Spike')` found neither of them, and now finds both.
+
+JanusGraph splits the value of a condition with the key's `text-analyzer` or `string-analyzer`, or with the standard
+tokenizer for a text key without one, while Solr analyzes the key's field as its schema says, so the two should agree.
+Where they don't, a stop word which only the field's type drops, of a key without an analyzer parameter, is still
+ignored. And a value which only JanusGraph's analysis drops, such as symbols which the field keeps, now matches nothing:
+`textContainsPhrase`, and `textContains` and `eq` of a key with a custom analyzer, find nothing for it, where they found
+the elements which hold it, and `neq` finds these elements too.
+
+The `string-analyzer` or `text-analyzer` of a key on Solr may name a tokenizer, such as
+`org.apache.lucene.analysis.core.WhitespaceTokenizer`, as the documentation of the field mappings says, as well as an
+analyzer. Since JanusGraph 1.0, a tokenizer made `textContains`, `eq` and `neq` fail with a `ClassCastException`: it now
+splits their values alone, as it did in JanusGraph 0.6.
+
+No reindexing is needed: only the queries change.
+
+##### Lucene counts more than a thousand matches exactly
+
+A `count()` which a Lucene mixed index answers, such as `g.V().has('age', lt(2000)).count()`, and the totals of a direct
+index query, `vertexTotals()`, `edgeTotals()` and `propertyTotals()`, took the total hits of a search for one document,
+which Lucene computes exactly only up to 1000 hits: past that threshold it may skip the documents which can't make the
+top, and the total is only a lower bound, so a count of more than a thousand matches could come out as low as 1001. A
+`mean()` which the index answers divided its sum by that count, and could come out too high. Lucene now counts the
+matches. Elasticsearch and Solr counted exactly already.
+
 ##### Apache Lucene 9
 
 `janusgraph-lucene` now uses Apache Lucene 9.12.3 instead of 8.11. A JanusGraph installation can contain only one
@@ -317,6 +443,54 @@ loaded by class name, so they have to exist in Lucene 9. Lucene 9 renamed the `l
 `lucene-analysis-common` and moved a few analyzers to other packages, for example `ClassicAnalyzer` to
 `org.apache.lucene.analysis.classic` and `UAX29URLEmailAnalyzer` to `org.apache.lucene.analysis.email`.
 
+##### `has(key)` on Lucene finds the elements with a `LIST` or `SET` key of numbers, dates or booleans
+
+On a Lucene mixed index, `has(key)` of a key of `LIST` or `SET` cardinality whose values are numbers, dates, instants or
+booleans, such as `g.V().has("weights")`, found no elements in JanusGraph 0.6.0 to 1.1.x, on vertex, edge and vertex
+property indexes alike, and its `count()` was 0. Lucene indexes such values as points alone, without the doc values or
+norms which the exists query of `has(key)` read. That query now finds the elements which hold a value of such a key, by
+reading all the values of the key in the index: roughly 1 ms a query per million values, also with a limit or a
+selective condition beside it. No reindexing is needed, as Lucene writes these keys as before.
+
+##### Names, dates and searched text no longer depend on the default locale
+
+JanusGraph converts the case of the names it reads and writes in the root locale, and lower-cases the text it searches
+case-insensitively one code point at a time, as the analyzers of the index backends do. Both followed the JVM's default
+locale. In a Turkish or Azerbaijani locale `I` lower-cases to a dotless `ı` and `i` upper-cases to a dotted `İ`, so with
+such a default locale JanusGraph didn't know a mapping given by its name in lower case (`string`), the type of a
+geoshape built from a JTS geometry (`MultiPoint`), a time unit in upper case (`MINUTES`) or the shorthand of a storage
+backend in upper case (`INMEMORY`), and it let a key or a label be named `ID`, a name which other JVMs reject as a
+system name. It sent Elasticsearch geo queries with relations which Elasticsearch rejects (`wıthın`), named the
+Elasticsearch index of a store whose name holds an `I` otherwise than other JVMs do, and didn't wait for Solr replicas
+which were recovering. The dates sent to Solr are formatted in the root locale too, where a Thai default locale
+formatted them in its own calendar.
+
+Text predicates evaluated in memory, and the text values which JanusGraph lower-cases for Elasticsearch queries and for
+Lucene, now turn the dotted capital `İ` into `i` and a capital sigma at the end of a word into `σ` in every locale, as
+the analyzers do: `String.toLowerCase` made an `i` followed by a combining dot above, and a final sigma, `ς`. A Lucene
+index needs a reindex for queries to find text values holding a dotted capital `İ` or a word-final capital sigma, or an
+`I` written by a JVM with a Turkish or Azerbaijani default locale. A mixed index on Elasticsearch whose store name holds
+an `I` or a dotted capital `İ`, and whose index such a JVM created, needs one too.
+
+##### Strings longer than 16,000 UTF-16 units keep their unpaired surrogates
+
+JanusGraph stores a string longer than 16,000 UTF-16 units compressed. It wrote each unpaired surrogate of such a
+string, a unit from U+D800 to U+DFFF which isn't half of a surrogate pair, as a question mark, so the string came back
+from storage with question marks in their place. Strings which differ only there were stored alike: the values of a
+`SET` property became one, and a unique composite index took such strings for duplicates. Such strings now keep their
+unpaired surrogates, as shorter strings do: an unpaired surrogate is compressed as the three bytes which UTF-8 would
+give its code point (WTF-8). Every other string is stored byte for byte as before, and strings stored before read as
+before:
+
+* A string stored before keeps its question marks, and so does its composite index entry, which a lookup by the string
+  as it reads back finds. A lookup by the string with its unpaired surrogates finds only the entries written since, and
+  a unique index doesn't take the two for duplicates.
+* JanusGraph versions before 1.2.0 read such a string which 1.2.0 wrote with U+FFFD in place of each unpaired surrogate.
+  Where its bytes are part of a key, they can't remove it: a value of a `SET` property stays, and so does a composite
+  index entry, which keeps a unique value taken. Upgrade every instance before such strings are written, or afterwards
+  remove the leftover values with 1.2.0 and replace the composite indexes concerned with new ones: neither `REINDEX`
+  nor `REMOVE_STALE_ENTRIES` removes the entry of an element which still exists.
+
 ##### Zombie instances auto-close during index status update operations
 
 Starting from version 1.2.0 JanusGraph can automatically force-close JanusGraph instances that are unreachable
@@ -333,6 +507,176 @@ threshold can be adjusted using the following configuration:
 graph.management-ack-timeout=240000 ms
 ```
 This is a breaking change for users who use the `JanusGraphIndexStatusUpdate` interface.
+
+##### Lucene range queries reach zero, negative decimals, the infinities and the ends of `long`
+
+A comparison of decimals on a Lucene mixed index, `lt`, `lte` or `neq`, didn't find zero or any negative value, as its
+range started from the smallest positive double, and `gt`, `gte` or `neq` didn't find positive infinity: a vertex with
+a score of 0 wasn't found by `has("score", lt(0.01))`. A strict comparison of whole numbers at an end of the range of
+`long`, such as `neq(Long.MAX_VALUE)` or `lt(Long.MIN_VALUE)`, threw an `ArithmeticException`, and so did a raw query
+such as `time:{9223372036854775807 TO *]`. Now these comparisons find what they should, a strict bound with nothing
+beyond it finds nothing, and an open end of a raw range in an exclusive bracket, as in `{5 TO *}`, keeps the end of the
+type. A comparison with a zero bound, such as `lt(0.0)` or `gte(-0.0)`, finds the same vertices whichever sign its zero
+has, as it does without the index, whereas Lucene orders `-0.0` below `0.0`. A comparison with NaN, which Lucene
+stores and orders above positive infinity, also finds what it does without the index: `eq`, `lte` and `gte` of NaN find
+NaN, `lt` and `gt` of NaN nothing, and `neq` of any other value finds NaN as well. A raw range reaches NaN by a NaN
+bound, as in `score:[5 TO NaN]`.
+
+##### Vertex-centric ranges of `Float` and `Double` keys hold what their comparisons hold
+
+Where a vertex-centric index sorts the edges or properties of a vertex by a `Float` or `Double` key, it holds them in an
+order which puts `-0.0` before `0.0` and NaN after positive infinity, while the comparisons of a range take `-0.0` and
+`0.0` as equal, and NaN as equal to NaN alone and comparable with no other value. A range of the key with an end
+returned the relations which the index holds between its bounds, and the slice of a range from a start without an end,
+which JanusGraph checked in memory, began at its start. So `outE('rated').has('score', lt(0.0d))` returned an edge with
+a score of `-0.0`, `lte(-0.0d)` missed one of `0.0`, `lt(Double.NaN)` returned every edge with a score but NaN,
+`lte(Double.NaN)` every edge with a score, and `gte(0.0d)` missed an edge with a score of `-0.0`, also up to an end, as
+in `between(0.0d, 1.0d)`. Two conditions on such a key were combined in the order of the index too, also where no index
+sorts by the key, and so were two of a `Float` or `Double` value on a key of type `Object`:
+`has('score', gte(0.0d)).has('score', lte(-0.0d))` and `has('score', -0.0d).has('score', gte(0.0d))` returned nothing,
+and `has('score', Double.NaN).has('score', gt(1.0d))` returned the edges scored NaN where an index sorts by the score.
+These queries now return the relations whose values the comparisons hold, as a Lucene mixed index finds them (see
+"Lucene range queries reach zero, negative decimals, the infinities and the ends of `long`"): a bound at either zero
+holds both zeros where it is inclusive and neither where it is strict, `lte` and `gte` of NaN hold NaN, and `lt` and
+`gt` of NaN nothing. An equality still tells `-0.0` from `0.0`, as it does without the index. The examples write their
+decimals with a `d`, as Groovy, which the Gremlin Console runs, reads `-0.0` as a `BigDecimal`, which has no negative
+zero.
+
+The slice of a range from a start, such as `outE('rated').has('score', gt(1.0d))`, now ends before NaN, so that the
+index answers such a range of a `Float` or `Double` key alone, where JanusGraph checked it in memory, as it answers a
+range of a key of another type (see "Ordered traversals leave out the elements which have no value of an order key").
+What the index holds doesn't change, so nothing needs to be reindexed.
+
+##### Lucene no longer keeps the floats, and the strings with unpaired surrogates, removed from `LIST` and `SET` keys
+
+On a Lucene mixed index, most floats (`Float`) removed from a key of `LIST` or `SET` cardinality stayed in the
+element's document, as did the float which such a key of an edge held before it was set to another one, and `eq` and
+the ranges kept finding the element by them: after `g.V(v).properties("weights").drop()`, `g.V().has("weights", 0.1f)`
+and `g.V().has("weights", gt(0f))` still found `v`. Lucene stores a float as the double which it widens to, and
+compared the removed float with the stored values by its own decimal string, which differs from the double's for most
+floats: `0.1` against `0.10000000149011612`. Floats whose strings are the same, such as `1.5f` or `-2.5f`, were
+removed. A string with an unpaired surrogate stayed likewise, whatever its mapping, as Lucene stores U+FFFD in place of
+the surrogate. Lucene now compares a removed value with the stored ones in the form in which it stores them. What it
+writes doesn't change. A string longer than 16,000 UTF-16 units is removed too where storage gives it back with its
+unpaired surrogates, as it does from 1.2.0 on (see "Strings longer than 16,000 UTF-16 units keep their unpaired
+surrogates"); one which an earlier version stored comes back with a question mark in place of each unpaired surrogate,
+and stays in the index when it's removed.
+
+In exchange, a `SET` key mapped as `STRING` or `TEXTSTRING` which holds two strings that Lucene stores alike, which
+differ only in an unpaired surrogate, or in one and U+FFFD, holds one entry for both, whichever came first, so once one
+of them is removed, the other isn't found either. Two instants of one millisecond share one entry in the same way, as
+before.
+
+What an earlier version left in an index stays there: the removed values, and a second copy of a value which a `SET`
+key held when the value was set again, so that removing that value now takes out one of the two. A reindex writes the
+document of each element which holds a value of the index anew, without them, but leaves the document of an element
+which holds none as it is. To clear those too, stop the instances, delete the directory of each mixed index concerned,
+`index.[X].directory/<index name>`, and reindex those indexes. They stay enabled meanwhile, so until the reindex has
+finished, their queries miss the elements which it hasn't written yet.
+
+##### Elasticsearch, OpenSearch and Solr compare decimals with zero, NaN and the infinities as JanusGraph does
+
+A comparison of a `Float` or `Double` key with a bound at zero didn't find on an Elasticsearch, OpenSearch or Solr
+mixed index what it finds without an index. These indexes order `-0.0` below `0.0`, while JanusGraph's comparisons
+hold the two zeros equal, and only `eq` and `neq` tell them apart: `has("score", lt(0.0))` found the elements with a
+score of `-0.0`, `gt(-0.0)` those with `0.0`, `gte(0.0)` missed those with `-0.0`, and `lte(-0.0)` those with `0.0`.
+Now a bound at either zero finds the same elements whichever sign its zero has, as on Lucene.
+
+These indexes also order NaN above positive infinity, while NaN equals NaN alone and compares to no other value. On
+Solr, `lt` and `lte` of NaN found every value, and `gte` of NaN missed NaN. Now `eq`, `lte` and `gte` of NaN find NaN,
+`lt` and `gt` of NaN nothing, and `neq` of NaN every other value, as on Lucene.
+
+Elasticsearch and OpenSearch hold neither NaN nor the infinities: they reject the document, or the update of the
+document, of an element with such a value of a `Float` or `Double` key, so that the mixed index misses a new element,
+or keeps an existing element's document as it was before the change, and JanusGraph logs that the index mutation
+failed. Yet `lt` and `lte` of NaN found every value of a `Double` key on Elasticsearch 7 and later and on OpenSearch,
+and of a `Float` key on Elasticsearch 8 and later. And a comparison with NaN or an infinity failed with "Could not call
+index" where the cluster rejected the query: `eq` and `neq` of a `Double` key on Elasticsearch 6 to 8 and on
+OpenSearch, every comparison of a `Float` key on Elasticsearch 6 and 7 and on OpenSearch, and every comparison of either
+key on Elasticsearch 6. Now such a comparison isn't sent to them: as every value they hold is finite, it finds every
+element with a value of the key where any finite value passes it, as `lt` of positive infinity and `neq` of NaN do, and
+none otherwise.
+
+Only the queries change, so no reindexing is needed.
+
+##### Ranges and not-equals of a `TEXTSTRING` key compare its strings whole
+
+A key mapped as `TEXTSTRING` holds each string whole in a field of its own, which the index sorts the key by, and its
+words in its text field. A range on such a key, `lt`, `lte`, `gt`, `gte` or `between`, compared its bound with the
+words, which are in lower case, rather than with the string, on Lucene, Elasticsearch and OpenSearch: with names "Long
+John Don", "Long Little Lewis", "Middle Sister Mabel", "big brother bob" and "Zed", `has("name", lt("Long Zed"))` found
+none of them, and `gt("Middle Sister Mabel")` all five. A `neq` read the text field on Elasticsearch, OpenSearch and
+Solr: `neq("Long John Don")` left out every element which holds all the words of its value, in any order and case, on
+Elasticsearch and OpenSearch, such as "Don John Long", and every element which holds them as a phrase on Solr, such as
+"Long John Don Jr". The comparisons now read the whole strings, in the order the key is sorted by, as `eq`,
+`textPrefix`, `textRegex` and `textFuzzy` already did on every index, and as Solr's ranges did. The predicates on words,
+such as `textContains`, still read the text field. No reindexing is needed for this: each index has written the whole
+strings since it began to support `TEXTSTRING`.
+
+Two more fixes on Lucene. Removing a value with upper-case letters from a `LIST` or `SET` key mapped as `TEXTSTRING`
+left it in the field of the whole strings, where `eq`, `neq`, `textPrefix`, `textRegex` and `textFuzzy` still saw it,
+and the ranges, which now read that field, would too. It's removed from there now; a value removed before this fix stays
+there until the index is reindexed. And the negated text predicates and `textContainsPhrase` on a `TEXTSTRING` key
+failed with "Could not call index", as Lucene accepted them but couldn't answer them. JanusGraph now checks them in
+memory, as it does on keys of the other mappings.
+
+On Lucene, Elasticsearch and OpenSearch, a `TEXTSTRING` key with a custom `string-analyzer` holds the terms of that
+analyzer in the field of its whole strings, as a key mapped as `STRING` with that analyzer does: a range compares its
+value, which isn't analyzed, with those terms, while `eq` and `neq` first split their value with that analyzer.
+
+##### Fixes to text predicates and `SET` keys on Lucene and Solr
+
+Lucene now finds the elements which Elasticsearch and OpenSearch find in three more cases.
+
+`textContainsRegex` on a key mapped as `TEXTSTRING` matched its expression anywhere in a word, so
+`textContainsRegex("lit")` found "Long Little Lewis", and `textContainsRegex("l.*e")` found "Middle Sister Mabel" too.
+A word now matches when the expression matches it whole, as the predicate is defined. An expression which was valid
+only within the `.*` around it now fails, as on Elasticsearch: one which ends in a backslash, or `abc|`, which matched
+every word. The expression is put in lower case, as the words are, as before: `textContainsRegex("Lit*le")` finds "Long
+Little Lewis", as on Elasticsearch and Solr, while the predicate checked in memory, as on the elements a transaction
+changed, doesn't. Putting it in lower case also turns an escape such as `\W` into `\w`, as on Elasticsearch.
+
+A `SET` key mapped as `DEFAULT`, `TEXT` or `TEXTSTRING` holds the words of each of its values in lower case, so two
+values which differ only in case have the same words. A value added beside such a variant of it, in the same
+transaction or a later one, took the place of the variant's words instead of adding its own, and once one of the two
+values was removed, the other had no words left: with "zed" and "Zed", removing "zed" made `textContains("zed")` miss
+the vertex. Lucene now replaces the words of an added value only where the document holds the value itself: as the
+field of the whole strings of a `TEXTSTRING` key tells, and on a `DEFAULT` or `TEXT` key, which has no such field, where
+a transaction puts the value back, as when a vertex property is replaced by one of the same value. An index provider
+tells such an addition by the new `IndexMutation.isReAddition`. On a `DEFAULT` or `TEXT` key, a value which reaches the
+index twice otherwise has its words twice, and they stay findable after the value is removed, until the element is
+reindexed. That takes a reindex or the transaction recovery which writes the element between the storage commit of the
+transaction which added the value and its index mutation, or a reattempt of a write whose commit failed after Lucene
+wrote it (see below). Both are rare, and the values of `LIST` keys already behave so. Words lost before this fix stay
+lost until the index is reindexed.
+
+On Solr, a value of a `SET` or `LIST` key which a transaction removed and added back was held twice, as when a
+transaction sets a value which a `SET` key holds and so replaces its property. The mutation drops such a removal and
+keeps the addition, which Solr's atomic update `add` appended to the values the document holds, while a later removal,
+Solr's `remove`, takes out one occurrence of a value. So once the value was removed, `textContains`, `eq` and the other
+predicates still found the element, on every mapping. Solr now leaves out an addition which puts back a value the
+mutation removed, as the document still holds it. Elasticsearch adds a value to a `SET` key only where the key doesn't
+hold it already. A value of a `LIST` key which a transaction removes and adds back is still held twice on Lucene and
+Elasticsearch.
+
+A mutation which Lucene reattempts after a failure is now applied once, save where a store's commit failed after Lucene
+wrote it. The stores which committed before the failure are left out of the reattempt, and the store which failed
+discards what it wrote before it failed. Before, the reattempt applied those changes again: it added the values of
+`LIST` keys a second time, and removed a second entry of a removed value of a `LIST` key, or the words of a case variant
+of a removed value of a `SET` key. And what a store wrote before it failed, also in a restore, was made to last by the
+next commit of the store, or by closing the index, where no reattempt followed. A commit which fails after Lucene wrote
+it takes an I/O error at its very end, such as a missing file of the previous commit, and the reattempt then applies
+its store again. A writer which a failure closed outside a write, such as a background merge which fails on a full
+disk, is now replaced by the next write of its store, which failed before, and a failure to open a writer, such as too
+many open files, is reattempted.
+
+`eq`, `neq` and `textContains` of a value which the analyzer gives no terms for, such as punctuation or a stop word of a
+custom analyzer, added no condition to the query: alone, they found every element in the index, with the key or
+without it, and a count of them failed with "Query must not be null". (`eq` and `neq` split their value only on a key
+with a custom `string-analyzer`.) Now `eq` and `textContains` find no element, and `neq` every element with a value.
+A `neq` of a value of several terms found the elements which hold none of its terms, and the elements without a value,
+instead of the elements with a value which `eq` doesn't find, which lack one of its terms or more: with "Tom and Jerry"
+and "Spike" under the English analyzer, `neq("Tom Spike")` found neither of the two, only an element without a value.
 
 ##### Faster mixed-index reindex with batched document restores
 
@@ -367,6 +711,34 @@ To restore the previous storage-page-sized, flush-once-per-segment behavior, set
 [Elasticsearch reindex tuning guide](index-backend/elasticsearch.md#reindex-optimization) for tuning
 the batch size, reindex threads and `index.[X].elasticsearch.bulk-refresh` together.
 
+##### Lucene analyzes each field with the key information of the transaction at hand
+
+The analyzer of a Lucene store kept the key information of the transaction which first wrote to or queried the store,
+and resolved every field through it from then on. Once that transaction had closed, its key information could no
+longer read the schema: when a schema change to the index, such as disabling or re-enabling it, had reached the
+transaction after its last use of the store and before it closed, the store's next write or query failed, with an
+`AssertionError` in `StandardJanusGraphTx.getSchemaVertex` where assertions are enabled and otherwise with
+`Index with name [...] is unknown or not configured properly`. And a key added to the index after that transaction
+had last read the index's keys was unknown to it, so its values were indexed with the standard analyzer instead of
+the one configured for its mapping or its `TEXT_ANALYZER` or `STRING_ANALYZER` parameter. Text keys stayed
+consistent between writes and queries until the instance restarted, after which the new instance's analyzer knew the
+key and queries no longer found the values indexed before; string-mapped and UUID keys were missed within the same
+instance already, as their exact, prefix, regex, fuzzy and range queries compare the raw value with what the
+standard analyzer indexed. The analyzer now resolves each field through the key information of the transaction on
+whose behalf the field is analyzed.
+
+##### Lucene finds the words of a string which ends in an unpaired high surrogate
+
+On a Lucene mixed index, a string value of a key mapped as `DEFAULT`, `TEXT` or `TEXTSTRING` which ended in an unpaired
+high surrogate, a unit from U+D800 to U+DBFF without the low half of its pair after it, was indexed without the words
+which Lucene's standard tokenizer read last along with the surrogate, all of them in a short value:
+`textContains("words")` didn't find an element whose value was `"Tail Words\uD800"`. A later write of the element's
+document found them, as it analyzed the string as Lucene had stored it, with U+FFFD in place of the surrogate. Such a
+string is now analyzed with U+FFFD from its first write, and so is a query value: a `textContains` value which ended in
+an unpaired high surrogate gave no words and found every element of the index, and a `textContainsPrefix` value found
+none, where both now find the elements with its words. A value written before keeps its words missing until its
+element's document is written again, as by a reindex or an update of another of its values in the index.
+
 ##### Faster OLAP scans (signal-based row hand-off)
 
 The OLAP scan pipeline behind reindex and other scan jobs now hands rows between its internal threads
@@ -374,6 +746,70 @@ using blocking `take()` and sentinel markers instead of polling bounded queues o
 fast backends (notably CQL/Cassandra) this removes per-row hand-off latency that could otherwise
 dominate scan wall-clock time, speeding up single-node reindex and other full scans by a large factor.
 No configuration or user action is required.
+
+##### OLAP jobs end their transactions, and jobs which run at once create their compute keys
+
+The OLAP jobs of `FulgoraGraphComputer` left transactions open until the graph closed: their scans started one for each
+processor and work block of each iteration, which nothing closed, the job's thread kept the one in which it attached the
+elements of the job's memory, and a new result graph is a transaction, which closing the job's `ComputerResult` didn't
+end. An instance acknowledges a schema change only once the transactions which were open when the change arrived have
+closed, so a graph which had run a job could no longer register a new index: the index stayed `INSTALLED`. A job now
+ends the transactions of its scans and of its thread once it has ended, and closing a `ComputerResult` rolls back the
+transaction of its new result graph, which can't be used afterwards. The vertices and edges among the values of a job's
+memory, which the side effects of a traversal collect, are detached from the scans' transactions when the job ends, with
+their properties, so that a later job of the traversal and the user can still read them; the elements of a traversal's
+results are read in the reading thread's own transaction, which it opens on demand and should close. Close the
+`ComputerResult` of a job whose result graph is new once done with `result.graph()`, as its transaction holds up the
+acknowledgement of schema changes until then.
+
+Of the jobs which ran at once and created the same compute key, all but one failed: the lock of the key's name failed
+their commits, and an `IllegalArgumentException` saying that the transaction had already been closed hid that failure. A
+job whose commit fails on such a lock, of JanusGraph's own locker, now waits twice `storage.lock.wait-time`, then twice
+as long each time, and creates the keys which are still missing, making up to `storage.lock.retries` attempts.
+`JanusGraphManagement.rollback()` no longer throws after a commit which failed.
+
+##### OLAP traversals no longer fail or lose results when the processors of a scan clone their program at once
+
+An OLAP traversal could fail with `Failed to process [N] vertices in vertex program iteration [K]`, where each vertex
+which failed logged `The provided key is not a memory compute key` or a `NullPointerException`, or return too few
+results without an error. The processors of a scan clone the job, and the traversal's `TraversalVertexProgram` with it,
+for each work block of `10 × storage.buffer-size` vertices, 10,240 by default, so in a scan of more than two blocks on
+several processors they may clone the program at the same time. Each clone numbers the steps of its own copy of the
+traversal, and TinkerPop's copies of a traversal share the counter with which they are numbered: copies numbered at the
+same time got mixed-up step ids, which the job's memory and the other clones didn't know, or knew as other steps. Vertex
+programs are now cloned one at a time.
+
+##### OLAP traversals no longer fail when some workers of an iteration add to a side effect which others read
+
+An OLAP traversal which reads a side effect in the iteration in which it adds to it, as
+`g.V().where(without("x")).aggregate("x")` does, could fail with `Failed to process [N] vertices in vertex program
+iteration [K]`, where each vertex which failed logged a `ConcurrentModificationException`, or read some of the values
+which other vertices added in the same iteration. The memory of a `FulgoraGraphComputer` job reduced each value which a
+worker added to a key into the key's value at once, and the reducer of a collection, as that of `aggregate()`, adds to
+the collection itself, which the other workers were reading. The values added to a key which the workers read, a
+broadcast `MemoryComputeKey`, are now reduced with each other, into the first one, and join the key's value once the
+iteration's workers have ended, where the key's reducer is `Operator.addAll` or isn't one of TinkerPop's `Operator`s.
+`TinkerGraphComputer` and `SparkGraphComputer` likewise reduce each worker's (task's) additions into the first one.
+TinkerPop's other operators change neither argument, so their keys still take each addition at once.
+
+A vertex program which adds to such a key must therefore add values which are mutable, of the key's own kind, and which
+it no longer uses, as the first value added decides how the iteration's additions combine: after an immutable
+collection, as one of `Collections.singletonList()`, the vertices which add to the key fail, and sets added to a list
+lose the elements which several of them share. A reducer of the program's own must be associative, and take two
+additions.
+
+So must the reducer of a traversal's side effect given to `withSideEffect(key, value, reducer)`. Unless it is
+`Operator.addAll` or `Operator.assign`, `aggregate()` adds each element to the side effect on its own, and so does a
+step which calls `Traverser.sideEffects(key, value)`, so the reducer now combines two elements where it took the side
+effect's value and an element. A reducer which adds an element to the side effect's set, as
+`(a, b) -> { ((Set) a).add(b); return a; }` does, fails, as on `TinkerGraphComputer`, where `Operator.addAll`, given a
+collection to start from, collects the elements.
+
+When the iteration ends, its additions are still held while they join the key's value, so a key which already holds
+values holds the iteration's additions twice for a moment; a job close to its heap limit may run out of memory. Where
+the key's value is an empty `BulkSet`, as the side effect of `aggregate()` is at first, the additions take its place
+instead. `TinkerGraphComputer` reduces each worker's additions into the key's value as that worker ends, so it holds a
+worker's share twice.
 
 ##### Opt-in parallel token-range scan for CQL full scans
 
@@ -429,6 +865,26 @@ scan job now fails with a `TemporaryBackendException` describing the failed pull
 returning a partial result, and it fails fast: the error surfaces as soon as the dead puller's
 end-of-data marker is observed rather than after the remaining key space has been streamed and
 discarded.
+
+##### OLAP jobs no longer drop the tasks which they run after their scans
+
+The phases of a `FulgoraGraphComputer` job which run on a pool of workers after its scans could end with some of their
+work missing, and without an error: the execution of the vertex program on the partitioned vertices, the reduce stage of
+a map-reduce, and the writing of the computed properties into the graph. Once all of a phase's tasks were submitted, the
+pool waited 10 s for them and then dropped those which hadn't started: on one worker, a program which took 100 ms on
+each of 140 partitioned vertices ran on about 105 to 110 of them. A reduce which failed was lost as well, and so was a
+batch of computed properties whose transaction couldn't start.
+
+The pool now waits for all its tasks as long as they keep ending. Where none ends for `computer.task-progress-timeout`,
+10 minutes by default, it interrupts the running tasks, drops the others and fails the job, whose failure is caused by
+the pool's, which names the phase and the tasks left, as nothing else can stop a job whose task never ends: neither
+cancelling its future nor closing the graph interrupts it. As for every duration, a value without a unit is in
+milliseconds, and one of about 292 years or more, such as 9223372036854775807, waits indefinitely. A task which throws,
+as a reduce which fails or a batch of computed properties whose transaction can't start, fails the job, and the tasks
+which haven't started are then skipped. The execution on a partitioned vertex and the commit of a batch of properties
+count their own failures, as before, which fail the job once all the tasks have run. A map-reduce's `workerStart()` now
+runs before its reduces and `workerEnd()` after them, on the job's thread and also after a failure, where both ran as
+tasks of their own, in any order with the reduces.
 
 ##### Scan merge no longer loses data on writes concurrent with the scan
 
@@ -677,6 +1133,346 @@ like every other 404 of a removal, so the commit passed silently although the in
 A removal stays exempt from a 404 which says only that the document is missing, since an absent document is the state
 it asked for.
 
+##### UUIDs are compared as their string forms, as the indexes and the storage backend order them
+
+JanusGraph now compares two UUIDs by their bits as unsigned numbers, the most significant half first, which is the
+order of their string forms, in the orders and ranges of its own queries: where it orders the results of a graph query
+or checks a range of UUIDs on them itself, and among the edges and properties of a vertex. It compared them with
+`UUID.compareTo`, which compares each half as a signed number: where, in the first half in which two UUIDs differ, one
+starts with a digit from `8` to `f` and the other with one from `0` to `7`, it put the first before the second.
+Elasticsearch, OpenSearch and Solr sort UUIDs by their string forms, and the storage backend holds the UUIDs which are
+the sort keys of a vertex's edges or properties, or the values of a key of `SET` cardinality, by their bytes, in that
+order too. So UUIDs like these came out of order:
+
+* in a graph query ordered by a UUID key, such as `g.V().has('kind', 'k').order().by('uid')`: the results of a query
+  which no index sorts, which JanusGraph sorted unlike an index would, and on Solr the vertices and edges which a
+  transaction had added or changed, merged into what the index returned;
+* among the edges or properties of a vertex ordered by a UUID sort key, and among the values of a UUID key of `SET`
+  cardinality: those which the transaction had added, merged into those which the storage backend returned.
+
+Elasticsearch failed a graph query ordered by a UUID key which its index holds with "Could not call index", as
+JanusGraph asked it to sort by the key with an `unmapped_type` of null, which it rejects. JanusGraph now gives
+`keyword`, the type which it maps UUIDs to. Lucene doesn't sort by a UUID key, and failed such a query as well:
+JanusGraph now sorts its results itself, as the section *Orders by a key which the index backend can't sort by are
+sorted by JanusGraph* describes.
+
+On Solr, an ascending order by a UUID key which keeps the elements without the key, such as that of
+`graph.query().has('tag', 't').orderBy('uid', asc)`, put those elements first, where JanusGraph and Elasticsearch put
+them last, as the `uuid` field type of the example `conf/solr/schema.xml` didn't declare `sortMissingLast="true"`, as
+its other sortable types do. With the transaction's new vertices merged into such an order, a limit could leave out a
+vertex which comes within it. The `uuid` type now declares the attribute. To have an existing collection order these
+elements in the same way, add the attribute to its `uuid` type and reload the collection.
+
+Ranges of UUIDs, such as `has('uid', gt(u))`, which no index answers, compared them as signed numbers too. In a graph
+query they disagreed with the order of an index which sorts by the key, so that keyset paging with `gt()` could skip
+UUIDs. On the edges of a vertex they disagreed with the storage backend, from which JanusGraph reads the stored edges in
+a range of their sort key: `has('uid', gt(u))` found the stored edges which come after `u` both as unsigned and as
+signed numbers, and the transaction's new ones which come after it as signed numbers, while a range from
+`00000000-0000-0000-0000-000000000001` to `ffffffff-ffff-ffff-ffff-ffffffffffff` found none at all.
+
+Where TinkerPop compares UUIDs, it still does so by `UUID.compareTo`, which now disagrees with JanusGraph's own orders
+and ranges: in an `order()` which JanusGraph doesn't fold into its query, in `min()` and `max()`, and in a `has()`,
+`is()` or `where()` which JanusGraph doesn't fold into a query, such as one after a `V()` of ids or a `hasId()`, or
+`where(values('uid').is(gt(u)))`. So `g.V(ids).has('uid', gt(u))` can find other vertices than
+`g.V().has('kind', 'k').has('uid', gt(u))` of the same vertices. After a `hasId()`, though, JanusGraph checks an `and()`
+or `or()` of predicates, such as a `between()`, with `Cmp`, which compares UUIDs as their string forms, while TinkerPop
+checks a single `gt()`, `gte()`, `lt()` or `lte()` there: `hasId(ids).has('uid', gte(a).and(lt(b)))` can find other
+vertices than `hasId(ids).has('uid', gte(a)).has('uid', lt(b))`, where both compared by `UUID.compareTo` before.
+
+Where no mixed index answers a query, its conditions compared UUIDs as an `order()` which JanusGraph doesn't fold does,
+and now don't, so keyset paging with such an order can skip UUIDs. With a composite index on `kind`, paging with
+`g.V().has('kind', 'k').has('uid', gt(last)).order().by('uid').by(T.id).limit(2)` over UUIDs on either side of `8`, such
+as `00000000-0000-0000-0000-000000000001`, `7fffffff-ffff-ffff-ffff-ffffffffffff`,
+`80000000-0000-0000-0000-000000000000` and `ffffffff-ffff-ffff-ffff-ffffffffffff`, returns `80000000-...` and
+`ffffffff-...`, which that order puts first, and then nothing, as no UUID comes after `ffffffff-...` in the order of
+their string forms; it returned all of them before. Keyset paging needs an order which JanusGraph folds, such as
+`order().by('uid')`, which returns all of them in the order of their string forms. That is the trade-off of this change:
+JanusGraph's own orders and ranges now agree with the indexes and the storage backend, and no longer with the orders
+which TinkerPop sorts.
+
+For code built on these classes: the ranges of `Cmp` and `AttributeUtils.compare` compare two UUIDs by their bits as
+unsigned numbers, and `AttributeUtils.compareValues` and `AttributeUtils.compareUnsigned` are new.
+
+##### Fixes to the aggregations and orders which a mixed index answers
+
+JanusGraph answers a `count()`, `min()`, `max()`, `sum()` or `mean()` which follows a query that a single mixed index
+answers, such as `g.V().has('name', 'x').values('age').max()`, from the index. A minimum, maximum, sum or mean now
+covers the values the matching elements hold, every value of a `LIST` or `SET` key included, and when there is none,
+because no element matches or none of those which do holds the key, the traversal has no result, as when TinkerPop
+aggregates the values itself. Elasticsearch answered 0 there, Lucene and Solr a sum of 0 and a mean of NaN, or failed.
+Code which takes such a result with `next()` now gets a `NoSuchElementException` in place of the 0, and `tryNext()` an
+empty `Optional`.
+
+The index aggregates every match it holds, so the traversal now aggregates in memory where the index can't give the
+same answer: after a `limit()` or the offset of a `range()`, which a minimum, maximum, sum or mean ignored; in a
+transaction whose uncommitted changes, which the index doesn't hold, add or remove a property of a key of the query's
+condition or of the aggregated key, removing an element included, so that such a transaction fetches every match to
+aggregate it, while changes of other keys leave the aggregation to the index; and for a key whose field in the index
+isn't `ENABLED`, such as one added to an existing index and not yet reindexed, whose values the index may lack. A count still comes from the index
+after a limit or a range, but now stops at the limit of the traversal and leaves out the offset of the range. It left
+out no offset, and stopped at the limit of the query the index answered, which `query.hard-max-limit` and
+`query.smart-limit` can make smaller than the number of matches. As before, an aggregation the index answers sees
+committed changes only once the index has made them visible, which Elasticsearch does after its refresh interval with
+the default `index.[X].elasticsearch.bulk-refresh` of `false`.
+
+Lucene also failed with a `NullPointerException` when some matching elements lacked the key: always for a sum or a
+mean, and for a minimum or a maximum when such an element came first in the index's order, which sorted it as 0. Its
+minimum and maximum of a `LIST` or `SET` key failed with an `IllegalStateException`, and its sum and mean took only the
+first value of each element. And on every backend, a minimum, maximum, sum or mean after a `has()` which names a key
+that doesn't exist, or whose conditions a composite index answers, failed with an `IndexOutOfBoundsException` or a
+`ClassCastException` while JanusGraph optimized the traversal; it now aggregates in memory. A sum keeps the number type
+the index gives it, a `Long` for whole numbers and a `Double` for decimals, where TinkerPop keeps the type of the values
+unless the sum outgrows it. As before, Elasticsearch and Solr aggregate in doubles, and Lucene sums in doubles, which
+hold whole numbers exactly only up to 2^53.
+
+Lucene, and Solr with the example schema of earlier versions, sorted the elements without the key of an ordered query
+which the index answers among the others, such as those of `graph.query().orderBy('age', asc)`: as if their value were 0
+for numbers and dates, and in Lucene for booleans too, while Lucene put strings without a value first when ascending.
+JanusGraph places these elements last, whether the order is ascending or descending, when it orders elements itself, and
+Elasticsearch does too. Lucene now places them last as well, except where they tie with the value they sort as, the
+greatest `Long` or date value or positive infinity when ascending and the least ones or negative infinity when
+descending, and except that they come before NaN when ascending. Solr places them as its schema says: the numeric and
+date field types of the example `conf/solr/schema.xml` now declare `sortMissingLast="true"`, as its string and boolean
+types did already. To have an existing collection order these elements in the same way, add the attribute to those types
+in its schema and reload the collection. A traversal's `order().by(key)` now leaves these elements out, as the section
+*Ordered traversals leave out the elements which have no value of an order key* describes.
+
+For code built on these classes: `ElasticSearchClient.avg` returns a `Double`, and `RestAggValue.getValue()` and
+`setValue()` give and take one; `ElasticSearchClient.min`, `max`, `avg` and `sum`, `IndexProvider.queryAggregation` and
+`MixedIndexAggQuery.execute` return null when there is no value to aggregate; and Lucene's `SumCollector` is now
+`StatsCollector`.
+
+##### Ordered traversals leave out the elements which have no value of an order key
+
+JanusGraph folds an `order().by(key)` of a traversal into its query, which an index sorts where it can, and the query
+returned the elements which have no value of the key as well, after the others. TinkerPop leaves such an element out, as
+a `by()` modulator which yields no value filters the traverser, and so does TinkerGraph. So
+`g.V().has('kind', 'k').order().by('name')` returned the vertices of kind `k` without a `name` too, and now leaves them
+out, and a `count()` after it no longer counts them. This holds wherever JanusGraph folds the order in: in a query which
+a mixed index sorts, which now skips these elements itself, in one which JanusGraph sorts in memory, for the elements
+which a transaction added or changed, and in an order of the edges or properties of a vertex, such as
+`local(outE('knows').order().by('weight').limit(10))`. Several `order()` steps in a row, such as
+`order().by('a').order().by('b')`, leave out the elements without `a` or `b`, and are now folded in together, ordering
+by `b` and then by `a`, as TinkerPop's sorts, which keep the order of ties, do. JanusGraph dropped all but the last of
+them. Where the index which sorts the query doesn't hold the key of an earlier step, as with only `b` indexed in
+`order().by('a').order().by('b').limit(10)`, JanusGraph read the first ten by `b` from the index and left their ties
+unordered; it now sorts every match in memory, as it sorts any query which no index sorts, which fails with a
+`QueryException` where it reads a million elements or more. An order by the same key twice, such as
+`order().by('name').by('name', desc)`, failed with an `IllegalArgumentException`, and now orders by the first.
+
+To keep the elements without the key, order by a traversal which gives them a value, such as
+`order().by(coalesce(values('name'), constant('')))`, which places them where the empty string sorts. JanusGraph doesn't
+fold such an order into its query, and TinkerPop sorts the elements in memory. A query of JanusGraph's API, such as
+`graph.query().has('kind', 'k').orderBy('name', asc).vertices()`, keeps them, last where JanusGraph sorts them and where
+the section *Fixes to the aggregations and orders which a mixed index answers* says for a mixed index. An order of
+vertices by a key of several values, `LIST` or `SET`, which JanusGraph folds in where every mixed index backend can sort
+by such a key, as Elasticsearch and Solr can, leaves them out as well, and so the vertices without a value of its other
+keys, as in `order().by('names').by('age')`.
+
+Where a vertex-centric index sorts the edges or properties of a vertex by the key, the slice of the index which such an
+order reads leaves out those without the key, and so do the slices of a `has(key)`, such as
+`outE('knows').has('since')`, and of a range of the key which is open toward the larger values, such as
+`outE('knows').has('since', gt(2020))`, which JanusGraph checked in memory before. The slice ends before them, as
+JanusGraph writes a missing value after every value of the key, except for a key whose data type is `Class` or one with
+a custom serializer which writes null itself, for which JanusGraph still checks them in memory. The slice of a range of
+a `Float` or `Double` key from a start ends before NaN, which sorts after the other values and which the comparisons of
+the range reject (see "Vertex-centric ranges of `Float` and `Double` keys hold what their comparisons hold"). A
+`has(key)` of the edges or properties of a vertex now reads such an index, so that with a limit and no order it may
+return other relations than before.
+
+Some orders which JanusGraph folded in are now left to TinkerPop:
+
+* `order().by(key, shuffle)`, which failed with an `AssertionError`;
+* an order of the edges or properties of a vertex by several keys, such as
+  `local(outE('knows').order().by('weight').by('time'))`, which failed with an `IllegalArgumentException`, as such a
+  query takes a single key;
+* an order whose `by()` modulator has a bypass traversal: the deprecated `ProductiveByStrategy` gives it one which
+  yields null where the key has none, which TinkerPop places first when ascending, and `SubgraphStrategy` with a filter
+  of vertex properties one which reads only the properties which the filter keeps;
+* an order of other elements than the step's by an `ElementValueComparator`, such as
+  `order().by(out('knows'), new ElementValueComparator('name', asc))`, which JanusGraph folded in as an order of the
+  step's own elements;
+* `order()` steps in a row of which one isn't by a key.
+
+TinkerPop sorts these orders in memory, after reading every element which the steps before them match, where an index
+sorted some of them before and a limit read only the first elements.
+
+The edges or properties of a vertex which a traversal fetches in a batch, as `query.batch.enabled` has it by default,
+could come in the order of the storage backend rather than the one which the traversal folded in, where no
+vertex-centric index sorts them in that order; so could those of an ordered `JanusGraphMultiVertexQuery`. They are now
+sorted.
+
+##### Ordered traversals read a mixed index of their order keys which answers them whole
+
+A traversal which orders by a key and has no condition that an index answers, such as
+`g.V().order().by('name').limit(10)` with `name` mapped as `STRING` in a mixed index, read every vertex and sorted them
+in memory, which fails with a `QueryException` where JanusGraph reads a million elements or more, and which
+`query.force-index` refused. Such a traversal leaves out the elements without a value of an order key, as the section
+*Ordered traversals leave out the elements which have no value of an order key* describes, so a mixed index which holds
+the order keys can answer it, as it answers `g.V().has('name').order().by('name').limit(10)`. It now does where a single
+mixed index holds every order key, which its backend sorts by, and answers every condition of the traversal: the index
+returns the elements sorted, so that a limit reads only the first of them, and a `count()` right after the order, or a
+`min()`, `max()`, `sum()` or `mean()` of a key which the index holds, comes from the index, as after a `has()`. An index
+restricted to a label with `indexOnly()` answers such an order of the elements of that label, as in
+`g.V().hasLabel('person').order().by('name').limit(10)`. `query.force-index` no longer refuses these traversals.
+
+On Elasticsearch, such a traversal without a limit, as `g.V().order().by('name')`, reads all that the index returns in
+pages of `index.[X].max-result-set-size` elements, 50 by default. In a test, ordering 31,846 vertices so took 51% longer
+than a scan of the inmemory storage backend with pages of 50, and 57% less time with pages of 1,000: raise
+`index.[X].max-result-set-size` for such traversals. Solr reads such a result in pages which grow up to
+`index.[X].solr.max-page-size`, as the section *Solr reads a result larger than a page in growing pages* describes: in
+the same test, ordering 31,846 vertices so took 51% less time than the scan.
+
+These traversals now see what a `has(key)` sees, where the scan read what the storage backend holds. An element
+committed moments before may be missing until the index shows it: Elasticsearch, with
+`index.[X].elasticsearch.bulk-refresh` at its default of `false`, shows it once it refreshes the index, and Solr, with
+`index.[X].solr.wait-searcher` at its default of `false`, once a commit opens a new searcher, which the `solrconfig.xml`
+that JanusGraph ships does only where `solr.autoSoftCommit.maxTime` is set. The other way round, an element whose order
+key was removed moments before may still come back, and so may a vertex removed moments before, and an element whose
+value of the key changed may come in the order of its old value, as JanusGraph doesn't check in memory what an index
+which answers every condition returns. Where a write to the index failed, the element may be missing, or come back as it
+was. Elements which tie on the order keys may come in another order than before, the index's, so that a limit may take
+others of them, and so may elements whose `Instant` values differ by less than a millisecond, as Elasticsearch and
+Lucene keep instants by the millisecond, and Solr takes no finer one.
+
+A traversal with a condition that an index answers, such as `g.V().has('kind', 'k').order().by('name')` with a
+composite index on `kind`, reads that index as before, and so does each branch of an `or()` which no index answers as a
+whole, which JanusGraph runs as a query of its own. Otherwise a traversal still reads every element where no single
+mixed index answers it whole:
+
+* where the mixed index which holds the order keys doesn't answer a condition, as one on a key which no index holds, in
+  `g.V().has('tag', 't').order().by('name')`, or a label which the index isn't restricted to, in
+  `g.V().hasLabel('person').order().by('name')` with `name` in an index of every vertex: JanusGraph would read the index
+  in growing batches and look up each element which it returns to check the condition, which may take longer than the
+  scan, depending on the index backend and on how many elements hold the condition;
+* where no mixed index holds an order key, or holds it in a field which isn't `ENABLED`, as one added to the index and
+  not yet reindexed;
+* where only several mixed indexes together hold the order keys and answer the conditions, as for
+  `g.V().hasLabel('person').order().by('nick').by('name')` with `nick` in an index of the persons and `name` in another
+  one: a query of several indexes reads all but the first of them whole;
+* where the backend of the index which holds the order keys doesn't sort by one of them as JanusGraph orders its
+  values, as the section *Orders by a key which the index backend can't sort by are sorted by JanusGraph* describes: no
+  backend sorts by a string key which the index maps as `TEXT`, as it maps a string key by default, Elasticsearch and
+  OpenSearch don't by a string key with a custom `string-analyzer`, and Lucene doesn't by a `UUID` key; nor does Lucene
+  sort by a key of `LIST` or `SET` cardinality, as in an order of edges by such a key, as the section *Orders by a key
+  of several values compare its least or greatest value* describes;
+* where the index holds an order key with custom parameters, which Elasticsearch takes into its mapping, and which may
+  keep it from sorting by the key, as `doc_values` false does.
+
+A single mixed index which holds every order key, which its backend sorts by, and answers the other conditions,
+restricted to the traversal's label where it has one, answers such a traversal, also where another index which holds
+the keys can't sort by them. To have an order by a string key read the index, map the key as `STRING`, or as
+`TEXTSTRING` to search its words as well, without a custom `string-analyzer` on Elasticsearch and OpenSearch. A query of
+JanusGraph's API, such as `graph.query().orderBy('name', asc).vertices()`, keeps the elements without the key, which no
+index holds, and so still reads every element too. An index backend of another provider which keeps the default of
+`IndexProvider.supportsOrdering`, true, is taken to sort by every key, so that such a traversal now reads its index,
+also by a key which it can't sort by, such as `g.V().order().by('title')` of a key of `TEXT` mapping: such a provider
+should implement `supportsOrdering`, as the section *Orders by a key which the index backend can't sort by are sorted by
+JanusGraph* says.
+
+##### The strings of an ordered graph query come in the order of their code points
+
+A graph query ordered by a string key, such as `g.V().has('kind', 'k').order().by('name')`, now orders the strings by
+their code points whoever sorts them: Elasticsearch, OpenSearch, Lucene and Solr sort strings by their UTF-8 bytes,
+which is that order, while JanusGraph compared them by UTF-16 code unit, as `String.compareTo` does, where it ordered
+elements itself. The two orders differ only where the first character in which two strings differ is one from U+10000
+up, such as an emoji, in one of them and one from U+E000 to U+FFFF, such as a private use character or a halfwidth or
+fullwidth form, in the other: by code point the first comes after the second, by UTF-16 unit before it. Strings like
+these came out of order:
+
+* the vertices and edges which a transaction had added or changed, merged into what an index returned for the query;
+* in a query which no index sorts, such as one ordered by a key which the index doesn't hold, which sorted them unlike
+  a query which an index sorts;
+* in a traversal whose `or()` branches JanusGraph answers by queries of their own, as it does when no index answers
+  the `or()` as a whole, as for branches which only a composite index or no index answers, which merged the results of
+  those queries by UTF-16 unit. That merge also failed with an `IllegalStateException` when it compared an element
+  without the order key with one of another branch; the traversal now leaves such an element out, as the section
+  *Ordered traversals leave out the elements which have no value of an order key* describes.
+
+An `order()` which JanusGraph doesn't fold into its query, such as one by a traversal, is TinkerPop's and still compares
+strings by UTF-16 unit, and so does the order of a vertex's edges or properties by a key, in which the storage backend
+holds them. A partitioned vertex put an edge without the key of a descending order of its edges, which a query of the
+vertex keeps, out of place among the edges which its representatives hold, where a vertex which isn't partitioned puts
+it first; it now merges them as each representative orders them.
+
+For code built on these classes: `MultiDistinctOrderedIterator` takes the `Comparator` to merge by in place of a list
+of `HasStepFolder.OrderEntry`.
+
+##### The `limit()`, `range()` and `order()` steps of an `or()` branch apply to each element, as in TinkerPop
+
+TinkerPop runs each branch of an `or()` for each element on its own. So a `limit()` or `range()` in a branch lets the
+element through, unless it skips it or its limit is 0, and an `order()` there lets it through where each of its
+`by(key)` modulators has a value. JanusGraph, which folds the `or()` into its query, took the first elements of such a
+branch instead, and a branch's limit could become that of the whole query. With `kind` in a mixed index:
+
+* `g.V().or(__.has('kind', 'p').limit(1), __.has('kind', 'q'))` returned a single vertex, and one of kind `p` with those
+  of kind `q` where the branches came the other way round. It now returns every vertex of kind `p` or `q`, as
+  TinkerGraph does.
+* `g.V().or(__.has('kind', 'p').range(1, 3), __.has('kind', 'q'))` returned two vertices of kind `p` as well. A range
+  from 1 lets no element through, so it now returns the vertices of kind `q`.
+* `g.V().or(__.has('kind', 'p').order().by('age').limit(1), __.has('kind', 'q')).order().by('name')` returned a single
+  vertex, and where no index answers the `or()` as a whole, the first vertex of kind `p` by its `name` rather than its
+  `age` with those of kind `q`. It now returns the vertices of kind `p` which have an `age`, and those of kind `q`.
+
+A branch's `limit()` no longer bounds what JanusGraph reads, so such an `or()` reads every element which matches it. To
+take the first elements of a branch, use a `union()` of traversals which each start from `V()`, such as
+`g.union(__.V().has('kind', 'p').limit(1), __.V().has('kind', 'q')).dedup()`, for which JanusGraph queries an index for
+each branch. `g.V().union(...)` reads every vertex instead, and fails under `query.force-index`.
+
+Each step of a branch is now a condition on the element, whatever their order. A `has(key)` after a `has()`, as in
+`__.has('kind', 'p').has('age')`, was dropped, and a second one taken for a branch of its own; several `has()` steps
+with a `limit()` between them, such as `__.has('kind', 'p').limit(1).has('age', 3)`, were taken for branches of their
+own; a branch which began with a `limit()` was left out; and an `order()` by a traversal in a branch was dropped. A
+branch's `order()` by the id or the label of the element, which every element has, lets each element through, and so
+does one by a key under the deprecated `ProductiveByStrategy`, which makes it yield null where the key has none. An
+`or()` of which no branch lets an element through now returns no element without reading any, also where the traversal
+orders the elements. JanusGraph leaves an `or()` to TinkerPop where one of its branches orders by a traversal, such as
+`__.has('kind', 'p').order().by(__.values('age').count())`, and folds in none of the `has()` steps after it either:
+TinkerPop then checks every element which the query of the `has()` steps before the `or()` returns, every vertex where
+there are none, which fails under `query.force-index`, where JanusGraph used the index before.
+
+The vertices of ids which a traversal starts from, as in
+`g.V().hasId(ids).or(__.has('kind', 'p'), __.has('name', 'd'))`, had to hold every branch of the `or()` at once; they
+now need to hold one, as in TinkerPop. A traversal with two `or()` steps, of which one had a branch with an offset or an
+order of its own, failed with a `NullPointerException`, and one with a branch on a key which doesn't exist next to
+another `or()` returned nothing; both are fixed. Such a branch also made the `or()` of JanusGraph's API return nothing:
+`tx.query().or([tx.query().has('nickname', 'x'), tx.query().has('kind', 'p')]).vertices()` now returns the vertices of
+kind `p`.
+
+That `or()` also left out the query's own conditions, so
+`tx.query().has('kind', 'p').or([tx.query().has('name', 'd'), tx.query().has('age', 1)])` returned the vertices of other
+kinds which held a sub-query too, and the `or()` calls of its sub-queries, so that a sub-query of only an `or()` call,
+as the first of `tx.query().or([tx.query().or([...]), tx.query().has('name', 'a')])`, held for every vertex, for none
+where a Lucene index answered the query, and made Elasticsearch fail. Both now hold, the sub-queries as they are when
+the `or()` is called: a condition added to a sub-query afterwards no longer counts. The query's own conditions, and
+those of an `or()` of a single sub-query, make one conjunction, which an `or()` of sub-queries of a single condition
+each joins as a disjunction of those conditions, so that a composite index, or a Solr index, can answer the conditions
+it holds. An `or()` of sub-queries of several conditions each takes the query's condition out of that form: it is
+checked in memory, or scans, and fails under `query.force-index`, even where a composite index holds one of the query's
+own conditions, unless an Elasticsearch or Lucene index answers the whole condition. The condition of a traversal with
+several `or()` steps whose branches have a single condition each is written in the same way, so that a composite or a
+Solr index can answer it too where it holds its keys, and `profile()` shows it flat, as
+`((name = bob OR prop = val2) AND (name = alex OR prop = val))`. And `tx.query().or([])`, of no sub-queries, returned
+every vertex, where it now returns none, as a disjunction of nothing holds for none.
+
+A sub-query which every element holds, such as `tx.query().hasNot('nickname')` where no key is named `nickname`, now
+makes the `or()` hold for every element. Where a mixed index answered the `or()`, such a sub-query became a conjunction
+of no conditions: Lucene read it as one which no element holds, so
+`tx.query().or([tx.query().hasNot('nickname'), tx.query().has('kind', 'p')])` returned only the vertices of kind `p`,
+and Elasticsearch failed with `Could not call index`. Such an `or()` now reads every element, and so fails under
+`query.force-index` with `Could not find a suitable index`. So does a traversal's `or()` with a branch such as
+`__.has('nickname', null)` on a key which doesn't exist, which JanusGraph holds for every vertex, as it does
+`g.V().has('nickname', null)`, where TinkerPop holds it for none:
+`g.V().or(__.has('nickname', null), __.has('kind', 'p'))` now returns every vertex with a Lucene or Elasticsearch index
+too, as it did without an index, where Lucene returned the vertices of kind `p` and Elasticsearch failed.
+
+For code built on these classes: `HasStepFolder.localFoldInHasContainer` takes the step and the branch, as
+`(HasStepFolder, Traversal.Admin)`. As the `limit()`, `range()` and `order()` steps of a branch are conditions on each
+element, a branch no longer has limits or an order of its own: `HasStepFolder.localOrderBy`, `setLocalLimit`,
+`getLocalLowLimit` and `getLocalHighLimit` are removed, with their implementations in `JanusGraphStep`,
+`JanusGraphVertexStep` and `JanusGraphPropertiesStep`, and so are `QueryInfo` and the last parameter of
+`HasStepFolder.foldInOrder` and `foldInRange`, which took the has containers of a branch. `foldInOrder` returns nothing.
+
 ##### Mixed index names on one backing index must now differ in more than case
 
 An index backend derives its own index name from the JanusGraph index name case-insensitively — Elasticsearch
@@ -687,6 +1483,45 @@ only in case, such as `byName` and `byname`, shared one backend index: each othe
 holds such a pair keeps working as before, and is repaired by discarding one of the two and recreating it under a
 distinct name. Composite indexes have no backend index and are not affected.
 
+##### Conditions on the strings of a graph query compare them by code point, as its order does
+
+A condition on strings in a graph query, such as `has('name', gt('m'))` or a `gte()`, `lt()`, `lte()`, `between()`,
+`inside()` or `outside()`, now compares two strings by their code points also where JanusGraph checks it itself, as
+Elasticsearch, OpenSearch, Lucene and Solr compare them where they answer it, and as JanusGraph orders the query where
+it folds the `order()` into it. JanusGraph compared them by UTF-16 code unit there, which differs where the first
+character in which two strings differ is one from U+10000 up, such as an emoji, in one of them and one from U+E000 to
+U+FFFF in the other. JanusGraph checks such a condition itself:
+
+* in a query which no mixed index answers, such as one which reads a composite index or scans the graph;
+* on what a mixed index returns where it doesn't answer the whole query, as when the query has a condition on a key
+  which the index doesn't hold;
+* on the vertices and edges which the transaction added or changed, which the indexes hold as they were before it.
+
+So such a condition left out strings which an index returned, and disagreed with the order of the query: keyset paging
+with `g.V().has('kind', 'k').has('name', gt(last)).order().by('name').limit(2)`, with a composite index on `kind` and
+the names `a`, U+E000, U+FFFF and U+1F600, returned `a` and U+E000, then U+FFFF alone, and never U+1F600, which the
+order puts last.
+
+An `order()` which JanusGraph doesn't fold into the query is TinkerPop's and still compares strings by UTF-16 unit: one
+with a tie-breaker which isn't a property key, such as `order().by('name').by(T.id)`, or one after a `dedup()`. Where no
+mixed index answered the query, such an order agreed with these conditions, and now disagrees with them: keyset paging
+with `order().by('name').by(T.id)` over the names above returns `a` and U+1F600, and then nothing. Keyset paging needs
+an order which JanusGraph folds, such as `order().by('name')`: by property keys alone, right after the `has()` steps of
+the query, and for vertices by keys of `SINGLE` cardinality, unless every mixed index backend of the graph can order by
+a key of several values. That is the trade-off of this change: the conditions which JanusGraph checks itself now agree
+with the mixed indexes and with the orders which JanusGraph folds, which compare strings by code point, and no longer
+with the orders which TinkerPop sorts.
+
+The conditions on the edges and properties of a vertex, such as `g.V(v).outE('link').has('name', gt('m'))`, still
+compare strings by UTF-16 unit, as the storage backend holds them by their sort keys in that order. So does a `has()`
+which JanusGraph doesn't turn into a graph query, such as one after an `out()`, a `V()` of ids or a `hasId()`, inside a
+`not()`, or in a `g.withComputer()` traversal: TinkerPop's predicate checks it, or, after a `hasId()`, `Cmp` an `and()`
+or `or()` of predicates, such as a `between()`, by UTF-16 unit either way.
+
+For code built on these classes: `PredicateCondition` takes whether the ranges of `Cmp` compare strings by code point,
+`QueryUtil.constraints2QNF` makes conditions which do unless it is asked for those of a vertex-centric query, and
+`OrderList.compareByCodePoint` is public.
+
 ##### Index restores are reattempted after a transient failure
 
 `IndexTransaction.restore`, through which `SchemaAction.REINDEX`, stale entry removal, CDC index updates and
@@ -695,6 +1530,57 @@ classified as transient — for Elasticsearch a 429, a 503 or a dropped connecti
 where the same failure during a commit is reattempted. It now runs through `BackendOperation` like a commit does:
 reattempted with backoff for up to `storage.write-time`, and only then reported. A restore writes whole documents, so
 a reattempt is idempotent.
+
+##### Elasticsearch sorts by Byte and Short keys
+
+A graph query which a mixed index on Elasticsearch answered in the order of a `Byte` or a `Short` key, such as
+`g.V().has('tag', 't').order().by('small')`, failed with `Could not call index`, and an index query (`indexQuery`)
+with `orderBy` on such a key failed too: JanusGraph gave the sort an `unmapped_type` of `null`, which Elasticsearch and
+OpenSearch reject with a 400 (`[field_sort] unmapped_type doesn't support values of type: VALUE_NULL`). The sort now
+names the `byte` or `short` type which JanusGraph maps such a key to.
+
+A sort by a string key named the type `string`, which Elasticsearch 5 replaced with `text` and `keyword`. Where the
+index had no mapping of the key, as under an external dynamic mapping
+(`index.[X].elasticsearch.create.use-external-mappings` without `index.[X].elasticsearch.create.allow-mapping-update`)
+before any document held the key, Elasticsearch 8 and 9 rejected the sort (`No mapper found for type [string]`), and
+Elasticsearch 6 and 7 sorted by `keyword` in its place, with a deprecation warning. It now names `keyword`, the type
+which JanusGraph maps the field a sort by a string key reads to, unless the key has a custom string analyzer.
+
+##### Orders by a key which the index backend can't sort by are sorted by JanusGraph
+
+A graph query which a mixed index answers, ordered by a key which the index holds, had the index sort the results by the
+key whatever its mapping. None of JanusGraph's index backends sorts by the strings of a key of `TEXT` mapping, which is
+the default for strings, as the index holds the words of each string rather than the string. So, for such a `title`,
+the traversal `g.V().has('kind', 'p').order().by('title')` failed with `Could not call index` on Lucene, which reported
+`unexpected docvalues type NONE for field 'title'`, and on Elasticsearch and OpenSearch, which don't sort by a text
+field (`Text fields are not optimised for operations that require per-document field data`), while Solr ordered the
+vertices by the least word of each title, ascending or descending, and a query of JanusGraph's API put those without a
+title first when ascending. Elasticsearch and OpenSearch failed in the same way on a key of `STRING` mapping with a
+custom `string-analyzer`, which JanusGraph maps to a text field, and on one of `TEXTSTRING` mapping with one, whose
+whole strings, by which the index sorts the key, are then a text field too. And Lucene failed on a UUID key, by which it
+doesn't sort (`Unsupported order specified on field [uid] with datatype [class java.util.UUID]`).
+
+JanusGraph now gives the index an order only by the keys which its backend can sort by, and sorts the results of the
+other orders itself, by the whole values. That holds for the queries of JanusGraph's API and for the orders which a
+traversal folds into its query, also under a custom index selection strategy which decides by the deprecated
+`IndexSelectionUtil.indexCoversOrder(MixedIndexType, OrderList)` whether the index sorts the results. As for any query
+whose order no index covers, JanusGraph reads every match before it returns the first one, and fails with a
+`QueryException` where there are 1,000,000 of them or more.
+
+Solr answered these orders from the index, reading only up to the limit of the query, and gave a key of the `DEFAULT`
+mapping, the default for strings, the right order but for the case of the letters where each of its values is a single
+word. Such a query now reads every match, and so fails where there are 1,000,000 of them or more. To have the index
+sort by a string key, on any backend, map it as `STRING`, or as `TEXTSTRING` to search its words as well, without a
+custom `string-analyzer` on Elasticsearch and OpenSearch: the index sorts such a key by its whole strings. An index
+keeps the mapping which it holds a key with, so that takes a new key, or a new index of the key and a reindex.
+
+For code built on these classes: `IndexInformation`, and so `IndexProvider`, has a new method
+`supportsOrdering(KeyInformation)`, which tells whether the index can sort by a key with the given information. It is
+true by default, so that an index provider which doesn't implement it is given every order, as before. A provider which
+can't sort by some keys should implement it, and one which hands its calls to another provider must forward it, as
+`MetricInstrumentedIndexProvider` now does, or the index is given every order again.
+`IndexSerializer.supportsOrdering(MixedIndexType, ParameterIndexField)` is new, and
+`IndexSelectionUtil.indexCoversOrder(MixedIndexType, OrderList, IndexSerializer)` checks it for each key of the order.
 
 ##### Transient Elasticsearch read failures are reattempted
 
@@ -728,6 +1614,17 @@ once, so bulk requests grow with the size of the documents they update; an updat
 `index.[X].elasticsearch.bulk-chunk-size-limit-bytes` is sent without it, as before this change, rather than failing. A
 mixed index on a cdc-only backend, whose documents are written asynchronously, is not affected.
 
+##### The complete document of an updated element no longer takes two queries per field
+
+The complete indexed content of an element, which a commit reads for every existing element it updates in a mixed index
+and which reindexing, transaction recovery and CDC synchronization restore, was read with two queries for each field of
+the index. It is now read with one query of the index's keys. A vertex in a transaction with property prefetching
+(`query.fast-property`, on by default) is first accessed by a single key, which reads all its properties in one slice,
+as before, and that slice answers the query of the keys. On in-memory storage, building the content of a vertex takes
+about a fifth of the time it took with 20 indexed fields, and a quarter with 5, at a commit which changed the vertex,
+and half when reindexing, recovering or synchronizing an unchanged one. With `query.fast-property` off, the query reads
+a slice for each of the index's keys, as before, which CQL now reads together rather than one after the other.
+
 ##### Elasticsearch searches open a scroll context only for results larger than a page
 
 Every mixed index query whose limit was at least `index.[X].max-result-set-size` (50 by default), and every query
@@ -749,6 +1646,128 @@ cluster rejects is logged as a warning once. Deployments which set
 `index.[X].elasticsearch.setup-max-open-scroll-contexts` to `false`, such as Amazon OpenSearch Service, are therefore
 far less likely to reach the cluster's limit of open scroll contexts.
 
+##### Elasticsearch results larger than a page can be read through a point in time
+
+A result larger than a page (`index.[X].max-result-set-size`, 50 by default) was read through a scroll. A scroll's
+context counts against the cluster's `search.max_open_scroll_context`, its pages count the total number of hits
+because Elasticsearch requires it, and it may skip a page when the request for one is sent again after a transient
+failure. The new option `index.[X].elasticsearch.paging-mode` reads such results through a point in time and
+`search_after` on Elasticsearch 7.12 and later where that pays: the point in time holds the state of the index while
+the pages are read, each page is asked for after the last hit of the one before, and none counts the total.
+`adaptive_point_in_time`, the default, reads through a point in time only the results for which that is about as fast
+as a scroll or faster, and every other result through a scroll; `scroll` reads every result through a scroll, as
+before; and `point_in_time` reads every result through a point in time. A graph query without a limit and without an order reads its pages in the order of the index; a limited one,
+and a direct index query without a sort of its own, in the order of their scores, as a single request does. The point
+in time is closed as soon as the result has been read, the limit is reached or the traversal is closed, as a scroll
+context is, and `index.[X].elasticsearch.scroll-keep-alive` bounds its life as well. An older cluster, a cluster whose
+version isn't asked for (`index.[X].elasticsearch.major-version` 7) or can't be, and OpenSearch, whose point in time
+lacks the tiebreaker `search_after` needs, scroll in every mode.
+
+On Elasticsearch 9.5.4, with 100,000 documents, a point in time read the pages of a graph query without a limit and
+without an order up to 17% faster than a scroll with pages of 50, and about as fast with pages of up to 500, on an
+index of one shard. In every other case it took longer: 3% to 6% for a query which sorts, 11% to 38% in the order of
+scores, and 4% to 37% on an index of two or three shards. So `adaptive_point_in_time` reads through a point in time
+only a graph query without a limit and without an order, on an index of at most
+`index.[X].elasticsearch.adaptive-point-in-time-max-shards` shards (1 by default) and with pages of at most
+`index.[X].elasticsearch.adaptive-point-in-time-max-page-size` hits (500 by default). A graph query is limited where its
+traversal limits it, where `query.smart-limit` is on, and where `query.hard-max-limit` is lowered. Through a graph query
+on an index of one shard, a result of 100,000 hits in the default pages of 50 takes 0.91 s in the adaptive mode, through
+a point in time, against 1.13 s through a scroll, and in pages of 10,000, which the adaptive mode scrolls, 118 ms against
+131 ms through a point in time.
+
+##### Elasticsearch reads a limited result beyond 10,000 hits in larger pages
+
+An index query whose offset and limit together go beyond 10,000 hits was read after its first request in pages of
+`index.[X].max-result-set-size` (50 by default), like an index query without a limit. Index queries get such limits from
+a traversal's own limit; from the offset and limit of a direct index query; from a lowered `query.hard-max-limit`, which
+every traversal without a limit then takes as the limit of its index query; from `query.smart-limit`, under which the
+index query of a traversal without a limit starts at 1,000 hits and doubles as the traversal reads on; from an order
+which the index can't sort, which JanusGraph sorts in memory after reading up to 1,000,000 hits; and from JanusGraph
+executing a limited query again with a doubled limit when it leaves out too many of the index's hits, for example those
+of vertices which the transaction removed or changed so that they no longer match, which the index still holds as they
+were. Each execution reads the hits from the first one on. Such a result is now read in as few pages as the new option
+`index.[X].elasticsearch.limited-result-max-page-size` (250 by default) allows, all of one size, so that the last page
+reads hardly more than the limit needs, and never in pages smaller than `max-result-set-size`. The first request still
+asks for one hit more than a page, so a small result needs no scroll context or point in time, and an index query
+without a limit keeps its pages of `max-result-set-size`. `index.[X].elasticsearch.scroll-keep-alive` must cover
+consuming one page, as each page renews it: with its default of 60 s, a page of 250 hits leaves 240 ms for each hit, a
+page of 1,000 hits 60 ms, and a page of 10,000 hits, the practical ceiling of the option, 6 ms. A consumer which takes
+longer loses the scroll context or point in time, and the next page fails. A slower consumer can lower the option in
+its local configuration, to `max-result-set-size` or below for the pages of earlier versions, or raise
+`scroll-keep-alive`, which is GLOBAL_OFFLINE.
+
+On Elasticsearch 9.5.4, with 50,000 vertices in an index of one shard, a
+`has("kind", "k").order().by("updatedAt", desc).limit(10)` in a transaction which had changed the `kind` of 20,000 of
+them took 155 requests and 0.57 s instead of 721 requests and 0.95 s, and of all 50,000 of them 399 requests and 1.21 s
+instead of 1,937 and 2.14 s. A traversal limited to 100,000 which reads all 50,000 hits took 202 requests and 221 ms
+instead of 1,002 and 864 ms, and one which stops after the first hit 1.7 ms against 1.8 ms. In the same session, pages
+of up to 1,000 took 49 requests and 0.46 s, 111 and 0.97 s, 52 and 120 ms, and 2.7 ms, and pages of up to 10,000 took 17
+and 0.37 s, 25 and 0.72 s, 7 and 67 ms, and 10.3 ms. Under load, with 16 threads at once, reads which stop after the
+first hit ran at 3,879 a second instead of 4,197, and the reads after 20,000 changed vertices at 17.7 a second instead
+of 9.9; with 32 threads, at 5,331 instead of 6,900, and at 18.3 instead of 11.7. Pages of up to 1,000 cost the reads
+which stop early about half their rate or more there.
+
+##### Solr reads a result larger than a page in growing pages
+
+A result larger than a page (`index.[X].max-result-set-size`, 50 by default) was read from Solr in pages of that size,
+each at its offset. For each page, Solr collects and sorts every hit before its offset again, so a result read whole
+took time which grew with the square of its size: on Solr 9.10.1, `g.V().has('name').order().by('name')` read 31,846
+hits in 5.9 s in pages of 50 and in 0.52 s in pages of 1,000, and its `range(20000, 20010)` took 2.9 s in pages of 50.
+The first page of such a result still holds `max-result-set-size` hits, or the limit if that is less, and every page
+after it now holds twice as many as the page before, up to the new option `index.[X].solr.max-page-size` (MASKABLE,
+10,000 by default), but never more than the limit leaves. So `max-result-set-size` no longer needs raising for large
+results to be read in good time. The pages only grow while a result is read on, so a read which stops early asks for no
+more than twice the hits it takes, plus a first page. A result of many pages of `max-page-size` still costs each page
+the hits before it; a larger `max-page-size` takes fewer pages, at the price of a larger response each. A
+`max-page-size` no larger than `max-result-set-size` reads every result in pages of `max-result-set-size`, as before.
+
+A query whose limit a page holds is one request, as before, and so is a result which a page holds. Graph queries and
+direct index queries read their pages alike, a direct index query from its offset on, whatever parameters of its own it
+has but `rows`. One with a `rows` parameter is read in pages of its `rows`, as before, but its later pages now ask for
+no more hits than its limit leaves, where they asked for whole pages: `rows` 100 with a limit of 150 reads pages of 100
+and 50 hits. A `start` which a parameter sets now carries over to the later pages, which were read at the query's offset
+plus the pages before, and `totals` count the hits from it, where they counted from the offset. The requests are
+otherwise those of earlier versions, with the same sort.
+
+A read also waited forever where another transaction deleted some of its hits meanwhile: it read on until it had as many
+hits as its first page had found, and asked for a page only where the hits read so far filled whole pages. It still
+takes no more hits than its first page found, so that hits which other transactions add meanwhile can't keep it going,
+and its last page now asks for no more; but it now also ends with a page which comes back empty, or after which Solr
+found no more hits, as the count of hits of that page says. A direct index query which sets `minExactCount`, whose
+counts may then be lower bounds, is read until such a page alone. As before, a deletion or an addition ahead of the hits
+read moves the hits after it, so that a page may skip a hit or repeat one, and a read may leave out hits added
+meanwhile.
+
+##### An Elasticsearch read which only some shards answered now fails
+
+A search, a page of a scroll or of a point in time, a count or an aggregation which Elasticsearch answered with the
+results of only some shards was taken as complete. Elasticsearch answers a request which some shards fail with the
+results of the others, and fails it only when every shard failed, but JanusGraph didn't check how many shards answered.
+A page with fewer hits than its size is taken for the last, so a page which lacked the hits of some shards ended the
+result early, and a count or an aggregation left those shards out, without an error. A shard fails where, for example,
+its search context expired on its node but not on the others, as where a consumer takes longer over a page than
+`index.[X].elasticsearch.scroll-keep-alive` and the index's shards sit on several nodes, where it isn't available, or
+where it rejects the request. A shard which runs out of the time of a search, which a direct index query sets as its
+`timeout` parameter or the cluster as `search.default_search_timeout`, answers with the hits it found until then, which
+the answer to a count didn't even tell.
+
+Such a read now fails, with the shard failures in its error. JanusGraph sends its searches, the first page of a scroll,
+the pages of a point in time and counts among them, with `allow_partial_search_results=false` to Elasticsearch 7 and
+later and to OpenSearch, which then fail them themselves. A count is now a search for no hits which counts them all,
+which is what the count API runs, as the count API doesn't take that parameter; it also applies the parameters of a
+direct index query, which the count API rejected. Every answer which reports shards that didn't answer or ran out of
+time fails as well, the later pages of a scroll among them, which don't take the parameter. A search which Elasticsearch
+fails because a shard isn't available is answered with status 503, which `index.[X].elasticsearch.retry-error-codes`
+lists by default, so it is reattempted like other transient read failures before it fails. JanusGraph doesn't reattempt
+a search which ran out of time, whatever its status, 429 on Elasticsearch 9.5.4 and 504 on 8.15.3, as it would run as
+long again; where several hosts are configured, the Elasticsearch client still sends a request answered with 502, 503 or
+504 to its next host. A page of a scroll which fails releases the scroll context, as one of a point in time closes the
+point in time. Closing a traversal after a read of an index failed no longer asks the index whether the result ended,
+which could fail again and throw that failure, wrapped, in place of the read's, and the transaction's cache of index
+results no longer keeps the hits read before the failure as the whole result, which it could after a page of a point in
+time failed. The new option `index.[X].elasticsearch.allow-partial-results` (MASKABLE, `false` by default) uses the
+results of the shards which answered instead, and the hits found before a search ran out of time, as before.
+
 ##### Relations without properties are parsed once
 
 A loaded relation is deserialized in two steps: its type, direction, id and other end first, and its properties only
@@ -767,6 +1786,17 @@ every later one. An entry with timestamp, TTL or visibility metadata, which the 
 (visibility only on a backend with cell-level visibility), is unaffected: the metadata is a property of the relation, so
 its full parse was already kept. The property map is only allocated for a relation which has properties.
 
+##### Reading one property of a vertex no longer preloads all of them each time
+
+With `query.fast-property`, on by default, a query for one property key of a vertex first loads all the vertex's
+properties in one slice, so that the keys read next come from the vertex's cache. The preload ran on every such query,
+even on a vertex whose properties were loaded already, as a query of its own which built its slice, looked it up in the
+cache and checked that it had a first entry, so reading one property of a loaded vertex took longer than reading all of
+them. The preload now runs only while the vertex doesn't hold the slice of its properties. In addition, a query of one
+type resolved the type's name three times, with a schema cache lookup and a vertex cache lookup each; it resolves it
+once. On an inmemory graph, reading one property of a vertex with 20 loaded properties takes 361 ns instead of 628, and
+reading its 20 properties one by one 7.7 µs instead of 13.0.
+
 ##### Composite index lookups of several values read their index rows together
 
 A composite index lookup of several values, as `has(key, within(values))` makes, or as a composite index on more than
@@ -782,7 +1812,7 @@ row after the other and stops at the limit. Either way a lookup asks the storage
 row after the other would not ask for. `query.batch.enabled=false` turns reading rows together off, as it turns off
 batching for traversal steps. Building the condition of a `within()` or `without()` also compared each value with every
 value before it to drop duplicates, so it grew with the square of the number of values; it now takes time in proportion
-to them.
+to them. `query.batch.max-keys-per-read` sets the most rows a call reads, 1,000 by default.
 
 ##### A vertex which gains relations in a transaction allocates about 2 KB less
 
@@ -795,6 +1825,131 @@ with the relations added. On the inmemory backend, a transaction which adds 1,00
 edge each allocates 9% less, one which sets a property of 1,000 existing vertices 24% less, and one which sets a
 property of an edge of each 22% less.
 
+##### Orders by a key of several values compare its least or greatest value
+
+A graph query ordered by a key of several values, of `LIST` or `SET` cardinality, failed with an `IllegalStateException`
+("Multiple properties exist for the provided key") wherever JanusGraph compared the elements by the key itself and met
+one with several values: where it sorted the results in memory, as those of a composite index; where it merged the
+vertices which the transaction added or changed with those of a mixed index, as a vertex which the transaction made
+match the query; and where it merged the queries of the branches of an `or()`. JanusGraph now compares such an element
+by the least of its values in an ascending order and by the greatest in a descending one, as Elasticsearch, OpenSearch
+and Solr sort such a key, so that the elements which it places come where the index puts the others. An element without
+a value of the key still comes last.
+
+That holds for the queries of JanusGraph's API, such as
+`graph.query().has('kind', 'k').orderBy('names', asc).vertices()`, and for the orders which a traversal folds into its
+query. A traversal folds an order of vertices by such a key in only where the graph has mixed index backends and every
+one of them can sort by it, as Elasticsearch, OpenSearch and Solr can: there, `g.V().order().by('names')` where no
+mixed index holds the key, and the order of what a composite index returns, are now sorted where they failed; where a
+mixed index holds it, that traversal reads the index, as the section *Ordered traversals read a mixed index of their
+order keys which answers them whole* describes. Elsewhere, as on a graph with a Lucene index backend, or without a mixed
+index backend, TinkerPop sorts the vertices, and fails on one with several values of the key, as before. A traversal
+folds an order of edges, each of which holds one value of a key at most, in whatever the cardinality of the key.
+
+Lucene can't sort by a key of several values: a query of JanusGraph's API, or a traversal's order of edges, by such a
+key, which a Lucene index holding the key answered, failed with "Could not call index". JanusGraph now sorts the results
+of such a query itself, which reads every match first, as for any query whose order no index covers, and fails with a
+`QueryException` at 1,000,000 of them.
+
+A vertex whose values of such a key a transaction changed kept the place which an index that sorts by the key gave it,
+by its values before the transaction; it now comes where the values it holds place it, as for a key of one value. A
+query which reads the index only up to the last new vertex within its limit does so only by a first order key of one
+value, as before.
+
+For a custom index backend or index selection strategy: JanusGraph gives an index an order by a key of several values
+only where its backend declares `IndexFeatures.supportsOrderingListProperty`, and sorts the results of any other index
+itself, reading every match; before, it gave such an order to any index which held the key. A backend which can sort by
+such a key should declare it. `IndexSelectionUtil.indexCoversOrder(MixedIndexType, OrderList)` is deprecated in favour
+of `indexCoversOrder(MixedIndexType, OrderList, IndexSerializer)`, which also checks that the backend of the index can
+sort by such a key. Where a strategy holds an index to sort the results which wasn't given the query's order, as one
+which decides by the old form may, or was given only part of it, JanusGraph sorts them itself.
+
+##### Graph queries in a transaction find the vertices it changed, whatever the order of their conditions
+
+A graph query in a transaction which had changed vertices could miss a vertex which those changes made match: with a
+composite index on `name` and `age`, a transaction which changed a vertex's `age` from 1 to 2 found it with
+`g.V().has("age", 2).has("name", "alice")` but not with `g.V().has("name", "alice").has("age", 2)`. The indexes hold
+what the vertices held before the transaction, so the query adds the vertices which the transaction changed, and with an
+equality on a composite-indexed key it added only those with the value of the first such equality, here `name`, which
+the transaction hadn't changed. The same could happen with any query reading an index on a key whose change it didn't
+look at, for example a composite index on `uid` and a mixed index on `name`, where a transaction which changed `name`
+found the vertex in neither order. Such a query now adds the vertices which the transaction changed on a key of the
+indexes it reads on which it has a condition, the only change which can make it match, for an equality those which
+gained the asked value, and the new vertices with the values of one of its equalities. Two more cases are fixed. An
+ordered query which an index sorts placed a vertex whose order key the transaction changed where its old value goes:
+after the transaction raised a vertex's `age` above the others,
+`g.V().has("kind", "x").order().by("age", desc).limit(1)` returned another vertex. It now places such a vertex by what
+it holds, also by a key of several values, and returns a changed vertex once when the index returns it too. And a
+query with a disjunction, such as `g.V().or(has("name", "bob"), has("tag", "t"))`, threw an `IllegalArgumentException`
+in a transaction with any change on Lucene, Elasticsearch and OpenSearch, which are given such a condition whole.
+
+The vertices changed by an added property come from an index of the properties which the transaction added, by key and
+value, which a key gets on its first lookup. A query without an equality on a composite-indexed key, for example one on
+a key of a mixed index, scanned every relation which the transaction had added, and a transaction which looked vertices
+up that way before creating them was quadratic in its size: on an inmemory graph with a Lucene index on the key, 20,000
+lookups, each followed by the creation of a vertex when it finds none, took 6.5 minutes in one transaction, and takes
+1.7 s now. A range or other condition which isn't an equality still looks at the properties of its key which the
+transaction added to existing vertices, and at every relation it removed for a negation, an absence or a predicate which
+an index may answer by leaving out the elements of which a value matches its negation, such as a not-equal. An unordered
+query returns the changed vertices which match first, checking each only once it reaches it, so that a limit which they
+fill checks no more of them and doesn't read the index: on 50,000 vertices in an Elasticsearch index, ten
+`has("kind", "k").has("updatedAt", gt(x)).limit(10)` queries take 11 ms instead of 1.4 s after the transaction changed
+`updatedAt` of all of them. The first query of a key in a transaction indexes the properties of the key which the
+transaction added, which takes about 9 ms for 50,000 of them, so a query which master answered from an index alone,
+missing the vertices which the transaction made match, is slower by that much once: ten such queries with an equality on
+a composite-indexed key take 11 ms instead of 4.9.
+
+A query which an index sorts, whatever its keys, also looks at the properties of its order keys which the transaction
+changed, and checks every vertex they changed against its condition, whatever its limit, to place it by what it holds.
+Where those which match fill the limit, it reads from the index only the elements whose value of the first order key
+doesn't come after that of the last of them within the limit, where every index compares that value as memory orders
+it: a whole number, a date to the millisecond, a float or double in an ascending order, or a string below U+D800 of a
+key mapped as `STRING` without an analyzer, on an index field without custom parameters. Ten
+`order().by("updatedAt", desc).limit(10)` queries take 25 ms instead of 11 after the transaction raised `updatedAt` of
+1,000 vertices, which they returned in the wrong order before, and 1.6 s instead of 63 ms after it raised all 50,000 of
+them by as much. A transaction which moves the vertices that the index has first further down, or out of the query,
+makes the query read the index past all of them: ten queries take 21 s after such a change of 50,000 vertices, in the
+default pages of 50 hits, where master took 62 ms and returned the moved vertices first, or as long for vertices which
+leave the query; #5071 reads such results in larger pages.
+A query which needs only the committed graph can run in a transaction of its own, as the
+[transactions](basics/transactions.md#queries-see-the-transactions-changes) page describes.
+
+For code built on these classes: `IndexCache` looks up the properties which a transaction added by key, value and
+whether their vertex is new, with `get(key, value, ofNewVertices)`, `count` and `getAll`, in place of `get(value, key)`,
+and `SimpleIndexCache` and `ConcurrentIndexCache` take the transaction's added relations, from which they index a key
+on its first lookup.
+
+##### Ordered graph queries in a transaction read less of the index for more strings
+
+An ordered query which an index sorts, in a transaction whose matching elements fill the query's limit, reads from the
+index only the elements whose value of the first order key doesn't come after that of the last of them within the limit,
+as the section above describes. For a string, it did so only below U+D800 and for a key mapped as `STRING`. It now does
+so for any string of valid UTF-16, now that JanusGraph orders strings by code point as the indexes do, and for a key
+mapped as `TEXTSTRING` as well, now that its ranges compare its whole strings, in either case for a key without a string
+or text analyzer. After a transaction renamed 20,000 of 50,000 vertices to names from U+E000,
+`g.V().has("kind", "k").order().by("name", desc).limit(10)` runs one Elasticsearch search instead of 155, and takes
+about 90 ms instead of 1.2 s. On Solr, the range reads the field which the schema defines for the key's whole strings,
+`<key>_s` with dynamic fields, as for a `STRING` key: a schema which makes that field analyzed breaks the range, as it
+breaks the order.
+
+A range from a long string could fail. JanusGraph's Lucene backend, OpenSearch 2 and Elasticsearch 6 to 8 can't build a
+range from a lower bound of more than 1,000 UTF-8 bytes, and Solr takes a query in a URL of at most 8 KB, as JanusGraph
+sends its queries to Solr as GET requests. So a descending query whose last new value was longer failed on the former
+with "Could not call index", and so did a query in either direction on Solr whose value had about 8 KB, or 2.7 KB of
+characters of three UTF-8 bytes, for a `STRING` key below U+D800 too. A descending range now starts at the value's
+longest prefix of whole characters within 1,000 bytes, and no ascending range is taken from a value of more than 1,000
+bytes, as an upper bound can't be cut.
+
+A string with a surrogate without its pair isn't valid UTF-16. No index holds such a surrogate as it is: Lucene, Solr,
+OpenSearch and Elasticsearch up to 8 hold U+FFFD, Elasticsearch 9.5 a question mark, while JanusGraph places it after
+U+FFFF. A last new value with one still makes the query read the index whole. The descending range of a string with a
+character from U+FFFD up starts at U+FFFD in place of that character and what follows it, so that where the index holds
+U+FFFD, a descending query returns what it returns without the range also where the index holds such strings. On
+Elasticsearch 9.5, a descending range from nearly any string, below U+D800 too, may leave out a stored string with such
+a surrogate. And where the index holds U+FFFD, an ascending range may leave out a stored string of more than 16,000
+UTF-16 units which storage holds with a question mark in place of such a surrogate, as it does where it compresses the
+string from its UTF-8 bytes.
+
 ##### Storage operations no longer contend for one random generator
 
 Nearly every storage operation, among them every read of a transaction and every mutation its commit writes, runs
@@ -803,6 +1958,104 @@ attempt, from a random generator which all threads shared, although nearly every
 which draw from one generator at the same time contend for its seed. The wait is now drawn only once an operation has
 failed temporarily, from the random generator of its thread, and the waits are the same as before. On the inmemory
 backend, reading a property of 1,000 vertices on each of eight threads takes 18% less time.
+
+##### A commit reads the labels its index updates check together
+
+An index restricted to a vertex label (`indexOnly`) applies to a vertex only if the vertex has that label, so a commit
+which changes a property such an index covers checks the label of every vertex whose property changed. For an existing
+vertex whose label the transaction hadn't loaded - as one which changes vertices it looked up by id hasn't - the check
+read the label with a query of its own. On a storage backend with multi-key queries, such as CQL and HBase, the commit
+now reads the labels of those vertices together before it computes its index updates, as many per read as the new
+option `query.batch.max-keys-per-read` allows, 1,000 by default, which also bounds the reads of a composite index
+lookup of several values. `query.batch.enabled`, or a transaction's own multi-query setting, turns this off, and a
+backend without multi-key queries, such as BerkeleyJE, still reads each label on its own. On a single-node Cassandra, a
+transaction which changes an indexed property of 1,000 vertices it looked up by id takes 29 ms instead of 282, and of
+100 vertices 8 ms instead of 45; with the labels loaded already, or without an index restricted to a label, it takes as
+long as before.
+
+##### An index query result too large for the transaction's cache is no longer put into it
+
+A transaction keeps the ids its index queries return in a cache, so that it answers the same query again without the
+index, up to a weight of half of `cache.tx-cache-size`, where a result weighs 2 more than its number of ids: by default
+10,000 in all, and 9,998 ids for a single result. A larger result was put into the cache all the same, which dropped it,
+and with it the result the cache held for the same query under a smaller limit. And the ids a query streams from an
+index were collected for the cache as they were read, however many there were, so a query which streamed more of them
+held every one until its end. Such a result is no longer put into the cache, and its ids stop being collected as soon as
+there are more than the cache keeps, which saves the memory they took where an index streams its results, as
+Elasticsearch and Solr do: a query which streamed 500,000 ids from Elasticsearch held about 16 MB more by its end, some
+31 bytes per id. The cache is also maintained by the thread which uses it, rather than in a task of the common pool
+after every change, so that a hundred index queries of one result each in a transaction take 0.71 ms instead of 0.89 on
+one thread, and 1.1 ms instead of 3.1 with eight threads running such transactions at once, on the inmemory backend.
+
+##### Graph queries which JanusGraph sorts leave out the vertices which the transaction removed
+
+A graph query ordered by a key which its index doesn't sort it by, such as one which a composite index answers, or a
+mixed index which doesn't hold the order key, failed in a transaction which had removed one of the vertices it matched,
+with an `IllegalStateException` that the vertex was removed: JanusGraph sorted what the index returned before it left
+out the elements which the transaction had removed, and read the order key of the removed vertex. It now leaves out the
+removed vertices before it sorts the others, as the query without an order leaves them out. So
+`g.V().has('kind', 'p').order().by('name')`, with `kind` in a composite index, returns the vertices of kind `p` which
+are left in a transaction which dropped one of them, as does
+`graph.query().has('kind', 'p').orderBy('name', asc).vertices()`.
+
+##### Graph queries read on past the edges and properties which the transaction removed
+
+An index, mixed or composite, still holds the edges and vertex properties which the transaction removed, until it
+commits. Their ids turn into no element, and a graph query leaves them out of what the index returns. A query which the
+index answers under a limit, as one with `limit()` does, took a read of the index which came back with fewer elements
+than its limit for the end of the result. So in a transaction which removed some of the edges or properties it asked
+for, it could return fewer than it should: of 30 edges, after removing the 8 of the lowest `weight`,
+`g.E().has("kind", "paved").order().by("weight").limit(10)` returned 7. An index entry of an edge which no longer exists
+did the same in any transaction. The query now reads on with a larger limit as long as the index returns as many ids as
+the limit allows, and the read under the larger limit skips the ids which the reads before went through, so a query
+which removes the edges it reads, as `drop()` does, gets each of them once. That also fixes such a query in any
+transaction where the index answers it under a limit it reads on past, as with `query.smart-limit`, or with a
+`query.hard-max-limit` below the size of the result: it skipped as many elements as it had returned, and those it had
+removed by then were no longer among them, so it left elements out. And a direct index query of edges or
+properties (`indexQuery(...).edgeStream()` or `propertyStream()`) threw a `NullPointerException` on such an id; it now
+leaves it out, though it doesn't read on, so with a limit it still returns fewer than its limit in such a transaction.
+Vertices weren't affected.
+
+##### Graph queries turn the ids which an index returns into elements faster
+
+A graph query which an index answers checks each id the index returns against the other indexes of the query, if
+any, and turns it into an element. It did that in the steps of a stream, and now does it in a loop of its own: on the
+inmemory backend, a query which reads 100,000 vertices from a composite index takes 24.7 ms instead of 27.2 with the
+steps of a stream, about 25 ns less for each id. Where reading the index takes most of the time, as on Elasticsearch, the gain was within the
+noise of the measurement.
+
+##### Queries of a vertex read only the relations of their types among those it gained in the transaction
+
+A query of the relations of a vertex, such as its edges of some labels or its properties of some keys, reads the
+relations which the vertex gained in the open transaction besides those that are stored. It read all of them and kept
+those of the queried types, and in a transaction which isn't bound to a thread (`graph.newTransaction()`, which several
+threads may share) it first copied all of them under a lock of the vertex. A vertex which gained many relations in a
+transaction therefore made every query of it slower, and the threads which queried it waited for each other. A vertex
+now keeps the edges it gains by label as well, once it has more than 32 of them: a query of some labels reads only the
+new edges of those, and a query of some keys only the new properties of the vertex. On the inmemory backend, of a vertex
+which gained 10,000 edges of one label and 10 of another in a transaction bound to its thread, the 10 edges are read in
+7.7 µs instead of 273 and a property in 5.1 µs instead of 277; with eight threads querying the vertex in a transaction
+they share, in 12 µs instead of 2.2 ms and 8.8 µs instead of 42 ms. The edges of the label with 10,000 are read 5 to 19%
+faster, and the queries of a vertex which gained only a few relations 5 to 35% faster.
+
+##### ID blocks of different partitions and namespaces are claimed in parallel
+
+`ConsistentKeyIDAuthority` claimed one ID block at a time per JanusGraph instance, whatever the partition and the id
+namespace, and on a distributed backend every claim holds that lock through its wait of `ids.authority.wait-time` plus a
+tenth of it (330 ms by default) before it reads the claims back. Each transaction writes its vertices to one of the
+`ids.num-partitions` (10 by default) partitions in use, with a pool of vertex ids and a pool of relation ids per
+partition, so when transactions on several threads needed blocks at the same time, as they do when an instance starts
+taking writes or when the pools renew their blocks, their claims queued behind one another and the last of N waited
+about N times that wait. The lock has to keep two threads of one process from claiming the same block of one partition
+and namespace at the same timestamp, where both would write the same claim and both take the block; claims on another
+partition or namespace go to another row. The authority now locks per partition and namespace, so those claims run in
+parallel, each with its own wait. On a store with locking of its own which isn't distributed, such as BerkeleyJE, the
+claims of an instance still run one at a time: a BerkeleyJE transaction keeps the records it reads locked until it ends,
+and a claim's read of a row with few claims, as on a new graph, reaches the newest claim of the next row, so claims in
+parallel would wait for each other's commits and fail on a commit slower than the lock timeout. Such a store makes its
+claims without the wait, so it has none to overlap. On Cassandra, 32 claims on 32 partitions at once take 0.35 s instead
+of 11.2 s, and the first transactions of ten threads, 100 vertices each on a fresh graph, take 1.4 s instead of 7.0 s;
+the first transaction of a single thread takes the same 6–7 s as before, its claims following one another.
 
 ##### Elasticsearch clients open up to 30 connections to a single host
 
@@ -819,6 +2072,24 @@ which takes 20 ms to answer three times as many. The new option `index.[X].elast
 I/O threads of each client, which is otherwise the number of processors, for every index backend of every graph, and
 `index.[X].elasticsearch.compression` compresses requests and responses with gzip.
 
+##### Elasticsearch bulk requests take less memory
+
+Without compression, the Elasticsearch client sends the body of a bulk request from the documents' serialized bytes as
+they are. It used to copy them into one array first, through a buffer which grows by doubling, so that a chunk of a bulk
+request, up to `index.[X].elasticsearch.bulk-chunk-size-limit-bytes` (100 MB by default), held up to three more copies
+of its body on the heap, on every attempt. With `index.[X].elasticsearch.compression` the client still holds the
+compressed body. A bulk request also asks Elasticsearch only for each item's status and error and for whether any item
+failed (`filter_path`), about a seventh of the response, and writes the action line of each document without building
+a map for it. A bulk of 50,000 documents of 1 KB each completes in a heap of 144 MB, where it needed 320 MB or more, and
+allocates a third as much.
+
+The action of a document is now named in the root locale. Under a Turkish default locale, the client named the
+index action `ındex`, with a dotless i, and Elasticsearch rejected the whole bulk request which held it: every bulk
+request with a new document, or with documents restored by a reindex, failed.
+
+`RestBulkResponse.RestBulkItemResponse.getResult()` is deprecated. A bulk response no longer carries the result of an
+item, so it returns `null`.
+
 ##### Conflicting Elasticsearch updates are reattempted
 
 Transactions which change the same element concurrently also update its document in a mixed index concurrently, and
@@ -830,6 +2101,83 @@ behavior. The client's own reattempts of a request, after a backoff which starts
 `index.[X].elasticsearch.retry-initial-wait` and grows tenfold up to `index.[X].elasticsearch.retry-max-wait`, now wait
 a random time between half of the backoff and all of it, so that requests which failed together don't all come back at
 the same moment.
+
+##### Elasticsearch counts and aggregations do less work
+
+A count of the documents which a mixed index query matches, for `totals()` and for the `COUNT` aggregation behind
+`count()`, counted every match, even where the caller only needed to know whether there were as many as its
+offset and limit, to which it clamped the count afterwards. Such a count now tells each shard to stop at the offset plus
+the limit (`terminate_after`), which keeps the count exact below that bound and at least the bound above it, so the
+clamped result is what it was. The aggregations `min`, `max`, `avg` and `sum` fetched the first ten matching documents
+with their sources along with the aggregation, and counted the matches; they now ask for the aggregation alone. The line
+which `IndexSerializer` logged at INFO for every raw index query it converted is logged at DEBUG.
+
+##### CQL reads more properties of a vertex per query
+
+With `storage.cql.grouping.slice-allowed`, true by default, the CQL backend reads the properties of a vertex whose keys
+have single cardinality, each one column, together: one query with `column1 IN ?` for up to
+`storage.cql.grouping.slice-limit` of them, 20 by default. Once a vertex had filled such a query, each further property
+was read with a query of its own, so 50 such properties of a vertex took 31 queries instead of 3. A full query is now
+followed by another one. On Cassandra 5, reading 50 properties of each of 1,000 vertices in one batch takes half as
+long.
+
+##### CQL write batches are marked idempotent
+
+The DataStax driver sends a request again, to the same node or another one, after a closed connection, an overloaded
+node or a server error, asks its retry policy about a write which timed out, and runs speculative executions, only for
+statements which are marked idempotent. The query builder with which JanusGraph prepares its statements marks them
+idempotent, but JanusGraph sends its writes in batches, and a batch isn't idempotent unless it is marked. So every such
+failure of a write reached JanusGraph, which reattempted a whole chunk of the mutations of a commit after a backoff of
+at least 25 ms. While `graph.assign-timestamp` is `true`, the default, JanusGraph now marks its batches idempotent, as a
+write sent again then writes the same cells with the same timestamp, and a speculative execution policy configured
+through `storage.cql.internal.*` now applies to its writes too; it already applied to its reads. With the new option
+`storage.cql.idempotent-writes=false`, or without assigned timestamps, writes keep the driver's default idempotence,
+`basic.request.default-idempotence`, as every write did before.
+
+##### The Gremlin pool of JanusGraph Server can run on virtual threads
+
+JanusGraph Server evaluates requests in the Gremlin pool of Gremlin Server, `gremlinPool` platform threads, by default
+one per processor, and a pool thread stays with its request while the request waits for the storage and index backends.
+The pool therefore evaluated only as many requests per second as its threads could wait for, however idle the processors
+were, and a larger pool meant as many platform threads. On Java 24 or later, the new JanusGraph Server setting
+`gremlinPoolVirtualThreads: true` runs the pool on virtual threads. The pool keeps its bounds, `gremlinPool` requests
+evaluated at once, `maxWorkQueueSize` more waiting and rejection beyond, but a request which waits for a
+backend releases its platform thread, so `gremlinPool` can be raised to the wanted concurrency. With Cassandra on the
+same 18-processor machine, 256 virtual threads answered 20,900 requests per second at 256 requests in flight, against
+16,800 for 256 platform threads and 5,480 for the default pool, while the server kept about 90 platform threads instead
+of 326. The setting is off by default, and JanusGraph Server refuses to start with it on Java versions older than 24,
+where a virtual thread which waits inside `synchronized`, as JanusGraph transactions do while they commit, keeps its
+platform thread.
+
+##### Threads and Metrics reporters end with the graph or server they belong to
+
+`JanusGraphFactory.drop()` clears the storage through a backend of its own, which never shut down the executor that
+`storage.parallel-backend-ops` creates for storage backends without multi-key queries, such as BerkeleyJE and inmemory.
+With `storage.parallel-backend-executor-service.class=cached`, which starts its core threads at once, every drop left as
+many threads running for good as the core pool size, by default twice the number of processors. The backend now shuts
+the executor down as it clears the storage.
+
+The Metrics reporters a graph starts from its `metrics.*` options kept reporting after the graph closed, and every graph
+opened with `metrics.graphite.*` options started a Graphite reporter of its own, while the earlier ones went on
+reporting. A graph now starts its reporters when it opens, rather than when its configuration is read, graphs share a
+Graphite reporter as they share the other reporters, and a reporter which graphs started stops once every graph which
+uses it has closed; one which other code started keeps running. As a reporter reports the metrics of all graphs of the
+JVM, those of a graph whose configuration asks for no reporter are no longer reported once the graphs which use it have
+closed. A periodic reporter reports one last time as it stops, which the close of the last graph using it waits for, and
+the Graphite reporter connects for that report without a timeout.
+
+`JanusGraphManager` bound the graphs of the `ConfiguredGraphFactory` to Gremlin Server on a thread which never ended and
+kept the JVM from exiting, and which idled from its first failed run on; every run fails without a
+`ConfigurationManagementGraph`. It is now a daemon thread, which ends at its first run after Gremlin Server has stopped,
+the runs starting 20 seconds after the previous one ended, and at a run which finds no `ConfigurationManagementGraph`; a
+run under way opens no further graph once Gremlin Server stops, and a run which fails for another reason is logged, and
+the next one tries again.
+
+Closing a storage backend stops its executors through `ExecuteUtil.gracefulExecutorServiceShutdown`, which now restores
+an interrupt that ends its wait instead of swallowing it. A backend closes its index providers before its storage
+backend, and shuts its own executor down last, so that no step of the close runs on a thread which an earlier step has
+interrupted. A `JanusGraphFactory.drop()` whose thread is interrupted while it closes the graph now fails on BerkeleyJE,
+which can't open the storage again on an interrupted thread, and leaves the storage as it was, rather than clearing it.
 
 ##### `tx.max-commit-time` now defaults to 300 s and is checked against the least a commit may take
 
@@ -901,6 +2249,14 @@ The second of the numbers `getStatistics()` returns, the transactions which fail
 counts a transaction once that attempt has finished rather than before it starts, so the repairs of the transactions it
 counts are done and the third number already includes those which could not be repaired.
 
+##### The first traversal no longer waits for a scan of the class path
+
+JanusGraph's optimized steps tell whether a traverser counts loops by the traverser's class, which they used to look up
+in sets filled by a scan of the class path for implementations of `Traverser`, when the first traversal in a JVM used
+them: on a graph of the `inmemory` backend the first traversal in a JVM took 220–244 ms, and takes 35 ms now that a
+class is looked at when one of its traversers is first seen. The sets were also written by any thread which saw a
+traverser of a class the scan had missed, without synchronization, while other threads read them.
+
 ##### Schema changes committed by ordinary transactions reach the other instances
 
 With `schema.constraints=true` and a schema maker which creates missing constraints, an ordinary transaction adds
@@ -918,6 +2274,33 @@ eviction as well and acknowledge it; that acknowledgement is ignored, so a rolli
 the upgrade, each such eviction costs an older instance the thread which waits for its open transactions to close before
 it acknowledges, for up to a minute, and one with a transaction open for longer than that logs the stale-transaction
 error it logs for any eviction it waited that long for.
+
+##### A connection or property which the schema has already is not added again
+
+`addConnection(edgeLabel, outLabel, inLabel)`, on a transaction or on the management system, wrote the connection, and a
+link from the edge label to the outgoing vertex label, each time it was called, and `addProperties(label, keys...)`
+wrote the property of a vertex or edge label on each call. `mappedConnections()` and `mappedProperties()` list each
+copy, so a connection which was added twice was listed twice by both labels.
+
+With `schema.constraints=true` and a schema maker which creates missing constraints, a transaction checks the
+connections and properties of the committed schema, so it added a connection or a property which that schema lacked
+for each edge or element of it: three such edges in one transaction left the connection listed three times by both
+labels, and three vertices with a property new to their label left the property listed three times.
+
+Now `addConnection` and `addProperties` write a connection, link or property only where the schema hasn't got it,
+committed or written earlier by the same transaction. The copies which earlier versions wrote stay, and so do those
+of two transactions which add the same constraint at the same time. Renaming an edge label renames each copy of its
+connections.
+
+##### Closing a graph no longer fails on a transaction which another thread closes meanwhile
+
+Closing a graph rolls back the transactions which are still open. If another thread closed one of them after the graph
+had listed it, the graph's rollback found it closed, and `close()` threw
+`IllegalStateException: Unable to close transaction`, caused by `The transaction has already been closed`, although the
+graph had closed. The reader of the management log is such a thread until the graph closes the log: when it applies a
+schema eviction, which a commit that changes schema definitions sends, it reloads the definitions it expires through
+short-lived transactions of its own, and while an eviction of this instance waits for acknowledgements, it opens a
+management transaction on each poll. The graph now skips a transaction which closed before it could roll it back.
 
 ##### Closing a graph on BerkeleyJE no longer interrupts its log readers
 
@@ -939,6 +2322,89 @@ a log processor while the log closes finishes. A `MessageReader` which never ret
 on BerkeleyJE, where it used to be interrupted after a second. A log closed from one of its own reader threads cannot
 wait for them and keeps the second, and so do the logs of other storage backends. The reader threads of every log are
 now named after it.
+
+##### BerkeleyJE enforces `LOCK` consistency
+
+BerkeleyJE claimed to lock keys itself, so JanusGraph didn't put its own locker in front of it, but it took no locks.
+So a constraint whose consistency is `LOCK` didn't hold against concurrent transactions on BerkeleyJE, which all
+committed:
+- The names of schema elements always have `LOCK` consistency. Transactions which created the same type at once,
+  explicitly or implicitly through the default schema maker, each created one, and the schema then returned one of them.
+  The data of the others became invisible: of four transactions which each added a vertex with a value of a new
+  property key `auto`, committing at once, all four committed, the schema had four keys named `auto`, and
+  `g.V().has('auto').count()` returned 1. So did management systems and OLAP jobs which created the same type or compute
+  key.
+- Transactions which added the same value of a unique index each added a vertex of it, while the index kept one of them.
+- Several transactions could each add an edge of a `ONE2ONE` label to the same vertex.
+- Management systems which each read a global configuration option and changed it all committed, and the last one won,
+  although a management system checks the option against the value it read when it commits.
+
+A transaction now takes the locks of these keys when it commits, holds them in the JVM until it has committed or rolled
+back, and checks before its first write that each key still has the value it read. Where concurrent transactions used to
+commit together, all but one now fail with a `PermanentLockingException`: "Local lock contention" where another
+transaction holds the lock, "Expected value mismatch" where another transaction changed the key. This includes
+transactions which create the same type implicitly at once, even where no schema element was given `LOCK` consistency:
+in the example above, one commits and three fail with "Local lock contention", leaving one key named `auto`. Of two
+management systems which read and change the same global option, the second one to commit fails with "Expected value
+mismatch".
+Handle or retry these failures as on the other storage backends. The graph instances of a JVM which open the same
+directory share the locks, which don't expire; the `storage.lock` options don't apply to them. With
+`storage.transactions=false`, nothing is locked, as before.
+
+Each locked key costs its transaction a read of its record before the first write. In a benchmark on a laptop SSD,
+transactions which each locked 100 keys in 8 threads at once took 2.5% longer, about 0.22 ms, and 6.9%, about 0.29 ms,
+where BerkeleyJE didn't sync commits to disk. Transactions of one locked key or of none, and schema changes, took no
+measurably longer.
+
+A constraint without `LOCK` consistency still doesn't hold against concurrent transactions on BerkeleyJE at its default
+isolation level, as the documentation now says.
+
+Two related fixes:
+- On a storage backend without transaction isolation, such as Cassandra or HBase, a transaction commits its schema
+  elements in a transaction of their own first. Where that commit failed, as when the name of a new type no longer had
+  the value which the transaction had read, the locks of the schema stayed taken: in the JVM until
+  `storage.lock.expiry-time` (5 minutes by default), during which the JVM's transactions which created or renamed a type
+  of that name failed with "Local lock contention", and in the lock store. The failed commit now releases them.
+- Opening a graph on BerkeleyJE with `graph.allow-custom-vid-types` set to `true` failed, as it should, but left the
+  BerkeleyJE environment it had opened open in the JVM. It now closes it.
+
+##### A graph runs its background work on fewer threads, which end with it
+
+Each ID pool of a graph renewed its blocks of ids on a thread of its own, which it kept until the graph closed: one for
+every partition and kind of id in use, up to 98 with the default 32 partitions. The renewals of a graph now share the
+threads of one pool, which end after `ids.renew-keep-alive-time`, a minute by default, without renewals;
+`ids.renew-pool-size` bounds the threads, and unset, which is the default, it allows as many as the graph can have
+pools, so that every pool can renew at once. A pool still renews one block at a time, also while a renewal it gave up
+waiting for goes on, and where the ID authority can't be interrupted, as on BerkeleyJE, its close still waits for that
+renewal.
+
+Every instance acknowledges a change of existing schema elements once the transactions open when the change arrived have
+closed, and it started a thread for every such acknowledgement, which checked them every 100 ms for up to a minute. The
+acknowledgements of a graph now share one thread, and the new option `graph.management-tx-close-wait-time` sets how long
+they wait for the transactions, still a minute by default. Closing the graph waits for an acknowledgement which is being
+sent, as long as one write of the log may take, and drops those still waiting for transactions, as the other instances
+stop waiting for an instance which has closed; one for an eviction of the graph from the `JanusGraphManager` still
+removes it there.
+
+Transaction recovery repaired transactions on the JVM's common pool, holding one of its threads for as long as the
+storage and index writes of a repair took, and unless `shutdown()` was called, its cleaning thread kept running after
+the graph had closed and kept the JVM from exiting. Repairs now run on threads of the recovery's own,
+`tx.recovery.repair-pool-size` of them, by default as many as the common pool has, which end after
+`tx.recovery.repair-keep-alive-time` without a repair. `shutdown()` waits up to `storage.write-time` for the repairs it
+has handed over, and recovery stops when its graph closes. A transaction which a stopped recovery gives up on while it
+still reads the log, as one which isn't recurring does, is now logged and counted as not repaired, where it was
+repaired.
+
+The OLAP jobs of `FulgoraGraphComputer` ran on threads of the common pool for as long as they took, or each on a thread
+of its own where the common pool has a single thread. They now run on threads of their graph's own, which end when it
+closes or after `computer.job-keep-alive-time` without a job: `computer.job-pool-size` of them, by default as many as
+the common pool has, or again a thread per job where it has a single one. As each graph has its own, several graphs of
+one JVM can run that many jobs each, where they shared the common pool. A graph reports itself closed from the moment
+its close begins, so a job which starts from the queue while it closes fails at once and a repair which starts then is
+counted as not repaired, where both could start on a graph which still reported itself open and race the close of its
+backend. The Hadoop input format for Cassandra computed the splits of the token ranges one range after the other on a
+single thread, as its executor of up to 128 threads had no core threads and an unbounded queue; it now uses up to
+`cassandra.input.split.threads` threads, 128 by default.
 
 ### Version 1.1.0 (Release Date: November 7, 2024)
 

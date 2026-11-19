@@ -18,6 +18,9 @@ import org.apache.tinkerpop.gremlin.process.traversal.Order;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.Step;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
+import org.apache.tinkerpop.gremlin.process.traversal.lambda.ConstantTraversal;
+import org.apache.tinkerpop.gremlin.process.traversal.lambda.IdentityTraversal;
+import org.apache.tinkerpop.gremlin.process.traversal.lambda.TokenTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.lambda.ValueTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.step.HasContainerHolder;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.HasStep;
@@ -25,6 +28,7 @@ import org.apache.tinkerpop.gremlin.process.traversal.step.filter.OrStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.RangeGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.TraversalParent;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.TraversalFilterStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.map.CoalesceStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.FlatMapStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.GraphStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.NoOpBarrierStep;
@@ -37,6 +41,7 @@ import org.apache.tinkerpop.gremlin.process.traversal.step.util.HasContainer;
 import org.apache.tinkerpop.gremlin.process.traversal.util.AndP;
 import org.apache.tinkerpop.gremlin.process.traversal.util.ConnectiveP;
 import org.apache.tinkerpop.gremlin.process.traversal.util.TraversalHelper;
+import org.apache.tinkerpop.gremlin.structure.T;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.PropertyKey;
@@ -72,19 +77,11 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
 
     void orderBy(String key, Order order);
 
-    void localOrderBy(TraversalParent parent, List<HasContainer> hasContainers, String key, Order order);
-
     void setLimit(int low, int high);
-
-    void setLocalLimit(TraversalParent parent, List<HasContainer> hasContainers, int low, int high);
 
     int getLowLimit();
 
-    int getLocalLowLimit(TraversalParent parent, List<HasContainer> hasContainers);
-
     int getHighLimit();
-
-    int getLocalHighLimit(TraversalParent parent, List<HasContainer> hasContainers);
 
     static boolean validJanusGraphHas(HasContainer has) {
         if (has.getPredicate() instanceof ConnectiveP) {
@@ -107,17 +104,26 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
         final List<Pair<Traversal.Admin, Object>> comparators = orderGlobalStep.getComparators();
         for(final Pair<Traversal.Admin, Object> comp : comparators) {
             final String key;
+            final Order order;
             if (comp.getValue0() instanceof ValueTraversal &&
                 comp.getValue1() instanceof Order) {
+                // a by(key) whose traversal yields a value where the key has none, as ProductiveByStrategy makes it,
+                // keeps the elements without the key, which TinkerPop then orders itself
+                if (((ValueTraversal) comp.getValue0()).getBypassTraversal() != null) return false;
                 key = ((ValueTraversal) comp.getValue0()).getPropertyKey();
-            } else if (comp.getValue1() instanceof ElementValueComparator) {
+                order = (Order) comp.getValue1();
+            } else if (comp.getValue0() instanceof IdentityTraversal
+                && comp.getValue1() instanceof ElementValueComparator) {
                 final ElementValueComparator evc = (ElementValueComparator) comp.getValue1();
                 if (!(evc.getValueComparator() instanceof Order)) return false;
                 key = evc.getPropertyKey();
+                order = (Order) evc.getValueComparator();
             } else {
                 // do not fold comparators that include nested traversals that are not simple ElementValues
                 return false;
             }
+            // shuffle marks a random order, which TinkerPop gives and no query sorts by
+            if (order == Order.shuffle) return false;
 
             // check if all mixed index backends of the graph supports ordering for LIST cardinality properties
             // if this is the case, validJanusGraphOrder() method can return true not only for SINGLE
@@ -177,12 +183,18 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
         Step<?, ?> currentStep = janusgraphStep.getNextStep();
         while (true) {
             if (currentStep instanceof OrStep && janusgraphStep instanceof JanusGraphStep) {
+                boolean anyPasses = false;
                 for (final Traversal.Admin<?, ?> child : ((OrStep<?>) currentStep).getLocalChildren()) {
-                    if (!validFoldInHasContainer(child.getStartStep(), false)){
+                    if (!validFoldInOrBranch(child)) {
                         return;
                     }
+                    anyPasses |= branchPassesElements(child);
                 }
-                ((OrStep<?>) currentStep).getLocalChildren().forEach(t ->localFoldInHasContainer(janusgraphStep, t.getStartStep(), t, rootTraversal));
+                ((OrStep<?>) currentStep).getLocalChildren().forEach(t -> localFoldInHasContainer(janusgraphStep, t));
+                if (!anyPasses) {
+                    //An or() which lets no element through, as each of its branches skips the element
+                    ((JanusGraphStep<?, ?>) janusgraphStep).addLocalHasContainersOfNoBranch((OrStep<?>) currentStep);
+                }
                 currentStep.getLabels().forEach(janusgraphStep::addLabel);
                 traversal.removeStep(currentStep);
             } else if (currentStep instanceof HasContainerHolder && validFoldInHasContainer(currentStep, true)){
@@ -203,25 +215,113 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
         }
     }
 
-    static void localFoldInHasContainer(final HasStepFolder janusgraphStep, final Step<?, ?>  tinkerpopStep, final Traversal.Admin<?, ?> traversal,
-            final Traversal<?, ?> rootTraversal){
-        Step<?, ?> currentStep = tinkerpopStep;
-        while (true) {
-            if (currentStep instanceof HasContainerHolder) {
-                List<HasContainer> localHasContainers = janusgraphStep.addLocalHasContainersConvertingAndPContainers(
-                    traversal.getParent(), ((HasContainerHolder<?, ?>) currentStep).getHasContainers());
-                currentStep.getLabels().forEach(janusgraphStep::addLabel);
-                traversal.removeStep(currentStep);
-                currentStep = foldInOrder(janusgraphStep, currentStep, traversal, rootTraversal, janusgraphStep instanceof JanusGraphStep && ((JanusGraphStep)janusgraphStep).returnsVertex(), localHasContainers);
-                foldInRange(janusgraphStep, currentStep, traversal, localHasContainers);
-            } else if (isExistsStep(currentStep)) {
-                currentStep = foldInHasFilter(traversal, (TraversalFilterStep) currentStep);
-                continue;
-            } else if (!(currentStep instanceof IdentityStep) && !(currentStep instanceof NoOpBarrierStep)) {
-                break;
+    /*
+     * Folds a branch of an or() into the step as the conditions which the branch holds an element to, unless it lets
+     * no element through. TinkerPop checks each element against the branch on its own, so that each of its steps is a
+     * condition on that element, whatever their order: a has() as it is, a range() or limit() which lets the element
+     * through unless it skips it or its limit is 0, and an order() which lets it through where each of its by(key)
+     * modulators has a value
+     */
+    static void localFoldInHasContainer(final HasStepFolder janusgraphStep, final Traversal.Admin<?, ?> branch) {
+        final List<HasContainer> conditions = new ArrayList<>();
+        for (final Step<?, ?> step : branch.getSteps()) {
+            if (step instanceof HasContainerHolder) {
+                conditions.addAll(((HasContainerHolder<?, ?>) step).getHasContainers());
+            } else if (isExistsStep(step)) {
+                final PropertiesStep<?> properties = (PropertiesStep<?>) ((TraversalFilterStep<?>) step)
+                    .getLocalChildren().get(0).getStartStep();
+                conditions.add(new HasContainer(properties.getPropertyKeys()[0], P.neq(null)));
+            } else if (step instanceof OrderGlobalStep) {
+                for (final String key : keysWithValues((OrderGlobalStep<?, ?>) step)) {
+                    conditions.add(new HasContainer(key, P.neq(null)));
+                }
             }
-            currentStep = currentStep.getNextStep();
+            step.getLabels().forEach(janusgraphStep::addLabel);
         }
+        if (branchPassesElements(branch)) {
+            janusgraphStep.addLocalHasContainersConvertingAndPContainers(branch.getParent(), conditions);
+        }
+    }
+
+    //Whether each step of an or() branch is a condition on the element which it is run for, at least one a has()
+    static boolean validFoldInOrBranch(final Traversal.Admin<?, ?> branch) {
+        boolean hasCondition = false;
+        for (final Step<?, ?> step : branch.getSteps()) {
+            if (step instanceof HasContainerHolder) {
+                if (!validJanusGraphHas(((HasContainerHolder<?, ?>) step).getHasContainers())) {
+                    return false;
+                }
+                hasCondition = true;
+            } else if (isExistsStep(step)) {
+                hasCondition = true;
+            } else if (step instanceof OrderGlobalStep) {
+                if (keysWithValues((OrderGlobalStep<?, ?>) step) == null) {
+                    return false;
+                }
+            } else if (!(step instanceof RangeGlobalStep) && !(step instanceof IdentityStep)
+                    && !(step instanceof NoOpBarrierStep)) {
+                return false;
+            }
+        }
+        return hasCondition;
+    }
+
+    //Whether an or() branch, run for a single element, can let it through: none of its ranges skips it or takes none
+    static boolean branchPassesElements(final Traversal.Admin<?, ?> branch) {
+        for (final Step<?, ?> step : branch.getSteps()) {
+            if (step instanceof RangeGlobalStep) {
+                final RangeGlobalStep<?> range = (RangeGlobalStep<?>) step;
+                if (range.getLowRange() > 0 || range.getHighRange() == 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /*
+     * The keys of which an order(), run for a single element, needs a value to let it through, as TinkerPop leaves out
+     * an element for which a by() modulator yields nothing; null where a modulator may yield nothing otherwise than for
+     * a missing key. A by() of the element itself, as an ElementValueComparator takes it, or of its id or label lets
+     * it through, as a single element isn't compared and every element has an id and a label, and so does a by(key)
+     * which ProductiveByStrategy makes yield null where the key has none
+     */
+    static List<String> keysWithValues(final OrderGlobalStep<?, ?> order) {
+        final List<String> keys = new ArrayList<>();
+        for (final Pair<? extends Traversal.Admin<?, ?>, ?> comparator : order.getComparators()) {
+            final Traversal.Admin<?, ?> modulator = comparator.getValue0();
+            if (modulator instanceof ValueTraversal) {
+                final Traversal.Admin<?, ?> bypass = ((ValueTraversal<?, ?>) modulator).getBypassTraversal();
+                if (bypass == null) {
+                    keys.add(((ValueTraversal<?, ?>) modulator).getPropertyKey());
+                } else if (!yieldsNullWithoutAValue(bypass)) {
+                    return null;
+                }
+            } else if (!(modulator instanceof IdentityTraversal) && !isTokenOfEveryElement(modulator)) {
+                return null;
+            }
+        }
+        return keys;
+    }
+
+    //Whether the bypass traversal of a by(key) is ProductiveByStrategy's, a coalesce() of the value and a constant null
+    static boolean yieldsNullWithoutAValue(final Traversal.Admin<?, ?> bypass) {
+        if (!(bypass.getStartStep() instanceof CoalesceStep)) {
+            return false;
+        }
+        final List<? extends Traversal.Admin<?, ?>> children =
+            ((CoalesceStep<?, ?>) bypass.getStartStep()).getLocalChildren();
+        final Traversal.Admin<?, ?> last = children.get(children.size() - 1);
+        return last instanceof ConstantTraversal && ((ConstantTraversal<?, ?>) last).next() == null;
+    }
+
+    //Whether a by() modulator is T.id or T.label, of which every element has a value
+    static boolean isTokenOfEveryElement(final Traversal.Admin<?, ?> modulator) {
+        if (!(modulator instanceof TokenTraversal)) {
+            return false;
+        }
+        final T token = ((TokenTraversal<?, ?>) modulator).getToken();
+        return token == T.id || token == T.label;
     }
 
     static boolean validFoldInHasContainer(final Step<?, ?>  tinkerpopStep, final boolean defaultValue){
@@ -277,26 +377,31 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
         return hasStep;
     }
 
-    static Step<?, ?> foldInOrder(final HasStepFolder janusgraphStep, final Step<?, ?>  tinkerpopStep, final Traversal.Admin<?, ?> traversal,
-                                   final Traversal<?, ?> rootTraversal, boolean isVertexOrder, final List<HasContainer> hasContainers) {
+    static void foldInOrder(final HasStepFolder janusgraphStep, final Step<?, ?>  tinkerpopStep, final Traversal.Admin<?, ?> traversal,
+                            final Traversal<?, ?> rootTraversal, boolean isVertexOrder) {
         Step<?, ?> currentStep = tinkerpopStep;
-        OrderGlobalStep<?, ?> lastOrder = null;
+        final List<OrderGlobalStep<?, ?>> orderSteps = new ArrayList<>();
         while (true) {
             if (currentStep instanceof OrderGlobalStep) {
-                if (lastOrder != null) { //Previous orders are rendered irrelevant by next order (since re-ordered)
-                    lastOrder.getLabels().forEach(janusgraphStep::addLabel);
-                    traversal.removeStep(lastOrder);
-                }
-                lastOrder = (OrderGlobalStep) currentStep;
+                orderSteps.add((OrderGlobalStep<?, ?>) currentStep);
             } else if (!(currentStep instanceof IdentityStep) && !(currentStep instanceof HasStep) && !(currentStep instanceof NoOpBarrierStep)) {
                 break;
             }
             currentStep = currentStep.getNextStep();
         }
 
-        if (lastOrder != null && validJanusGraphOrder(lastOrder, rootTraversal, isVertexOrder)) {
-            //Add orders to HasStepFolder
-            for (final Pair<Traversal.Admin<Object, Comparable>, Comparator<Object>> comp : (List<Pair<Traversal.Admin<Object, Comparable>, Comparator<Object>>>) ((OrderGlobalStep) lastOrder).getComparators()) {
+        //TinkerPop sorts by each order() in turn, keeping the order of ties, and each leaves out the elements for which
+        //one of its by() modulators has no value: so the elements come in the order of the last one, and where that
+        //ties, of those before it. These orders are folded in together, the last one's keys first, or none of them
+        final List<OrderEntry> orders = new ArrayList<>();
+        for (int i = orderSteps.size() - 1; i >= 0; i--) {
+            if (!validJanusGraphOrder(orderSteps.get(i), rootTraversal, isVertexOrder)) {
+                return;
+            }
+            final List<Pair<Traversal.Admin<Object, Comparable>, Comparator<Object>>> comparators =
+                (List<Pair<Traversal.Admin<Object, Comparable>, Comparator<Object>>>)
+                    ((OrderGlobalStep) orderSteps.get(i)).getComparators();
+            for (final Pair<Traversal.Admin<Object, Comparable>, Comparator<Object>> comp : comparators) {
                 final String key;
                 final Order order;
                 if (comp.getValue0() instanceof ValueTraversal) {
@@ -308,16 +413,25 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
                     key = evc.getPropertyKey();
                     order = (Order) evc.getValueComparator();
                 }
-                if (hasContainers == null) {
-                    janusgraphStep.orderBy(key, order);
-                } else {
-                    janusgraphStep.localOrderBy(traversal.getParent(), hasContainers, key, order);
+                //a key which the orders taken so far already sort by, those of later order() steps or of earlier
+                //by() modulators of this one, doesn't change the order
+                if (orders.stream().noneMatch(entry -> entry.key.equals(key))) {
+                    orders.add(new OrderEntry(key, order));
                 }
             }
-            lastOrder.getLabels().forEach(janusgraphStep::addLabel);
-            traversal.removeStep(lastOrder);
         }
-        return currentStep;
+        //A query of the edges or properties of a vertex takes a single order key
+        if (orders.isEmpty() || orders.size() > 1 && !(janusgraphStep instanceof JanusGraphStep)) {
+            return;
+        }
+        //Add orders to HasStepFolder
+        for (final OrderEntry order : orders) {
+            janusgraphStep.orderBy(order.key, order.order);
+        }
+        for (final OrderGlobalStep<?, ?> orderStep : orderSteps) {
+            orderStep.getLabels().forEach(janusgraphStep::addLabel);
+            traversal.removeStep(orderStep);
+        }
     }
 
     static void splitAndP(final List<HasContainer> hasContainers, final HasContainer hasContainer) {
@@ -367,22 +481,18 @@ public interface HasStepFolder<S, E> extends Step<S, E> {
         }
     }
 
-    static void foldInRange(final HasStepFolder janusgraphStep, final Step<?, ?>  tinkerpopStep, final Traversal.Admin<?, ?> traversal, final List<HasContainer> hasContainers) {
+    static void foldInRange(final HasStepFolder janusgraphStep, final Step<?, ?>  tinkerpopStep, final Traversal.Admin<?, ?> traversal) {
         final Step<?, ?> nextStep = tinkerpopStep instanceof IdentityStep ? JanusGraphTraversalUtil.getNextNonIdentityStep(tinkerpopStep): tinkerpopStep;
         if (nextStep instanceof RangeGlobalStep) {
             final RangeGlobalStep range = (RangeGlobalStep) nextStep;
             int low = 0;
             if (janusgraphStep instanceof JanusGraphStep) {
                 low = QueryUtil.convertLimit(range.getLowRange());
-                low = QueryUtil.mergeLowLimits(low, hasContainers == null ? janusgraphStep.getLowLimit(): janusgraphStep.getLocalLowLimit(traversal.getParent(), hasContainers));
+                low = QueryUtil.mergeLowLimits(low, janusgraphStep.getLowLimit());
             }
             int high = QueryUtil.convertLimit(range.getHighRange());
-            high = QueryUtil.mergeHighLimits(high, hasContainers == null ? janusgraphStep.getHighLimit(): janusgraphStep.getLocalHighLimit(traversal.getParent(), hasContainers));
-            if (hasContainers == null) {
-                janusgraphStep.setLimit(low, high);
-            } else {
-                janusgraphStep.setLocalLimit(traversal.getParent(), hasContainers, low, high);
-            }
+            high = QueryUtil.mergeHighLimits(high, janusgraphStep.getHighLimit());
+            janusgraphStep.setLimit(low, high);
             if (janusgraphStep instanceof JanusGraphStep || range.getLowRange() == 0) { //Range can be removed since there is JanusGraphStep or no offset
                 nextStep.getLabels().forEach(janusgraphStep::addLabel);
                 traversal.removeStep(nextStep);
