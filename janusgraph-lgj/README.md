@@ -7,19 +7,29 @@ Java 11. It is built and run by `run.sh` with plain `javac`.
 ## What it does
 
 `LanceHopStrategy` is a TinkerPop provider strategy for a JanusGraph traversal
-source. It answers one traversal shape from a lance-graph-java row store, as a
+source. It answers two traversal shapes from a lance-graph-java row store, as a
 chain of mask hops, and leaves everything else to JanusGraph:
 
 ```
 g.V(ids).out(label)^k.dedup().count()        k >= 1
+g.V(ids).out(label)^k.dedup().id()           k >= 1
 ```
+
+The `id()` shape returns the JanusGraph vertex ids of the reached vertices,
+one traverser each, in ascending row order. It is answered by
+`LanceHopIdsStep`: the hop chain, then `Graph.materializeRows()`, then a
+mapping from row number to vertex id. Without `dedup()` it is not lowered,
+because it would list walks, not vertices.
 
 `repeat(out(label)).times(k)` reaches the same shape. The caller's Gremlin is
 unchanged; the strategy is registered with `withStrategies(...)`.
 
 It is the JanusGraph counterpart of the strategy in lance-graph-java's
 `interop/tinkerpop`. Two things differ: a JanusGraph vertex id is not a row
-number, so the caller supplies the mapping; and the strategy declares
+number, so the caller supplies the mapping (vertex id to row, and for the
+`id()` shape also row to vertex id, as the fourth constructor argument; the
+three-argument constructor is count-only and the `id()` shape falls back with
+the reason "id() needs the row-to-vertex-id mapping"); and the strategy declares
 JanusGraph's own provider strategies as coming after it, so JanusGraph starts
 no storage read for a traversal it answers.
 
@@ -29,7 +39,7 @@ no storage read for a traversal it answers.
 edge by edge into JanusGraph's in-memory backend. The copy is test code and is
 the oracle. Measured on 2026-11-19, JanusGraph `1.3.0-SNAPSHOT` at `0ce834a`
 (TinkerPop 3.8.2), lance-graph-java at `0286573` (abi 0.14), Temurin
-`28+16-ea`: 45 checks pass.
+`28+16-ea`: 84 checks pass.
 
 | Check | Result |
 |---|---|
@@ -39,6 +49,13 @@ the oracle. Measured on 2026-11-19, JanusGraph `1.3.0-SNAPSHOT` at `0ce834a`
 | Clone after running | a clone of a lowered traversal that already ran answers afresh, with the same count |
 | Provenance | against an empty JanusGraph, plain Gremlin answers 0 and the lowered traversal answers 29 |
 | Fallbacks | five shapes that are not lowered are counted, give a reason and answer as JanusGraph does |
+| Same ids, k = 1, 2, 3 | the id sets equal JanusGraph's, same sizes, no duplicates, and the size equals the count shape's answer |
+| The id comparison can fail | with the row-to-id mapping off by one row the id sets differ |
+| Really lowered, ids | the traversal that ran is one `LanceHopIdsStep` |
+| Order | the lowered ids come out in ascending row order |
+| Provenance, ids | against an empty JanusGraph, plain Gremlin returns no ids and the lowered traversal returns the ids from the row store |
+| Fallbacks, ids | `out().id()` without `dedup()`, and the count-only constructor, are counted, give a reason and answer as JanusGraph does |
+| Clone after running, ids | a clone of a lowered id traversal that already ran answers afresh, with the same set |
 
 Also established on the way: JanusGraph's core and in-memory backend run on
 the JDK 28 preview build unchanged.
@@ -49,20 +66,25 @@ Against the checks in bardioc's `docs/profiles/PROFILE_DEFINITION.md`:
 
 | Check | State |
 |---|---|
-| Same answers | shown, for this one shape |
+| Same answers | shown, for these two shapes (ids compared as sets) |
 | Provenance | shown |
 | No host evaluation | holds for a lowered traversal (JanusGraph is not consulted); not instrumented |
-| One crossing per request | **not met**: a k-hop count makes k + 2 native calls (seed, one per hop, count) |
+| One crossing per request | **not met**: a k-hop count makes k + 2 native calls (seed, one per hop, count); the `id()` shape makes k + 2 as well (seed, one per hop, materialization) |
 | No host bytes | not measured |
 | No copy at ingest | not applicable: there is no ingest. The row store is generated from a seed |
-| Refusals are named | shown for the five fallbacks |
+| Refusals are named | shown for the five count fallbacks and the two id fallbacks |
+
+Materialization happens at the API edge only: the ids are read out of the
+store once, after the last hop, to hand them to the caller. Nothing in the
+chain materializes rows between hops. The cost of that call grows with the
+number of reached rows; it was not measured.
 
 Not here at all: writes, schema (the test maps one edge label to one class id
-by hand), property filters, any step other than `out`, a JanusGraph storage
+by hand), property filters, any step other than `out`, any terminal step other than `count()` and `id()`, a JanusGraph storage
 backend, and any timing.
 
-The id mapping in the test is arithmetic (`fromVertexId(id) - 1`) because the
-test sets its own vertex ids. A graph whose ids JanusGraph assigned needs a
+The id mappings in the test are arithmetic (`fromVertexId(id) - 1` and its
+inverse) because the test sets its own vertex ids. A graph whose ids JanusGraph assigned needs a
 real mapping, which is the open question of one ordinal axis.
 
 ## Running it
