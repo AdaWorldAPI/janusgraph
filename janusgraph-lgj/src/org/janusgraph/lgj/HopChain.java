@@ -64,6 +64,7 @@ final class HopChain {
     static <T> T runFiltered(RowStore store, long[] seeds, int[] hops, FacetId labelFacet,
                              int labelClassid, Function<Mask, T> terminal) {
         List<Mask> open = new ArrayList<>();
+        Throwable primary = null;
         try {
             Mask m = store.importRows(seeds);
             open.add(m);
@@ -73,24 +74,32 @@ final class HopChain {
             }
             Mask label = store.maskOfFacetClass(labelFacet, labelClassid);
             open.add(label);
+            // a & b in one native call: ternlog(a, b, b) with truth table 0xC0.
             Mask both = m.ternlog(label, label, 0xC0);
             open.add(both);
             return terminal.apply(both);
+        } catch (RuntimeException | Error e) {
+            primary = e;
+            throw e;
         } finally {
-            RuntimeException failure = null;
+            // Close every mask. A failure of the chain itself is never replaced by a close
+            // failure; close failures are attached to it, or thrown if there was none.
+            RuntimeException closeFailure = null;
             for (Mask m : open) {
                 try {
                     m.close();
                 } catch (RuntimeException e) {
-                    if (failure == null) {
-                        failure = e;
+                    if (primary != null) {
+                        primary.addSuppressed(e);
+                    } else if (closeFailure == null) {
+                        closeFailure = e;
                     } else {
-                        failure.addSuppressed(e);
+                        closeFailure.addSuppressed(e);
                     }
                 }
             }
-            if (failure != null) {
-                throw failure;
+            if (closeFailure != null) {
+                throw closeFailure;
             }
         }
     }
