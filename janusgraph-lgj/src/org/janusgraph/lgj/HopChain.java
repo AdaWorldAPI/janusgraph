@@ -55,11 +55,13 @@ final class HopChain {
      * As {@link #run}, then intersects the last frontier with the mask of the rows whose
      * {@code labelFacet} carries {@code labelClassid}, and runs {@code terminal} on the result.
      *
-     * <p>Native calls: seed 1, one per hop, the label mask 2 (create, class match), the
-     * intersection 1 ({@code ternlog} with the truth table 0xC0, {@code a & b}), the terminal 1:
-     * k + 5 in all. {@code Graph} has no public {@code and}; {@code a.minus(a.minus(b))} would
-     * cost two calls for the intersection, and {@code Graph} does not expose its frontier
-     * {@code Mask}, so the chain here runs on {@code Mask}s directly. Every Mask is closed.
+     * <p>Native calls, measured by {@code JanusCrossingsTest}: the seed import 2, two per hop, the
+     * label mask 2 (create, class match), the intersection 2 ({@code ternlog} with the truth
+     * table 0xC0, {@code a & b}: create the destination, run it), the terminal 1, and one per
+     * mask closed, k + 3 of them: 3k + 10 in all. {@code Graph} has no public {@code and};
+     * {@code a.minus(a.minus(b))} would cost four calls for the intersection, and {@code Graph}
+     * does not expose its frontier {@code Mask}, so the chain here runs on {@code Mask}s
+     * directly. Every Mask is closed.
      */
     static <T> T runFiltered(RowStore store, long[] seeds, int[] hops, FacetId labelFacet,
                              int labelClassid, Function<Mask, T> terminal) {
